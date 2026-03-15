@@ -1,14 +1,15 @@
+MiaUI TODO
 -------------------------------
 
-<img src="github/minui-main.png" width=320 /> <img src="github/minui-menu-gbc.png" width=320 />
+* Local Achievements
 
-Please see the README.txt in the zip file for installation and update instructions.
+ORIGINAL MINUI TODO
+-------------------------------
+
 
 **Base**
 - fixed mistaking bare tag name folders as empty
-- removed incomplete hdmi support (won't support codepaths I won't use, ergonomics are all wrong)
 - restored low battery overlay
-- fixed disappearing in-game save data that may occur after quicksave/auto-resume
 
 **Extras**
 - 
@@ -25,9 +26,6 @@ bugs
 api
 	battery ramp is wrong for bigger battery
 		need to log drain
-	rewrite scaling logic
-	rewrite overlay
-	move scanlines/grid to overlay?
 	
 more regressions
 	slow power led
@@ -67,9 +65,6 @@ misc
 	port say, show, blank, and confirm
 	make my own simple file browser? :sweat_smile:
 
-commander
-	create a commander-11-mono for text views?
-
 cores
 	vb
 		launching directly into native scaling has normal performance
@@ -83,27 +78,6 @@ cores
 		warning about lack of autosave and 
 		update ui for lack of save states, etc
 		blech, getting pretty tired of all of this
-	
-	
-Union-ize this?
-	Mini?
-	Smart & Model S?
-
-makefile
-	-
-	
-sdl
-	-
-
-batmon
-	charging icons at least?
-		ramdisk.img/res/images/charger/battery_[0-5].png
-
-clock
-	-
-
-libmsettings
-	hdmi
 
 keymon
 	handle sleep/wake
