@@ -1,7 +1,8 @@
 #ifndef __API_H__
 #define __API_H__
-#include <SDL/SDL.h>
-#include <SDL/SDL_ttf.h>
+#include "sdl.h"
+#include "platform.h"
+#include <GLES2/gl2.h>
 
 ///////////////////////////////
 
@@ -20,19 +21,23 @@ void LOG_note(int level, const char* fmt, ...);
 
 ///////////////////////////////
 
-#define FIXED_WIDTH		640
-#define FIXED_HEIGHT	480
-#define FIXED_BPP		2
-#define FIXED_DEPTH		(FIXED_BPP * 8)
-#define FIXED_PITCH		(FIXED_WIDTH * FIXED_BPP)
-#define FIXED_SIZE		(FIXED_PITCH * FIXED_HEIGHT)
-
 #define PAGE_COUNT	2
 #define PAGE_SCALE	3
 #define PAGE_WIDTH	(FIXED_WIDTH * PAGE_SCALE)
 #define PAGE_HEIGHT	(FIXED_HEIGHT * PAGE_SCALE)
 #define PAGE_PITCH	(PAGE_WIDTH * FIXED_BPP)
 #define PAGE_SIZE	(PAGE_PITCH * PAGE_HEIGHT)
+
+///////////////////////////////
+
+// TODO: these only seem to be used by a tmp.pak in trimui (model s)
+// used by minarch, optionally defined in platform.h
+#ifndef PLAT_PAGE_BPP
+#define PLAT_PAGE_BPP 	FIXED_BPP
+#endif
+#define PLAT_PAGE_DEPTH (PLAT_PAGE_BPP * 8)
+#define PLAT_PAGE_PITCH (PAGE_WIDTH * PLAT_PAGE_BPP)
+#define PLAT_PAGE_SIZE	(PLAT_PAGE_PITCH * PAGE_HEIGHT)
 
 ///////////////////////////////
 
@@ -76,6 +81,11 @@ enum {
 	
 	ASSET_SCROLL_UP,
 	ASSET_SCROLL_DOWN,
+	
+	ASSET_WIFI,
+	ASSET_SWAP,
+	ASSET_SWAP_GRAY,
+	ASSET_SWAP_DARK_GRAY,
 };
 
 typedef struct GFX_Fonts {
@@ -87,17 +97,79 @@ typedef struct GFX_Fonts {
 extern GFX_Fonts font;
 
 enum {
+	SHARPNESS_CRISP,
+	SHARPNESS_SOFT,
+};
+
+typedef struct GFX_Renderer {
+	void* src;
+	void* dst;
+	void* blit;
+	double aspect; // 0 for integer, -1 for fullscreen, otherwise aspect ratio, used for SDL2 accelerated scaling
+	int scale;
+	
+	// TODO: document this better
+	int true_w;
+	int true_h;
+
+	int src_x;
+	int src_y;
+	int src_w;
+	int src_h;
+	int src_p;
+	
+	// TODO: I think this is overscaled
+	int dst_x;
+	int dst_y;
+	int dst_w;
+	int dst_h;
+	int dst_p;
+} GFX_Renderer;
+
+enum {
 	MODE_MAIN,
 	MODE_MENU,
 };
 
+
+#define MAX_PARAM_NAME 128
+#define MAX_PARAM_LABEL 128
+typedef struct {
+    char name[MAX_PARAM_NAME];
+    char label[MAX_PARAM_LABEL];
+    float def;
+    float min;
+    float max;
+    float step;
+	float value;
+	GLint uniformLocation;
+} ShaderParam;
+
+enum {
+	LAYER_ALL = 0,
+	LAYER_BACKGROUND = 1,
+	LAYER_TRANSITION = 2,
+	LAYER_THUMBNAIL = 3,
+	LAYER_SCROLLTEXT = 4,
+	LAYER_IDK2 = 5, // unused?
+};
+
 SDL_Surface* GFX_init(int mode);
-SDL_Surface* GFX_resize(int width, int height, int pitch);
-void GFX_setScaleClip(int x, int y, int width, int height);
-void GFX_setNearestNeighbor(int enabled);
+#define GFX_resize PLAT_resizeVideo // (int w, int h, int pitch);
+#define GFX_setScaleClip PLAT_setVideoScaleClip // (int x, int y, int width, int height)
+#define GFX_setNearestNeighbor PLAT_setNearestNeighbor // (int enabled)
+#define GFX_setSharpness PLAT_setSharpness // (int sharpness)
+#define GFX_initGameOverlay PLAT_initGameOverlay
 void GFX_setMode(int mode);
-void GFX_clear(SDL_Surface* screen);
-void GFX_clearAll(void);
+int GFX_hdmiChanged(void);
+
+#define GFX_clear PLAT_clearVideo // (SDL_Surface* screen)
+#define GFX_clearAll PLAT_clearAll // (void)
+#define GFX_clearLayers PLAT_clearLayers //(SDL_Surface *inputSurface,int x, int y)
+
+#define PAD_init PLAT_initInput
+#define PAD_quit PLAT_quitInput
+
 void GFX_startFrame(void);
 void GFX_flip(SDL_Surface* screen);
 void GFX_sync(void); // call this to maintain 60fps when not calling GFX_flip() this frame
@@ -109,12 +181,24 @@ enum {
 	VSYNC_STRICT,
 };
 
+enum {
+	// actual views
+	SCREEN_GAMELIST,
+	SCREEN_GAMESWITCHER,
+	SCREEN_QUICKMENU,
+	// meta
+	SCREEN_GAME,
+	SCREEN_OFF
+};
+
 int GFX_getVsync(void);
 void GFX_setVsync(int vsync);
 
-SDL_Surface* GFX_getBufferCopy(void); // must be freed by caller
 int GFX_truncateText(TTF_Font* font, const char* in_name, char* out_name, int max_width, int padding); // returns final width
 int GFX_wrapText(TTF_Font* font, char* str, int max_width, int max_lines);
+
+#define GFX_getScaler PLAT_getScaler		// scaler_t:(GFX_Renderer* renderer)
+#define GFX_blitRenderer PLAT_blitRenderer	// void:(GFX_Renderer* renderer)
 
 // NOTE: all dimensions should be pre-scaled
 void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect);
@@ -126,7 +210,8 @@ void GFX_blitButton(char* hint, char*button, SDL_Surface* dst, SDL_Rect* dst_rec
 void GFX_blitMessage(TTF_Font* font, char* msg, SDL_Surface* dst, SDL_Rect* dst_rect);
 
 int GFX_blitHardwareGroup(SDL_Surface* dst, int show_setting);
-int GFX_blitButtonGroup(char** hints, SDL_Surface* dst, int align_right);
+void GFX_blitHardwareHints(SDL_Surface* dst, int show_setting);
+int GFX_blitButtonGroup(char** hints, int primary, SDL_Surface* dst, int align_right);
 
 void GFX_sizeText(TTF_Font* font, char* str, int leading, int* w, int* h);
 void GFX_blitText(TTF_Font* font, char* str, int leading, SDL_Color color, SDL_Surface* dst, SDL_Rect* dst_rect);
@@ -144,55 +229,6 @@ void SND_quit(void);
 
 ///////////////////////////////
 
-enum {
-	BTN_ID_NONE = -1,
-	BTN_ID_UP,
-	BTN_ID_DOWN,
-	BTN_ID_LEFT,
-	BTN_ID_RIGHT,
-	BTN_ID_A,
-	BTN_ID_B,
-	BTN_ID_X,
-	BTN_ID_Y,
-	BTN_ID_START,
-	BTN_ID_SELECT,
-	BTN_ID_L1,
-	BTN_ID_R1,
-	BTN_ID_L2,
-	BTN_ID_R2,
-	BTN_ID_MENU,
-	BTN_ID_PLUS,
-	BTN_ID_MINUS,
-	BTN_ID_POWER,
-	BTN_ID_COUNT,
-};
-
-enum {
-	BTN_NONE	= 0,
-	BTN_UP 		= 1 << BTN_ID_UP,
-	BTN_DOWN	= 1 << BTN_ID_DOWN,
-	BTN_LEFT	= 1 << BTN_ID_LEFT,
-	BTN_RIGHT	= 1 << BTN_ID_RIGHT,
-	BTN_A		= 1 << BTN_ID_A,
-	BTN_B		= 1 << BTN_ID_B,
-	BTN_X		= 1 << BTN_ID_X,
-	BTN_Y		= 1 << BTN_ID_Y,
-	BTN_START	= 1 << BTN_ID_START,
-	BTN_SELECT	= 1 << BTN_ID_SELECT,
-	BTN_L1		= 1 << BTN_ID_L1,
-	BTN_R1		= 1 << BTN_ID_R1,
-	BTN_L2		= 1 << BTN_ID_L2,
-	BTN_R2		= 1 << BTN_ID_R2,
-	BTN_MENU	= 1 << BTN_ID_MENU,
-	BTN_PLUS	= 1 << BTN_ID_PLUS,
-	BTN_MINUS	= 1 << BTN_ID_MINUS,
-	BTN_POWER	= 1 << BTN_ID_POWER,
-};
-
-// TODO: this belongs in defines.h or better yet a platform.h
-#define BTN_RESUME BTN_X
-#define BTN_SLEEP BTN_POWER
-
 void PAD_reset(void);
 void PAD_poll(void);
 int PAD_anyPressed(void);
@@ -201,7 +237,7 @@ int PAD_isPressed(int btn);
 int PAD_justReleased(int btn);
 int PAD_justRepeated(int btn);
 
-int PAD_tappedMenu(uint32_t now); // special case, returns 1 on release of BTN_MENU within 250ms and BTN_PLUS/BTN_MINUS haven't been pressed
+int PAD_tappedMenu(uint32_t now); // special case, returns 1 on release of BTN_MENU within 250ms if BTN_PLUS/BTN_MINUS haven't been pressed
 
 ///////////////////////////////
 
@@ -213,30 +249,78 @@ void VIB_setStrength(int strength);
 ///////////////////////////////
 
 #define BRIGHTNESS_BUTTON_LABEL "+ -" // ew
-typedef void (*POW_callback_t)(void);
-void POW_init(void);
-void POW_quit(void);
-void POW_warn(int enable);
 
-void POW_update(int* dirty, int* show_setting, POW_callback_t before_sleep, POW_callback_t after_sleep);
+typedef void (*PWR_callback_t)(void);
+void PWR_init(void);
+void PWR_quit(void);
+void PWR_warn(int enable);
 
-void POW_disablePowerOff(void);
-void POW_powerOff(void);
+int PWR_ignoreSettingInput(int btn, int show_setting);
+void PWR_update(int* dirty, int* show_setting, PWR_callback_t before_sleep, PWR_callback_t after_sleep);
 
-void POW_fauxSleep(void);
-void POW_disableAutosleep(void);
-void POW_enableAutosleep(void);
-int POW_preventAutosleep(void);
+void PWR_disablePowerOff(void);
+void PWR_powerOff(void);
+int PWR_isPoweringOff(void);
 
-int POW_isCharging(void);
-int POW_getBattery(void);
+void PWR_fauxSleep(void);
 
-#define CPU_SPEED_MENU			 504000 // 240000 had latency issues
-#define CPU_SPEED_POWERSAVE 	1104000
-#define CPU_SPEED_NORMAL 		1296000
-#define CPU_SPEED_PERFORMANCE	1488000
-void POW_setCPUSpeed(int speed);
+void PWR_disableSleep(void);
+void PWR_enableSleep(void);
+
+void PWR_disableAutosleep(void);
+void PWR_enableAutosleep(void);
+int PWR_preventAutosleep(void);
+
+int PWR_isCharging(void);
+int PWR_getBattery(void);
+
+enum {
+	CPU_SPEED_MENU,
+	CPU_SPEED_POWERSAVE,
+	CPU_SPEED_NORMAL,
+	CPU_SPEED_PERFORMANCE,
+};
+#define PWR_setCPUSpeed PLAT_setCPUSpeed
+/////////////
+
+typedef void (*scaler_t)(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dw, uint32_t dh, uint32_t dp);
+
 
 ///////////////////////////////
+
+void PLAT_initInput();
+void PLAT_quitInput();
+
+SDL_Surface* PLAT_initVideo(void);
+void PLAT_quitVideo(void);
+void PLAT_clearVideo(SDL_Surface* screen);
+void PLAT_clearAll(void);
+void PLAT_clearLayers(int layer);
+void PLAT_setVsync(int vsync);
+SDL_Surface* PLAT_resizeVideo(int w, int h, int pitch);
+void PLAT_setVideoScaleClip(int x, int y, int width, int height);
+void PLAT_setNearestNeighbor(int enabled);
+void PLAT_setSharpness(int sharpness);
+void PLAT_vsync(int remaining);
+scaler_t PLAT_getScaler(GFX_Renderer* renderer);
+void PLAT_blitRenderer(GFX_Renderer* renderer);
+void PLAT_flip(SDL_Surface* screen, int sync);
+
+void PLAT_initGameOverlay(const char* ovl_path);
+SDL_Surface* PLAT_initOverlay(void);
+void PLAT_quitOverlay(void);
+void PLAT_enableOverlay(int enable);
+	
+#define PWR_LOW_CHARGE 10
+void PLAT_getBatteryStatus(int* is_charging, int* charge); // 0,1 and 0,10,20,40,60,80,100
+void PLAT_enableBacklight(int enable);
+void PLAT_powerOff(void);
+	
+void PLAT_setCPUSpeed(int speed); // enum
+void PLAT_setRumble(int strength);
+int PLAT_pickSampleRate(int requested, int max);
+
+char* PLAT_getModel(void);
+int PLAT_isOnline(void);
 
 #endif

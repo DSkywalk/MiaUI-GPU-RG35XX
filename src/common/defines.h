@@ -1,43 +1,7 @@
 #ifndef __DEFINES_H__
 #define __DEFINES_H__
 
-#define CODE_UP			0x5A
-#define CODE_DOWN		0x5B
-#define CODE_LEFT		0x5C
-#define CODE_RIGHT		0x5D
-#define CODE_A			0x5E
-#define CODE_B			0x5F
-#define CODE_X			0x60
-#define CODE_Y			0x61
-#define CODE_START		0x62
-#define CODE_SELECT		0x63
-#define CODE_L1			0x64
-#define CODE_R1			0x65
-#define CODE_L2			0x66
-#define CODE_R2			0x67
-#define CODE_MENU		0x68
-#define CODE_PLUS		0x6C
-#define CODE_MINUS		0x6D
-#define CODE_POWER		0x74
-
-#define	BUTTON_UP		SDLK_KATAKANA
-#define	BUTTON_RIGHT	SDLK_KATAKANAHIRAGANA
-#define	BUTTON_DOWN		SDLK_HIRAGANA
-#define	BUTTON_LEFT		SDLK_HENKAN
-#define	BUTTON_A		SDLK_MUHENKAN
-#define	BUTTON_B		SDLK_KP_JPCOMMA
-#define	BUTTON_X		SDLK_KP_ENTER
-#define	BUTTON_Y		SDLK_RCTRL
-#define	BUTTON_L1		SDLK_RALT
-#define	BUTTON_L2		SDLK_HOME
-#define	BUTTON_R1		SDLK_BREAK
-#define	BUTTON_R2		SDLK_UP
-#define	BUTTON_SELECT	SDLK_PRINT
-#define	BUTTON_START	SDLK_KP_DIVIDE
-#define	BUTTON_MENU		SDLK_PAGEUP
-#define	BUTTON_PLUS		SDLK_DOWN
-#define	BUTTON_MINUS	SDLK_PAGEDOWN
-#define	BUTTON_POWER	SDLK_UNKNOWN
+#include "platform.h"
 
 #define VOLUME_MIN 		0
 #define VOLUME_MAX 		20
@@ -46,23 +10,25 @@
 
 #define MAX_PATH 512
 
-#define SDCARD_PATH "/mnt/sdcard"
 #define ROMS_PATH SDCARD_PATH "/Roms"
-#define ROOT_SYSTEM_PATH SDCARD_PATH "/.system/"
-#define SYSTEM_PATH SDCARD_PATH "/.system/" PLATFORM
-#define RES_PATH SDCARD_PATH "/.system/res"
+#define ROOT_SYSTEM_PATH SDCARD_SYS
+#define SYSTEM_PATH SDCARD_SYS
+#define RES_PATH SDCARD_SYS "/res"
 #define FONT_PATH RES_PATH "/BPreplayBold-unhinted.otf"
-#define USERDATA_PATH SDCARD_PATH "/.userdata/" PLATFORM
+#define USERDATA_PATH SDCARD_PATH "/Profile"
+#define SHARED_USERDATA_PATH SDCARD_PATH "/Profile/shared"
 #define PAKS_PATH SYSTEM_PATH "/paks"
-#define RECENT_PATH USERDATA_PATH "/.minui/recent.txt"
+#define RECENT_PATH SHARED_USERDATA_PATH "/recent.txt"
+#define SIMPLE_MODE_PATH SHARED_USERDATA_PATH "/enable-simple-mode"
+#define AUTO_RESUME_PATH SHARED_USERDATA_PATH "/auto_resume.txt"
+#define AUTO_RESUME_SLOT 9
+
 #define FAUX_RECENT_PATH SDCARD_PATH "/Recently Played"
 #define COLLECTIONS_PATH SDCARD_PATH "/Collections"
 
 #define LAST_PATH "/tmp/last.txt" // transient
 #define CHANGE_DISC_PATH "/tmp/change_disc.txt"
 #define RESUME_SLOT_PATH "/tmp/resume_slot.txt"
-#define AUTO_RESUME_PATH USERDATA_PATH "/.minui/auto_resume.txt"
-#define AUTO_RESUME_SLOT 9
 
 #define TRIAD_WHITE 		0xff,0xff,0xff
 #define TRIAD_BLACK 		0x00,0x00,0x00
@@ -78,18 +44,8 @@
 #define COLOR_BLACK			(SDL_Color){TRIAD_BLACK}
 #define COLOR_LIGHT_TEXT	(SDL_Color){TRIAD_LIGHT_TEXT}
 #define COLOR_DARK_TEXT		(SDL_Color){TRIAD_DARK_TEXT}
+#define COLOR_DARK_PILL		(SDL_Color){TRIAD_LIGHT_GRAY}
 #define COLOR_BUTTON_TEXT	(SDL_Color){TRIAD_GRAY}
-
-#define BASE_WIDTH 320
-#define BASE_HEIGHT 240
-
-#define SCREEN_WIDTH 	640
-#define SCREEN_HEIGHT 	480
-#define SCREEN_SCALE 	2 // SCREEN_HEIGHT / BASE_HEIGHT
-
-#define SCREEN_DEPTH 	16
-#define SCREEN_BPP 		2
-#define SCREEN_PITCH 	(SCREEN_WIDTH * SCREEN_BPP)
 
 // all before scale
 #define PILL_SIZE 30
@@ -99,13 +55,31 @@
 #define SETTINGS_SIZE 4
 #define SETTINGS_WIDTH 80
 
-#define MAIN_ROW_COUNT 6 // SCREEN_HEIGHT / (PILL_SIZE * SCREEN_SCALE) - 2 (floor and subtract 1 if not an integer)
+#ifndef MAIN_ROW_COUNT
+#define MAIN_ROW_COUNT 6 // FIXED_HEIGHT / (PILL_SIZE * FIXED_SCALE) - 2 (floor and subtract 1 if not an integer)
+#endif
+
+#ifndef PADDING
 #define PADDING 10 // PILL_SIZE / 3 (or non-integer part of the previous calculatiom divided by three)
+#endif
 
 #define FONT_LARGE 16 	// menu
 #define FONT_MEDIUM 14 	// single char button label
 #define FONT_SMALL 12 	// button hint
 #define FONT_TINY 10  	// multi char button label
+#define FONT_MICRO 7  	// icon overlay text
+
+#ifndef MAXSHADERS
+#define MAXSHADERS 3
+#endif
+
+enum
+{
+	GFX_SCALE_FULLSCREEN = 0,
+	GFX_SCALE_FIT,
+	GFX_SCALE_FILL,
+	GFX_SCALE_NUM_OPTIONS // do not use 
+};
 
 ///////////////////////////////
 
@@ -116,9 +90,105 @@
 #define MIN(a, b) (a) < (b) ? (a) : (b)
 #define CEIL_DIV(a,b) ((a) + (b) - 1) / (b)
 
-#define SCALE1(a) ((a)*SCREEN_SCALE)
-#define SCALE2(a,b) ((a)*SCREEN_SCALE),((b)*SCREEN_SCALE)
-#define SCALE4(a,b,c,d) ((a)*SCREEN_SCALE),((b)*SCREEN_SCALE),((c)*SCREEN_SCALE),((d)*SCREEN_SCALE)
+#define SCALE1(a) ((a)*FIXED_SCALE)
+#define SCALE2(a,b) ((a)*FIXED_SCALE),((b)*FIXED_SCALE)
+#define SCALE3(a,b,c) ((a)*FIXED_SCALE),((b)*FIXED_SCALE),((c)*FIXED_SCALE)
+#define SCALE4(a,b,c,d) ((a)*FIXED_SCALE),((b)*FIXED_SCALE),((c)*FIXED_SCALE),((d)*FIXED_SCALE)
 
+///////////////////////////////
+
+#define HAS_POWER_BUTTON (BUTTON_POWER!=BUTTON_NA)
+#define HAS_POWEROFF_BUTTON (BUTTON_POWEROFF!=BUTTON_NA)
+#define HAS_MENU_BUTTON (BUTTON_MENU!=BUTTON_NA)
+#define HAS_SKINNY_SCREEN (FIXED_WIDTH<320)
+
+///////////////////////////////
+
+#define BUTTON_NA	-1
+#define CODE_NA		-1
+#define JOY_NA		-1
+#define AXIS_NA		-1
+
+#ifndef BUTTON_POWEROFF
+#define BUTTON_POWEROFF BUTTON_NA
+#endif
+#ifndef CODE_POWEROFF
+#define CODE_POWEROFF CODE_NA
+#endif
+
+#ifndef BUTTON_MENU_ALT
+#define BUTTON_MENU_ALT BUTTON_NA
+#endif
+#ifndef CODE_MENU_ALT
+#define CODE_MENU_ALT CODE_NA
+#endif
+#ifndef JOY_MENU_ALT
+#define JOY_MENU_ALT JOY_NA
+#endif
+
+#ifndef AXIS_L2
+#define AXIS_L2	AXIS_NA
+#define AXIS_R2	AXIS_NA
+#endif 
+
+#ifndef HAS_HDMI
+#define HDMI_WIDTH	FIXED_WIDTH
+#define HDMI_HEIGHT	FIXED_HEIGHT
+#define HDMI_PITCH	FIXED_PITCH
+#define HDMI_SIZE	FIXED_SIZE
+#endif
+
+#ifndef BTN_A // prevent collisions with input.h in keymon
+// TODO: doesn't this belong in api.h? it's meaningless without PAD_*
+enum {
+	BTN_ID_NONE = -1,
+	BTN_ID_UP,
+	BTN_ID_DOWN,
+	BTN_ID_LEFT,
+	BTN_ID_RIGHT,
+	BTN_ID_A,
+	BTN_ID_B,
+	BTN_ID_X,
+	BTN_ID_Y,
+	BTN_ID_START,
+	BTN_ID_SELECT,
+	BTN_ID_L1,
+	BTN_ID_R1,
+	BTN_ID_L2,
+	BTN_ID_R2,
+	BTN_ID_L3,
+	BTN_ID_R3,
+	BTN_ID_MENU,
+	BTN_ID_PLUS,
+	BTN_ID_MINUS,
+	BTN_ID_POWER,	
+	BTN_ID_POWEROFF,
+	BTN_ID_COUNT,
+};
+enum {
+	BTN_NONE	= 0,
+	BTN_UP 		= 1 << BTN_ID_UP,
+	BTN_DOWN	= 1 << BTN_ID_DOWN,
+	BTN_LEFT	= 1 << BTN_ID_LEFT,
+	BTN_RIGHT	= 1 << BTN_ID_RIGHT,
+	BTN_A		= 1 << BTN_ID_A,
+	BTN_B		= 1 << BTN_ID_B,
+	BTN_X		= 1 << BTN_ID_X,
+	BTN_Y		= 1 << BTN_ID_Y,
+	BTN_START	= 1 << BTN_ID_START,
+	BTN_SELECT	= 1 << BTN_ID_SELECT,
+	BTN_L1		= 1 << BTN_ID_L1,
+	BTN_R1		= 1 << BTN_ID_R1,
+	BTN_L2		= 1 << BTN_ID_L2,
+	BTN_R2		= 1 << BTN_ID_R2,
+	BTN_L3		= 1 << BTN_ID_L3,
+	BTN_R3		= 1 << BTN_ID_R3,
+	BTN_MENU	= 1 << BTN_ID_MENU,
+	BTN_PLUS	= 1 << BTN_ID_PLUS,
+	BTN_MINUS	= 1 << BTN_ID_MINUS,
+	BTN_POWER	= 1 << BTN_ID_POWER,
+	BTN_POWEROFF= 1 << BTN_ID_POWEROFF,
+};
+#endif
 
 #endif
