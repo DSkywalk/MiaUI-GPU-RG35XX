@@ -12,8 +12,14 @@ void SetRawVolume(int value); // 0-40
 
 void SetBrightness(int value); // 0-10
 void SetVolume(int value); // 0-20
+void SetMasterVolumeKoriki(int value); //0-100
+void SetRawBrightnessKoriki(int value); //0-100
+void SaveSettings(void);
 
 int GetJack(void);
 void SetJack(int value); // 0-1
+
+int GetHDMI(void);
+void SetHDMI(int value); // 0-1
 
 #endif  // __msettings_h__

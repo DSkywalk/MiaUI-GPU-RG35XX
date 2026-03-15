@@ -3,13 +3,11 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
-#include <SDL/SDL.h>
-#include <SDL/SDL_image.h>
 #include <msettings.h>
 
 #include "defines.h"
-#include "utils.h"
 #include "api.h"
+#include "utils.h"
 
 enum {
 	CURSOR_YEAR,
@@ -22,28 +20,32 @@ enum {
 };
 
 int main(int argc , char* argv[]) {
-	POW_setCPUSpeed(CPU_SPEED_MENU);
+	PWR_setCPUSpeed(CPU_SPEED_MENU);
 	
 	SDL_Surface* screen = GFX_init(MODE_MAIN);
-	POW_init();
+	//PAD_init();
+	PWR_init();
 	InitSettings();
 	
 	// TODO: make use of SCALE1()
-	SDL_Surface* digits = SDL_CreateRGBSurface(SDL_SWSURFACE, 240,32, 16, 0,0,0,0);
+	SDL_Surface* digits = SDL_CreateRGBSurface(SDL_SWSURFACE, SCALE2(120,16), FIXED_DEPTH,RGBA_MASK_AUTO);
 	SDL_FillRect(digits, NULL, RGB_BLACK);
 	
 	SDL_Surface* digit;
 	char* chars[] = { "0","1","2","3","4","5","6","7","8","9","/",":", NULL };
 	char* c;
 	int i = 0;
-#define DIGIT_WIDTH 20
-#define DIGIT_HEIGHT 32
+#define DIGIT_WIDTH 10
+#define DIGIT_HEIGHT 16
+
 #define CHAR_SLASH 10
 #define CHAR_COLON 11
 	while (c = chars[i]) {
 		digit = TTF_RenderUTF8_Blended(font.large, c, COLOR_WHITE);
-		int y = i==CHAR_COLON ? -3 : 0; // : sits too low naturally
-		SDL_BlitSurface(digit, NULL, digits, &(SDL_Rect){ (i * DIGIT_WIDTH) + (DIGIT_WIDTH - digit->w)/2, y + (DIGIT_HEIGHT - digit->h)/2});
+		int y = i==CHAR_COLON ? SCALE1(-1.5) : 0; // : sits too low naturally
+		// TODO: y offset is wrong here
+		// printf("%s x:%i y:%i SCALE1(DIGIT_HEIGHT):%i SCALE1(DIGIT_HEIGHT) - digit->h:%i\n", c, (i * SCALE1(DIGIT_WIDTH)), y, SCALE1(DIGIT_HEIGHT), SCALE1(DIGIT_HEIGHT) - digit->h); fflush(stdout);
+		SDL_BlitSurface(digit, NULL, digits, &(SDL_Rect){ (i * SCALE1(DIGIT_WIDTH)) + (SCALE1(DIGIT_WIDTH) - digit->w)/2, y + (SCALE1(DIGIT_HEIGHT) - digit->h)/2 });
 		SDL_FreeSurface(digit);
 		i += 1;
 	}
@@ -65,12 +67,13 @@ int main(int argc , char* argv[]) {
 	int32_t seconds_selected = tm.tm_sec;
 	int32_t am_selected = tm.tm_hour < 12;
 	
+	// x,y,w are pre-scaled
 	int blit(int i, int x, int y) {
-		SDL_BlitSurface(digits, &(SDL_Rect){i*20,0,20,32}, screen, &(SDL_Rect){x,y});
-		return x + 20;
+		SDL_BlitSurface(digits, &(SDL_Rect){i*SCALE1(10),0,SCALE2(10,16)}, screen, &(SDL_Rect){x,y});
+		return x + SCALE1(10);
 	}
 	void blitBar(int x, int y, int w) {
-		GFX_blitPill(ASSET_UNDERLINE, screen, &(SDL_Rect){ x,y,w});
+		GFX_blitPill(ASSET_UNDERLINE, screen, &(SDL_Rect){x,y,w});
 	}
 	int blitNumber(int num, int x, int y) {
 		int n;
@@ -138,6 +141,7 @@ int main(int argc , char* argv[]) {
 
 	int dirty = 1;
 	int show_setting = 0;
+	int was_online = PLAT_isOnline();
 	while(!quit) {
 		uint32_t frame_start = SDL_GetTicks();
 		
@@ -230,7 +234,11 @@ int main(int argc , char* argv[]) {
 			}
 		}
 		
-		POW_update(&dirty, &show_setting, NULL,NULL);
+		PWR_update(&dirty, NULL, NULL,NULL);
+		
+		int is_online = PLAT_isOnline();
+		if (was_online!=is_online) dirty = 1;
+		was_online = is_online;
 		
 		if (dirty) {
 			validate();
@@ -239,27 +247,25 @@ int main(int argc , char* argv[]) {
 			
 			GFX_blitHardwareGroup(screen, show_setting);
 			
-			if (show_setting) {
-				if (show_setting==1) GFX_blitButtonGroup((char*[]){ BRIGHTNESS_BUTTON_LABEL,"BRIGHTNESS",  NULL }, screen, 0);
-				else GFX_blitButtonGroup((char*[]){ "MENU","BRIGHTNESS",  NULL }, screen, 0);
-			}
-			else GFX_blitButtonGroup((char*[]){ "SELECT",show_24hour?"12 HOUR":"24 HOUR", NULL }, screen, 0);
+			if (show_setting) GFX_blitHardwareHints(screen, show_setting);
+			else GFX_blitButtonGroup((char*[]){ "SELECT",show_24hour?"12 HOUR":"24 HOUR", NULL }, 0, screen, 0);
 
-			GFX_blitButtonGroup((char*[]){ "B","CANCEL", "A","SET", NULL }, screen, 1);
+			GFX_blitButtonGroup((char*[]){ "B","CANCEL", "A","SET", NULL }, 1, screen, 1);
 		
-			// 376 or 446
-			int ox = (screen->w - (show_24hour?376:446)) / 2;
+			// 376 or 446 (@2x)
+			// 188 or 223 (@1x)
+			int ox = (screen->w - (show_24hour?SCALE1(188):SCALE1(223))) / 2;
 			
 			// datetime
 			int x = ox;
-			int y = 185;
-		
+			int y = SCALE1((((FIXED_HEIGHT / FIXED_SCALE)-PILL_SIZE-DIGIT_HEIGHT)/2));
+			
 			x = blitNumber(year_selected, x,y);
 			x = blit(CHAR_SLASH, x,y);
 			x = blitNumber(month_selected, x,y);
 			x = blit(CHAR_SLASH, x,y);
 			x = blitNumber(day_selected, x,y);
-			x += 20; // space
+			x += SCALE1(10); // space
 			
 			am_selected = hour_selected < 12;
 			if (show_24hour) {
@@ -281,21 +287,21 @@ int main(int argc , char* argv[]) {
 			
 			int ampm_w;
 			if (!show_24hour) {
-				x += 20; // space
+				x += SCALE1(10); // space
 				SDL_Surface* text = TTF_RenderUTF8_Blended(font.large, am_selected ? "AM" : "PM", COLOR_WHITE);
-				ampm_w = text->w + 4;
-				SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){x,y-6});
+				ampm_w = text->w + SCALE1(2);
+				SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){x,y-SCALE1(3)});
 				SDL_FreeSurface(text);
 			}
 		
 			// cursor
 			x = ox;
-			y = 222;
+			y += SCALE1(19);
 			if (select_cursor!=CURSOR_YEAR) {
-				x += 100; // YYYY/
-				x += (select_cursor - 1) * 60;
+				x += SCALE1(50); // YYYY/
+				x += (select_cursor - 1) * SCALE1(30);
 			}
-			blitBar(x,y, (select_cursor==CURSOR_YEAR ? 80 : (select_cursor==CURSOR_AMPM ? ampm_w : 40)));
+			blitBar(x,y, (select_cursor==CURSOR_YEAR ? SCALE1(40) : (select_cursor==CURSOR_AMPM ? ampm_w : SCALE1(20))));
 		
 			GFX_flip(screen);
 			dirty = 0;
@@ -306,10 +312,12 @@ int main(int argc , char* argv[]) {
 	SDL_FreeSurface(digits);
 	
 	QuitSettings();
-	POW_quit();
+	PWR_quit();
+	//PAD_quit();
 	GFX_quit();
 	
 	
+	// TODO: getting and saving time should be part of PLAT_*
 	// TODO: if (seconds_selected==tm.tm_sec) refresh tm and update seconds_selected
 	
 	if (save_changes) {
