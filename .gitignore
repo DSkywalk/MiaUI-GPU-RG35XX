@@ -6,6 +6,7 @@ cores/output
 private
 releases
 src/boot/output
+tools
 
 *.o
 *.so

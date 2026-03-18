@@ -1,0 +1,17 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+case "$1" in
+  start)
+	mkdir -p /var/run/evmapy
+	touch /var/run/evmapy/ready
+   ;;
+  *)
+    echo "Usage: /etc/init.d/S15evmapy {start}"
+    exit 1
+    ;;
+esac
+
+exit 0
+

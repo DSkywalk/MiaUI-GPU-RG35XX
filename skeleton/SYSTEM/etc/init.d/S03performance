@@ -1,0 +1,26 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+	# Disable the IO scheduler (it just ends up slowing down the MicroSD cards)
+	echo noop > /sys/devices/b0238000.mmc/mmc_host/mmc0/emmc_boot_card/block/mmcblk0/queue/scheduler
+	echo noop > /sys/devices/b0230000.mmc/mmc_host/mmc1/sd_card/block/mmcblk1/queue/scheduler
+
+	# Disable MicroSD card power-saving (helps reduce load stutter)
+	echo on > /sys/devices/b0238000.mmc/mmc_host/mmc0/power/control
+	echo on > /sys/devices/b0230000.mmc/mmc_host/mmc1/power/control
+
+	# Fix /run issues
+	rm /run/messagebus.pid
+    ;;
+    stop)
+    ;;
+    restart|reload)
+    ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?
+

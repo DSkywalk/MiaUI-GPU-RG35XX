@@ -1,0 +1,20 @@
+back = space
+start = enter
+guide = esc
+
+a = mouse_left
+b = mouse_right
+x = n
+y = y
+
+l1 = 1
+l2 = 2
+r1 = 3
+r2 = 4
+
+up = mouse_movement_up
+down = mouse_movement_down
+left = mouse_movement_left
+right = mouse_movement_right
+
+dpad_mouse_step = 8

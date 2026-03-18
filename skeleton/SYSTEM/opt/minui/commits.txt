@@ -1,0 +1,41 @@
+UNION
+--------
+MinUI                   24b65c93  shauninman/MinUI
+
+TOOLCHAINS
+--------
+m17-toolchain           385666e4  shauninman/union-m17-toolchain
+miyoomini-toolchain     90ce1ec3  shauninman/union-miyoomini-toolchain
+nano-toolchain          24b65c93  shauninman/MinUI
+rg353-toolchain         2ce165ac  shauninman/union-rg353-toolchain
+rg35xx-toolchain        cd2bf2b5  shauninman/union-rg35xx-toolchain
+rgb30-toolchain         75525c03  shauninman/union-rgb30-toolchain
+tg5040-toolchain        f9eee1a6  shauninman/union-tg5040-toolchain
+trimui-toolchain        53663b6f  shauninman/union-trimui-toolchain
+trimuismart-toolchain   32c62ac5  shauninman/union-trimuismart-toolchain
+
+LIBRETRO
+--------
+libretro-common         67df6b8b  libretro/libretro-common
+
+RG35XX
+--------
+DinguxCommander         2b8b2904  shauninman/DinguxCommander
+CORES
+beetle-pce-fast         69d93f14  libretro/beetle-pce-fast-libretro
+beetle-vb               dd6393f7  libretro/beetle-vb-libretro
+fake-08                 8594cfd2  jtothebell/fake-08
+fceumm                  c4efb229  libretro/libretro-fceumm
+gambatte                c21b9fb8  libretro/gambatte-libretro
+gpsp                    541adc9e  libretro/gpsp
+mednafen_supafaust      75c658cc  libretro/supafaust
+mgba                    a69c3434  libretro/mgba
+pcsx_rearmed            4373e29d  libretro/pcsx_rearmed
+picodrive               c7e1c39b  irixxxx/picodrive
+pokemini                9ba2c2d9  libretro/PokeMini
+race                    f65011e6  libretro/race
+snes9x2005_plus         fd45b0e0  libretro/snes9x2005
+
+MiaUI Extra cores
+-----------------
+https://github.com/rg35xx-cfw/Koriki

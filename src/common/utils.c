@@ -96,6 +96,12 @@ void getDisplayName(const char* in_name, char* out_name) {
     }
     // --- FIN DE LA LÓGICA DEL "DOT" ---
 
+        // if arcade list, look up real name in MAME DB
+    for (int i = 0; mame_list[i].code != NULL; i++) {
+        if (strcmp(mame_list[i].code, out_name) == 0) {
+            strcpy(out_name, mame_list[i].name);
+        }
+    }
 
     // remove trailing parens (round and square)
     strcpy(work_name, out_name);
@@ -113,12 +119,6 @@ void getDisplayName(const char* in_name, char* out_name) {
     while(tmp>out_name && isspace((unsigned char)*tmp)) tmp--;
     tmp[1] = '\0';
 
-    // if arcade list, look up real name in MAME DB
-    for (int i = 0; mame_list[i].code != NULL; i++) {
-        if (strcmp(mame_list[i].code, out_name) == 0) {
-            strcpy(out_name, mame_list[i].name);
-        }
-    }
 }
 
 /**

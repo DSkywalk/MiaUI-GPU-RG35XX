@@ -1,0 +1,29 @@
+#!/bin/sh
+BOOTCONF="/boot/batocera-boot.conf"
+
+. /etc/profile.d/xdg.sh
+. /etc/profile.d/dbus.sh
+
+case "$1" in
+	start)
+		minui & 
+	    ;;
+
+	stop)
+		rm -f /tmp/minui_exec
+		killall -9 minui.elf      2>/dev/null
+		killall minui 2>/dev/null
+		;;
+
+	restart|reload)
+		"$0" stop
+		"$0" start
+		;;
+
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+esac
+
+exit $?
+

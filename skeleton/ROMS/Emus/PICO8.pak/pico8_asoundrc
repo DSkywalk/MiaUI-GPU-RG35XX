@@ -1,0 +1,7 @@
+pcm.pico8_fix {
+    type plug
+    slave {
+        pcm "softvol"
+        rate 44100
+    }
+}

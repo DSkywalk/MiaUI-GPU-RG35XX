@@ -1,0 +1,36 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+	mkdir /dev/pts
+	mount -t devpts devpts /dev/pts
+
+	mkdir /dev/shm
+	mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /dev/shm
+	mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+        # mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /var/lib/alsa
+	
+	# sdl2 cache and /var/run
+	mkdir /tmp/profiledata
+	mkdir /tmp/evmapy
+	mkdir /tmp/udev
+	mkdir /tmp/lock
+
+	mount -t ext4 -o noatime,nodiratime,errors=continue /dev/mmcblk0p3 /userdata
+    ;;
+    stop)
+	sync
+	umount /userdata
+	umount /tmp
+	umount /dev/shm
+	umount /dev/pts
+    ;;
+    restart|reload)
+    ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?
+

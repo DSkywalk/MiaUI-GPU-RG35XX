@@ -1,0 +1,57 @@
+#!/bin/sh
+
+# Configuración
+ZRAM_SIZE="64M"
+MAX_PARTITIONS=5
+SD_DEVICE="/dev/mmcblk1p"
+
+case "$1" in
+    start)
+	SD_SWAP_FOUND=false
+
+	for i in $(seq 1 $MAX_PARTITIONS); do
+            PART="${SD_DEVICE}${i}"
+            if [ -b "$PART" ]; then
+                # Intentamos activar la swap de la SD primero
+                if swapon "$PART" 2>/dev/null; then
+                    echo "Swap detected ($PART)."
+                    SD_SWAP_FOUND=true
+                fi
+            fi
+        done
+
+	if [ "$SD_SWAP_FOUND" = true ]; then
+		echo 1 > /sys/block/zram0/reset 2>/dev/null
+		echo 64M > /sys/block/zram0/disksize
+
+		mkswap /dev/zram0
+		if swapon /dev/zram0 2>/dev/null; then
+    		exit 0 # OK
+    else
+        exit 2
+    fi
+  else
+    exit 1
+	fi
+    ;;
+
+    stop)
+
+	swapoff /dev/zram0 2>/dev/null
+        echo 1 > /sys/block/zram0/reset 2>/dev/null
+        
+        for i in $(seq 1 $MAX_PARTITIONS); do
+            swapoff "${SD_DEVICE}${i}" 2>/dev/null
+        done
+        
+	echo "Swap removed."                       
+    ;;
+    restart|reload)
+    ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?
+

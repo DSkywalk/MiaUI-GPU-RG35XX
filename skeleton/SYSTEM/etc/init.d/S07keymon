@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# Starts keymon services
+#
+
+case "$1" in
+    start)
+	source /etc/minui.env
+        /opt/minui/bin/keymon.elf &
+    ;;
+    stop)
+    ;;
+    restart|reload)
+    ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?

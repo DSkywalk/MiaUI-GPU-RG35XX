@@ -45,6 +45,7 @@ static int overclock = 1; // normal
 static int DEVICE_WIDTH = FIXED_WIDTH;
 static int DEVICE_HEIGHT = FIXED_HEIGHT;
 static int DEVICE_PITCH = FIXED_PITCH;
+static retro_keyboard_event_t retro_keyboard_cb = NULL;
 
 GFX_Renderer renderer;
 
@@ -1734,14 +1735,26 @@ static void input_poll_callback(void) {
     for (int i=0; config.controls[i].name; i++) {
         ButtonMapping* mapping = &config.controls[i];
         int btn = 1 << mapping->local;
+        
         if (btn==BTN_NONE) continue; // present buttons can still be unbound
 
-        if (PAD_isPressed(btn) && (!mapping->mod || PAD_isPressed(BTN_MENU))) {
+        bool is_key = mapping->retro_key > 0;
+        bool mod_met = (!mapping->mod || PAD_isPressed(BTN_MENU));
 
-            if (mapping->retro_key > 0) {
-                // En vez de un 1, le "estampamos" el número del frame actual
+        if (retro_keyboard_cb != NULL && is_key) {
+            if (PAD_justPressed(btn) && mod_met) {
+                retro_keyboard_cb(true, mapping->retro_key, 0, 0); 
+            } 
+            else if (PAD_justReleased(btn)) {
+                retro_keyboard_cb(false, mapping->retro_key, 0, 0);
+            }
+        }
+
+        if (PAD_isPressed(btn) && mod_met) {
+            if (is_key) {
                 keyboard_state[mapping->retro_key] = current_input_frame;
-            } else if (mapping->retro >= 0) {
+            } 
+            else if (mapping->retro >= 0) {
                 buttons |= 1 << mapping->retro;
             }
 
@@ -1950,6 +1963,11 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
         const char **out = (const char **)data;
         if (out)
             *out = core.saves_dir; // save_dir;
+        break;
+    }
+    case RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK: {
+        const struct retro_keyboard_callback *cb = (const struct retro_keyboard_callback *)data;
+        retro_keyboard_cb = cb->callback;
         break;
     }
     // RETRO_ENVIRONMENT_SET_CONTROLLER_INFO 35

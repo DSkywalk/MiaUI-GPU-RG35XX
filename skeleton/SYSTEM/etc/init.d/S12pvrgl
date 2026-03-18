@@ -1,0 +1,28 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+
+	if [ -f /tmp/pvr.initted ]; then
+	  echo "pvr: alread initted."
+	else
+	  /usr/local/bin/pvrsrvctl --start --no-module
+	  touch /tmp/pvr.initted
+	  echo "pvr: init OK!"
+	fi
+    ;;
+    stop)
+        if [ -f /tmp/pvr.initted ]; then
+          echo "pvr: alread initted."
+	  /usr/local/bin/pvrsrvctl --stop --no-module
+        else
+	  echo "pvr: process not found?"
+	fi
+    ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+esac
+
+exit $?
+

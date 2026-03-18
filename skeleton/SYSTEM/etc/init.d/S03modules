@@ -1,0 +1,22 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        insmod /lib/modules/3.10.37/kernel/drivers/input/keyboard/gpio_keys_polled.ko
+        modprobe pvrsrvkm
+        rmmod ethernet
+        #echo allahu > /proc/sys/kernel/hostname
+        #insmod /lib/modules/3.10.37/8188eu.ko
+        #insmod /lib/modules/3.10.37/8192cu.ko
+    ;;
+    stop)
+    ;;
+    restart|reload)
+    ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?
+
