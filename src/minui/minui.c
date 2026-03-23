@@ -1423,7 +1423,7 @@ static int autoResume(void)
     // putFile(LAST_PATH, FAUX_RECENT_PATH); // saveLast() will crash here because top is NULL
 
     char cmd[256];
-    sprintf(cmd, "'%s' '%s'", escapeSingleQuotes(emu_path), escapeSingleQuotes(sd_path));
+    sprintf(cmd, "sh '%s' '%s'", escapeSingleQuotes(emu_path), escapeSingleQuotes(sd_path));
     putInt(RESUME_SLOT_PATH, AUTO_RESUME_SLOT);
     queueNext(cmd);
     return 1;
@@ -1439,7 +1439,7 @@ static void openPak(char *path)
     saveLast(path);
 
     char cmd[256];
-    sprintf(cmd, "'%s/launch.sh'", escapeSingleQuotes(path));
+    sprintf(cmd, "sh '%s/launch.sh'", escapeSingleQuotes(path));
     queueNext(cmd);
 }
 static void openRom(char *path, char *last)
@@ -1507,7 +1507,7 @@ static void openRom(char *path, char *last)
     saveLast(last == NULL ? sd_path : last);
 
     char cmd[256];
-    sprintf(cmd, "'%s' '%s'", escapeSingleQuotes(emu_path), escapeSingleQuotes(sd_path));
+    sprintf(cmd, "sh '%s' '%s'", escapeSingleQuotes(emu_path), escapeSingleQuotes(sd_path));
     queueNext(cmd);
 }
 static void openDirectory(char *path, int auto_launch)
