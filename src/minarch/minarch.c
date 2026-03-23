@@ -1741,6 +1741,7 @@ static void input_poll_callback(void) {
         bool is_key = mapping->retro_key > 0;
         bool mod_met = (!mapping->mod || PAD_isPressed(BTN_MENU));
 
+        // check cap32/ dosbox poll keyboard
         if (retro_keyboard_cb != NULL && is_key) {
             if (PAD_justPressed(btn) && mod_met) {
                 retro_keyboard_cb(true, mapping->retro_key, 0, 0); 
@@ -1749,8 +1750,8 @@ static void input_poll_callback(void) {
                 retro_keyboard_cb(false, mapping->retro_key, 0, 0);
             }
         }
-
-        if (PAD_isPressed(btn) && mod_met) {
+        // basic poll keyboard
+        else if (PAD_isPressed(btn) && mod_met) {
             if (is_key) {
                 keyboard_state[mapping->retro_key] = current_input_frame;
             } 
@@ -1824,7 +1825,7 @@ static void Input_init(const struct retro_input_descriptor *vars) {
         ButtonMapping* mapping = &config.controls[i];
         mapping->default_ = mapping->local;
 
-        // ¡NUEVO! Si es una tecla del teclado (retro == -1), saltamos la comprobación
+        // Si es una tecla del teclado (retro == -1), saltamos la comprobación
         // porque el core no nos va a decir si soporta teclas, asumimos que siempre sí.
         if (mapping->retro < 0) {
             mapping->ignore = 0; // Las teclas de teclado nunca se ignoran
@@ -3247,7 +3248,6 @@ static int OptionKeyboard_openMenu(MenuList* list, int i) {
         int k = 0;
         for (int j = 0; config.controls[j].name; j++) {
             ButtonMapping* button = &config.controls[j];
-            if (button->ignore) continue; // Saltamos botones no usados por el core
             
             MenuItem* item = &OptionKeyboard_menu.items[k++];
             item->id = j;
@@ -3272,7 +3272,6 @@ static int OptionKeyboard_openMenu(MenuList* list, int i) {
         int k = 0;
         for (int j = 0; config.controls[j].name; j++) {
             ButtonMapping* button = &config.controls[j];
-            if (button->ignore) continue;
             
             MenuItem* item = &OptionKeyboard_menu.items[k++];
             item->value = 0;
