@@ -97,7 +97,7 @@ This project is a personal hobby and a labor of love for a handheld I truly enjo
 
 I've spent over two years refining it so that it works exactly the way I want it to. So user support is not provided and the Issues tab is disabled. Clean Pull Requests are welcome, but for new features or major design changes, please fork the repository and build your own vision.
 
-If you just want to say hi, show off your customized setup, or tell me you're enjoying MiaUI, I'd 🥰 to hear from you over on: [@dskywalk.bsky.social](https://bsky.app/profile/dskywalk.bsky.social) or [@dskywalk@masto.es](https://masto.es/@dskywalk).
+If you just want to say hi, show off your customized setup, or tell me you're enjoying MiaUI, I'd 🥰 to hear from you over on: [@dskywalk.eurosky.social](https://bsky.app/profile/dskywalk.bsky.social) or [@dskywalk@masto.es](https://masto.es/@dskywalk).
 
 ### Testers
 * Thx to ^Morgoth^, Ricco, Eric Magnus, Wolfenprey, dfernandezd, ShinMetalSonic.
