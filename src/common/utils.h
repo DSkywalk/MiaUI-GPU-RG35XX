@@ -8,7 +8,8 @@ int suffixMatch(char* suf, char* str);
 int exactMatch(char* str1, char* str2);
 int hide(char* file_name);
 
-void getDisplayName(const char* in_name, char* out_name);
+int getDisplayName(const char* in_name, char* out_name);
+const char* getMameName(int index);
 void getEmuName(const char* in_name, char* out_name);
 void getEmuPath(char* emu_name, char* pak_path);
 

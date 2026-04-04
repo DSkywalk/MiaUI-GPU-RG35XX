@@ -412,14 +412,24 @@ typedef struct Entry
     char *unique;
     int type;
     int alpha; // index in parent Directory's alphas Array, which points to the index of an Entry in its entries Array :sweat_smile:
-    int needs_swap;  // si necesita swap, 0 si no
-    int is_darker; // la quiero oscura
+    int needs_swap;  // if need swap
+    int is_darker; // user darker
+    int mame_index; // mame romname index
 } Entry;
 
+/**
+ * Allocates and initializes a new Entry object.
+ * Processes the path to extract a clean display name and checks if it's a MAME game.
+ *
+ * @param path The absolute or relative file path of the entry.
+ * @param type The type of the entry (e.g., file, directory, or archive).
+ * @return A pointer to the newly allocated Entry.
+ */
 static Entry *Entry_new(char *path, int type)
 {
     char display_name[256];
-    getDisplayName(path, display_name);
+    int mame_index = getDisplayName(path, display_name);
+    
     Entry *self = malloc(sizeof(Entry));
     self->path = strdup(path);
     self->name = strdup(display_name);
@@ -428,6 +438,10 @@ static Entry *Entry_new(char *path, int type)
     self->alpha = 0;
     self->needs_swap = 0;
     self->is_darker = 0;
+    
+    // Store the index in the MAME database (-1 if it is not a MAME game)
+    self->mame_index = mame_index; 
+    
     return self;
 }
 static void Entry_free(Entry *self)
@@ -532,16 +546,27 @@ static void getUniqueName(Entry *entry, char *out_name)
     strcpy(tmp, ")");
 }
 
+/**
+ * Iterates through a directory's entries to assign alphabetical indices
+ * and handle display name collisions (duplicate titles).
+ * It will fall back to original MAME names or filenames to ensure uniqueness.
+ *
+ * @param self Pointer to the Directory object to be indexed.
+ */
 static void Directory_index(Directory *self)
 {
-    int skip_index = exactMatch(FAUX_RECENT_PATH, self->path) || prefixMatch(COLLECTIONS_PATH, self->path); // not alphabetized
+    // Skip alphabetizing for specific virtual or collection paths
+    int skip_index = exactMatch(FAUX_RECENT_PATH, self->path) || prefixMatch(COLLECTIONS_PATH, self->path); 
 
     Entry *prior = NULL;
     int alpha = -1;
     int index = 0;
+
     for (int i = 0; i < self->entries->count; i++)
     {
         Entry *entry = self->entries->items[i];
+
+        // Handle naming collisions between the prior entry and current entry
         if (prior != NULL && exactMatch(prior->name, entry->name))
         {
             if (prior->unique)
@@ -551,8 +576,10 @@ static void Directory_index(Directory *self)
 
             char *prior_filename = strrchr(prior->path, '/') + 1;
             char *entry_filename = strrchr(entry->path, '/') + 1;
+
             if (exactMatch(prior_filename, entry_filename))
             {
+                // Files are identical, fallback to prepending/appending emulator tags
                 char prior_unique[256];
                 char entry_unique[256];
                 getUniqueName(prior, prior_unique);
@@ -563,11 +590,23 @@ static void Directory_index(Directory *self)
             }
             else
             {
+                // Files are different (e.g., clones). 
+                // Fast retrieval of the intact MAME name using the stored index.
+                if (prior->mame_index != -1) {
+                    prior->unique = strdup(getMameName(prior->mame_index));
+                } else {
                 prior->unique = strdup(prior_filename);
+                }
+
+                if (entry->mame_index != -1) {
+                    entry->unique = strdup(getMameName(entry->mame_index));
+                } else {
                 entry->unique = strdup(entry_filename);
+                }
             }
         }
 
+        // Build the alphabetical fast-scroll index
         if (!skip_index)
         {
             int a = getIndexChar(entry->name);

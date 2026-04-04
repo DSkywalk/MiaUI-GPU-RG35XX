@@ -50,75 +50,93 @@ int hide(char* file_name) {
 }
 
 /**
- * Cleans up a filename for display.
- * Removes extensions, parenthesis content, and handles specific MAME naming.
+ * Cleans up a filename for display purposes.
+ * Removes file extensions, numeric prefixes (track numbers), and parenthesis/bracket content.
+ * Looks up the real, untruncated name in the MAME database if applicable.
+ *
+ * @param in_name The original filename or path to be processed.
+ * @param out_name The buffer where the cleaned display name will be stored.
+ * @return The index of the game in the mame_list array, or -1 if not found.
  */
-void getDisplayName(const char* in_name, char* out_name) {
+int getDisplayName(const char* in_name, char* out_name) {
     char* tmp;
     char work_name[256];
+    int mame_index = -1; // -1 indicates it is not a MAME game
+    
     strcpy(work_name, in_name);
     strcpy(out_name, in_name);
 
-    //printf("[utils] getDisplayName %s %s\n", in_name, work_name);
-    
-    // extract just the filename if necessary
+    // Extract just the filename if a path is provided
     tmp = strrchr(work_name, '/');
     if (tmp) strcpy(out_name, tmp+1);
-
-    //printf("[1] %s\n", )
     
-    // remove extension(s), eg. .p8.png
-    while ((tmp = strrchr(out_name, '.'))!=NULL) {
+    // Remove extension(s), e.g., .p8.png
+    while ((tmp = strrchr(out_name, '.')) != NULL) {
         int len = strlen(tmp);
-        if (len>2 && len<=4) tmp[0] = '\0'; // 3 letter extension plus dot
+        if (len > 2 && len <= 4) tmp[0] = '\0'; // 3-letter extension plus dot
         else break;
     }
 
-    // --- INICIO DE LA LÓGICA DEL "DOT" (Eliminar números de pista) ---
+    // --- START OF "DOT" LOGIC (Remove numeric prefixes) ---
     char *dot_ptr = strstr(out_name, ".");
-    // Nos aseguramos de que haya un punto y que no sea el primer carácter (ej: archivos ocultos como ".juego")
+    
+    // Ensure there is a dot and it is not the first character (e.g., hidden files like ".game")
     if (dot_ptr != NULL && dot_ptr != out_name) { 
         char *s = out_name;
-        // Avanzamos mientras sean números y no lleguemos al punto
+        
+        // Advance as long as characters are digits and we haven't reached the dot
         while (isdigit((unsigned char)*s) && s < dot_ptr) {
             s++;
         }
         
-        // Si s llegó exactamente al punto, significa que todo antes eran números
+        // If 's' reached exactly the dot, it means everything before it was purely numeric
         if (s == dot_ptr) {
-            dot_ptr++; // Saltamos el punto
-            if (*dot_ptr == ' ') {
-                dot_ptr++; // Saltamos el espacio si lo hay justo después
-            }
-            // Desplazamos el texto restante al principio de out_name para "borrar" el prefijo
+            dot_ptr++; // Skip the dot
+            if (*dot_ptr == ' ') dot_ptr++; // Skip the trailing space if there is one
+            
+            // Shift the remaining text to the beginning of out_name to erase the prefix
             memmove(out_name, dot_ptr, strlen(dot_ptr) + 1);
         }
     }
-    // --- FIN DE LA LÓGICA DEL "DOT" ---
+    // --- END OF "DOT" LOGIC ---
 
-        // if arcade list, look up real name in MAME DB
+    // If arcade list, look up real name in MAME database
     for (int i = 0; mame_list[i].code != NULL; i++) {
         if (strcmp(mame_list[i].code, out_name) == 0) {
+            mame_index = i; // Save the array index for future reference in O(1) lookups
             strcpy(out_name, mame_list[i].name);
+            break; // Optimization: stop searching once a match is found
         }
     }
 
-    // remove trailing parens (round and square)
+    // Remove trailing parens (round and square)
     strcpy(work_name, out_name);
-    while ((tmp=strrchr(out_name, '('))!=NULL || (tmp=strrchr(out_name, '['))!=NULL) {
-        if (tmp==out_name) break;
+    while ((tmp = strrchr(out_name, '(')) != NULL || (tmp = strrchr(out_name, '[')) != NULL) {
+        if (tmp == out_name) break;
         tmp[0] = '\0';
         tmp = out_name;
     }
     
-    // make sure we haven't nuked the entire name
-    if (out_name[0]=='\0') strcpy(out_name, work_name);
+    // Make sure we haven't nuked the entire name
+    if (out_name[0] == '\0') strcpy(out_name, work_name);
     
-    // remove trailing whitespace
+    // Remove trailing whitespace
     tmp = out_name + strlen(out_name) - 1;
-    while(tmp>out_name && isspace((unsigned char)*tmp)) tmp--;
+    while(tmp > out_name && isspace((unsigned char)*tmp)) tmp--;
     tmp[1] = '\0';
 
+    return mame_index;
+}
+
+/**
+ * Retrieves the full display name of a MAME game from the global database.
+ *
+ * @param index The position of the game within the mame_list array.
+ * @return A pointer to a constant string containing the full name (including metadata
+ * such as region or version), or NULL if the index is out of bounds.
+ */
+const char* getMameName(int index) {
+    return mame_list[index].name;
 }
 
 /**
