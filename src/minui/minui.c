@@ -595,13 +595,13 @@ static void Directory_index(Directory *self)
                 if (prior->mame_index != -1) {
                     prior->unique = strdup(getMameName(prior->mame_index));
                 } else {
-                prior->unique = strdup(prior_filename);
+                    prior->unique = strdup(prior_filename);
                 }
 
                 if (entry->mame_index != -1) {
                     entry->unique = strdup(getMameName(entry->mame_index));
                 } else {
-                entry->unique = strdup(entry_filename);
+                    entry->unique = strdup(entry_filename);
                 }
             }
         }
@@ -682,6 +682,85 @@ static void DirectoryArray_free(Array *self)
         Directory_free(self->items[i]);
     }
     Array_free(self);
+}
+///////////////////////////////////////
+
+/**
+ * Deletes the file associated with the given entry from the filesystem,
+ * removes it from the directory's entry list, and re-indexes the directory.
+ *
+ * @param dir Pointer to the Directory object.
+ * @param index The index of the entry to be deleted.
+ */
+static int deleteCurrentEntry(Directory *dir, int index)
+{
+    if (!dir || index < 0 || index >= dir->entries->count)
+        return 0;
+
+    Entry *entry = dir->entries->items[index];
+
+    // 1. Delete the actual file from the filesystem
+    if (remove(entry->path) != 0) {
+        printf("Error deleting file: %s\n", entry->path);
+        // If the filesystem prevents deletion, we abort removing it from the UI
+        return 0;
+    }
+
+    // Prepare the UI message based on the result
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Deleted: %s", entry->name);
+
+    // 2. Free the memory allocated for this specific entry
+    if (entry->path) free(entry->path);
+    if (entry->name) free(entry->name);
+    if (entry->unique) free(entry->unique);
+    free(entry);
+
+    // 3. Shift the remaining entries in the array to fill the gap
+    for (int i = index; i < dir->entries->count - 1; i++) {
+        dir->entries->items[i] = dir->entries->items[i + 1];
+    }
+    dir->entries->count--;
+
+    // 4. Clear and rebuild the alphabetical index to prevent crashes when using L1/R1
+    dir->alphas->count = 0;
+    Directory_index(dir);
+
+    // Render the message directly to the screen
+    SDL_Surface *notif_txt = TTF_RenderUTF8_Blended(font.large, msg, COLOR_LIGHT_RED);
+
+    // Use MinUI's exact scaling constants so the pill edges render without clipping
+    int pill_width = notif_txt->w + SCALE1(BUTTON_PADDING * 2);
+    int pill_height = SCALE1(PILL_SIZE);
+    
+    // Center the notification box on the screen
+    SDL_Rect bg_rect = {
+        (screen->w - pill_width) / 2,
+        (screen->h - pill_height) / 2, 
+        pill_width,
+        pill_height
+    };
+    
+    // Draw the background pill using proper dimensions
+    GFX_blitPill(ASSET_DARK_GRAY_PILL, screen, &bg_rect);
+    
+    // Position the text accurately inside the pill
+    SDL_Rect txt_rect = { 
+        bg_rect.x + SCALE1(BUTTON_PADDING), 
+        bg_rect.y + SCALE1(4), // Standard MinUI vertical offset for pills
+        notif_txt->w, 
+        notif_txt->h 
+    };
+    SDL_BlitSurface(notif_txt, NULL, screen, &txt_rect);
+    SDL_FreeSurface(notif_txt);
+    
+    // Force the hardware to draw this frame immediately, then block the thread
+    GFX_flip(screen);
+    SDL_Delay(2000); // 1000 milliseconds = 1 second delay
+
+    sync();
+
+    return 1;
 }
 
 ///////////////////////////////////////
@@ -1825,6 +1904,44 @@ int main(int argc, char *argv[])
             }
             else if (total > 0)
             {
+                if (show_setting && PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_START))
+                {
+                    Entry *target_entry = top->entries->items[selected];
+                    
+                    // Backup the name before deletion to display it on screen
+                    char deleted_name[256];
+                    strncpy(deleted_name, target_entry->name, sizeof(deleted_name) - 1);
+                    deleted_name[sizeof(deleted_name) - 1] = '\0';
+
+                    int success = deleteCurrentEntry(top, selected);
+                    if (!success)
+                        continue;
+
+                    // Update cursor and pagination bounds after deletion
+                    total = top->entries->count;
+                    if (total == 0) 
+                    {
+                        selected = 0;
+                        top->start = 0;
+                        top->end = 0;
+                    } 
+                    else 
+                    {
+                        if (selected >= total) selected = total - 1;
+                        
+                        if (top->end > total) 
+                        {
+                            top->end = total;
+                            top->start = (top->end > MAIN_ROW_COUNT) ? top->end - MAIN_ROW_COUNT : 0;
+                        }
+                    }
+                    
+                    // Reset the input timer to prevent skipped frames from jumping the cursor
+                    update_timer = SDL_GetTicks(); 
+                    dirty = 1; // Force a full UI redraw for the next iteration
+                    continue;  // Skip the rest of the inputs for this frame
+                }
+
                 if (PAD_justRepeated(BTN_UP))
                 {
                     if (selected == 0 && !PAD_justPressed(BTN_UP))
