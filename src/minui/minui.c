@@ -1971,6 +1971,9 @@ int main(int argc, char *argv[])
 
         if (result_ready)
         {
+            if (thumbbmp || result_thumb || folderbgbmp || result_bg)
+                dirty = 1; // Redraw on thumb/bg changes
+
             // Update thumbnail
             if (thumbbmp)
                 SDL_FreeSurface(thumbbmp);
@@ -1985,7 +1988,6 @@ int main(int argc, char *argv[])
 
             result_ready = 0;
             had_thumb = (thumbbmp != NULL);
-            dirty = 1; // Redraw
         }
         pthread_mutex_unlock(&thumb_mutex);
 
@@ -2064,29 +2066,6 @@ int main(int argc, char *argv[])
 
                     strncpy(old_thumb_path, thumbpath, sizeof(old_thumb_path) - 1);
                     old_thumb_path[sizeof(old_thumb_path) - 1] = '\0';
-                }
-            }
-
-            // Blit thumb & bg
-            if (!show_version)
-            {
-                if (folderbgbmp)
-                {
-                    SDL_Rect image_rect = {0, 0, screen->w, screen->h};
-                    SDL_BlitSurface(folderbgbmp, NULL, screen, &image_rect);
-                }
-
-                if (had_thumb && thumbbmp)
-                {
-                    int target_y = (int)(screen->h * 0.48);
-                    int center_y = target_y - (thumbbmp->h / 2);
-                    ox = (int)(screen->w - thumbbmp->w) - SCALE1(BUTTON_MARGIN);
-                    SDL_Rect dest_rect = {
-                        screen->w - (thumbbmp->w + SCALE1(BUTTON_MARGIN * 3)),
-                        center_y,
-                        thumbbmp->w,
-                        thumbbmp->h};
-                    SDL_BlitSurface(thumbbmp, NULL, screen, &dest_rect);
                 }
             }
 
@@ -2169,6 +2148,25 @@ int main(int argc, char *argv[])
             }
             else
             {
+                if (folderbgbmp)
+                {
+                    SDL_Rect image_rect = {0, 0, screen->w, screen->h};
+                    SDL_BlitSurface(folderbgbmp, NULL, screen, &image_rect);
+                }
+
+                if (had_thumb && thumbbmp)
+                {
+                    int target_y = (int)(screen->h * 0.48);
+                    int center_y = target_y - (thumbbmp->h / 2);
+                    ox = (int)(screen->w - thumbbmp->w) - SCALE1(BUTTON_MARGIN);
+                    SDL_Rect dest_rect = {
+                        screen->w - (thumbbmp->w + SCALE1(BUTTON_MARGIN * 3)),
+                        center_y,
+                        thumbbmp->w,
+                        thumbbmp->h};
+                    SDL_BlitSurface(thumbbmp, NULL, screen, &dest_rect);
+                }
+
                 // list
                 if (total > 0)
                 {
