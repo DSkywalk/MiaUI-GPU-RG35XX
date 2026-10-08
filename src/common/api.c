@@ -933,16 +933,170 @@ static struct SND_Context {
 /**
  * SDL Audio callback. Fills the stream with samples from the ring buffer.
  */
+///////////////////////////////////////
+// achievement chime
+//
+// A two-note chime synthesised on the fly from a quarter-kilobyte sine table.
+//
+// Why a table and not a baked PCM array: SDL negotiates the output rate in
+// SND_init, so a precomputed buffer would be pitch- and tempo-locked to
+// whatever rate it was generated at, and would need resampling to be correct.
+// A phase accumulator just takes the rate as a divisor and is right at any of
+// them. It is also 512 bytes of rodata instead of ~37KB.
+//
+// Cost per sample: one table index, two multiplies, three adds. Only while a
+// chime is sounding (~400ms, on an achievement unlock), and only a single
+// predictable branch otherwise.
+
+#define CHIME_LUT_BITS   8
+#define CHIME_LUT_SIZE   (1 << CHIME_LUT_BITS)
+#define CHIME_ATTACK_MS  8      // long enough not to click, short enough to be a chime
+#define CHIME_VOLUME     48     // out of 256, ie. a quarter of full scale
+#define CHIME_ENV_ONE    (1 << 24) // envelope accumulates in Q24...
+#define CHIME_ENV_SHIFT  9         // ...and is applied in Q15, so the multiply can't overflow
+
+// one cycle, full scale
+static const int16_t chime_sine[CHIME_LUT_SIZE] = {
+         0,    804,   1608,   2410,   3212,   4011,   4808,   5602,
+      6393,   7179,   7962,   8739,   9512,  10278,  11039,  11793,
+     12539,  13279,  14010,  14732,  15446,  16151,  16846,  17530,
+     18204,  18868,  19519,  20159,  20787,  21403,  22005,  22594,
+     23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
+     27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,
+     30273,  30571,  30852,  31113,  31356,  31580,  31785,  31971,
+     32137,  32285,  32412,  32521,  32609,  32678,  32728,  32757,
+     32767,  32757,  32728,  32678,  32609,  32521,  32412,  32285,
+     32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
+     30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,
+     27245,  26790,  26319,  25832,  25329,  24811,  24279,  23731,
+     23170,  22594,  22005,  21403,  20787,  20159,  19519,  18868,
+     18204,  17530,  16846,  16151,  15446,  14732,  14010,  13279,
+     12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
+      6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,
+         0,   -804,  -1608,  -2410,  -3212,  -4011,  -4808,  -5602,
+     -6393,  -7179,  -7962,  -8739,  -9512, -10278, -11039, -11793,
+    -12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530,
+    -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
+    -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
+    -27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956,
+    -30273, -30571, -30852, -31113, -31356, -31580, -31785, -31971,
+    -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
+    -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
+    -32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571,
+    -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
+    -27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731,
+    -23170, -22594, -22005, -21403, -20787, -20159, -19519, -18868,
+    -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
+    -12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,
+     -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804,
+};
+
+static const struct { uint16_t hz; uint16_t ms; } chime_notes[] = {
+    { 659,   40 }, // E5  - Blip inicial muy rápido
+    { 831,   40 }, // G#5 - Blip intermedio
+    { 988,   40 }, // B5  - Blip alto
+    { 1319, 400 }  // E6  - Campana final que se desvanece suavemente
+};
+#define CHIME_NOTE_COUNT ((int)(sizeof(chime_notes)/sizeof(chime_notes[0])))
+
+// Touched only by the audio thread, except chime_request.
+static struct {
+    int      playing;
+    int      note;
+    uint32_t phase;
+    uint32_t phase_inc;
+    int32_t  env;        // Q24
+    int32_t  env_rise;
+    int32_t  env_fall;
+    uint32_t attack;     // samples of attack left
+    uint32_t remain;     // samples left in this note
+} chime = {0};
+
+// Set on the emulation thread, consumed on the audio thread. A single word, so
+// the worst case is a trigger seen one callback late.
+static SDL_atomic_t chime_request;
+
+static void SND_chimeNote(int n) {
+    uint32_t rate = snd.sample_rate_out > 0 ? (uint32_t)snd.sample_rate_out : 44100;
+    uint32_t total = (uint32_t)((uint64_t)chime_notes[n].ms * rate / 1000);
+    uint32_t attack = (uint32_t)((uint64_t)CHIME_ATTACK_MS * rate / 1000);
+
+    if (total < 2) total = 2;
+    if (attack < 1) attack = 1;
+    if (attack > total/2) attack = total/2;
+
+    chime.note      = n;
+    chime.phase     = 0; // start on a zero crossing so the note cannot click in
+    chime.phase_inc = (uint32_t)(((uint64_t)chime_notes[n].hz << 32) / rate);
+    chime.env       = 0;
+    chime.env_rise  = CHIME_ENV_ONE / (int32_t)attack;
+    chime.env_fall  = CHIME_ENV_ONE / (int32_t)(total - attack);
+    chime.attack    = attack;
+    chime.remain    = total;
+}
+
+// Next chime sample, or 0 once it has finished. Advances the oscillator.
+static inline int32_t SND_chimeSample(void) {
+    int32_t env = chime.env >> CHIME_ENV_SHIFT;                  // Q24 -> Q15
+    int32_t s   = (chime_sine[chime.phase >> (32-CHIME_LUT_BITS)] * env) >> 15;
+
+    chime.phase += chime.phase_inc;
+
+    if (chime.attack) {
+        chime.attack--;
+        chime.env += chime.env_rise;
+        if (chime.env > CHIME_ENV_ONE) chime.env = CHIME_ENV_ONE;
+    }
+    else {
+        chime.env -= chime.env_fall;
+        if (chime.env < 0) chime.env = 0;
+    }
+
+    if (--chime.remain == 0) {
+        if (chime.note + 1 < CHIME_NOTE_COUNT) SND_chimeNote(chime.note + 1);
+        else chime.playing = 0;
+    }
+    return (s * CHIME_VOLUME) >> 8;
+}
+
+// Mix one chime sample into a stereo pair, clamping rather than wrapping.
+static inline void SND_chimeMix(int16_t* l, int16_t* r) {
+    int32_t c  = SND_chimeSample();
+    int32_t ml = *l + c;
+    int32_t mr = *r + c;
+    if (ml >  32767) ml =  32767; else if (ml < -32768) ml = -32768;
+    if (mr >  32767) mr =  32767; else if (mr < -32768) mr = -32768;
+    *l = (int16_t)ml;
+    *r = (int16_t)mr;
+}
+
+// Safe to call from any thread; never blocks, never allocates.
+void SND_playChime(void) {
+    SDL_AtomicSet(&chime_request, 1);
+}
+
 static void SND_audioCallback(void* userdata, uint8_t* stream, int len) { // plat_sound_callback
     if (snd.frame_count==0) return;
     
     int16_t *out = (int16_t *)stream;
     len /= (sizeof(int16_t) * 2);
-    
+
+    // Picked up here rather than in SND_batchSamples so the chime runs off the
+    // DAC clock: it stays in tune and in time even if the emulator stutters or
+    // the ring buffer underruns, and it never touches the emulation thread.
+    if (SDL_AtomicSet(&chime_request, 0)) {
+        SND_chimeNote(0);
+        chime.playing = 1;
+    }
+
     while (snd.frame_out!=snd.frame_in && len>0) {
-        *out++ = snd.buffer[snd.frame_out].left;
-        *out++ = snd.buffer[snd.frame_out].right;
-        
+        int16_t l = snd.buffer[snd.frame_out].left;
+        int16_t r = snd.buffer[snd.frame_out].right;
+        if (chime.playing) SND_chimeMix(&l, &r); // adds, never ducks
+
+        *out++ = l;
+        *out++ = r;
+
         snd.frame_filled = snd.frame_out;
         
         snd.frame_out += 1;
@@ -951,9 +1105,12 @@ static void SND_audioCallback(void* userdata, uint8_t* stream, int len) { // pla
         if (snd.frame_out>=snd.frame_count) snd.frame_out = 0;
     }
     
+    // starved: the game is silent here, but the chime should still ring out
     while (len>0) {
-        *out++ = 0;
-        *out++ = 0;
+        int16_t l = 0, r = 0;
+        if (chime.playing) SND_chimeMix(&l, &r);
+        *out++ = l;
+        *out++ = r;
         len -= 1;
     }
 }

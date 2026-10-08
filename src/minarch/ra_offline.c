@@ -23,6 +23,7 @@
 // module has no use for -- keep it standalone and just borrow the logger.
 enum { RA_LOG_INFO = 1, RA_LOG_WARN = 2 };
 void LOG_note(int level, const char* fmt, ...);
+void SND_playChime(void); // common/api.h, declared here to keep this file standalone
 #define LOG_info(fmt, ...) LOG_note(RA_LOG_INFO, fmt, ##__VA_ARGS__)
 #define LOG_warn(fmt, ...) LOG_note(RA_LOG_WARN, fmt, ##__VA_ARGS__)
 
@@ -336,6 +337,8 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
     ra.msg_id++;
 
     //LOG_debug("RA: unlocked %u (%s)\n", event->id, title ? title : "???");
+
+    SND_playChime(); // just sets a flag; the audio thread does the work
 
     ra_saveProgress();
 }
