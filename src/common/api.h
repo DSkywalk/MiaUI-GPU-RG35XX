@@ -165,6 +165,7 @@ int GFX_hdmiChanged(void);
 
 #define GFX_clear PLAT_clearVideo // (SDL_Surface* screen)
 #define GFX_clearAll PLAT_clearAll // (void)
+#define GFX_setUILayer PLAT_setUILayer // (int visible)
 #define GFX_clearLayers PLAT_clearLayers //(SDL_Surface *inputSurface,int x, int y)
 
 #define PAD_init PLAT_initInput
@@ -295,6 +296,11 @@ SDL_Surface* PLAT_initVideo(void);
 void PLAT_quitVideo(void);
 void PLAT_clearVideo(SDL_Surface* screen);
 void PLAT_clearAll(void);
+// The ui layer is a full-screen RGBA texture composited over the game. The
+// driver swizzles it on every upload, which is expensive, and in game it is
+// almost always empty - so let the caller say when it has nothing in it and
+// both the upload and the composite can be skipped. Defaults to visible.
+void PLAT_setUILayer(int visible);
 void PLAT_clearLayers(int layer);
 void PLAT_setVsync(int vsync);
 SDL_Surface* PLAT_resizeVideo(int w, int h, int pitch);

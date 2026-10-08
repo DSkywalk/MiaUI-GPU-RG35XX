@@ -20,6 +20,7 @@
 
 #include "defines.h"
 #include "platform.h"
+#include "profile.h"
 #include "api.h"
 #include "utils.h"
 
@@ -290,6 +291,25 @@ SDL_Surface* PLAT_initVideo(void) {
 	printGLString("Vendor", GL_VENDOR);
 	printGLString("Renderer", GL_RENDERER);
 
+#if PROFILE
+	// into the profile log too, since printf goes nowhere adb can read
+	{
+		GLint max_tex = 0, max_vp[2] = {0,0}, units = 0;
+		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+		glGetIntegerv(GL_MAX_VIEWPORT_DIMS, max_vp);
+		glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+		PROF_LOG("\n=== GL capabilities ===\n");
+		PROF_LOG("vendor      : %s\n", (const char*)glGetString(GL_VENDOR));
+		PROF_LOG("renderer    : %s\n", (const char*)glGetString(GL_RENDERER));
+		PROF_LOG("version     : %s\n", (const char*)glGetString(GL_VERSION));
+		PROF_LOG("backbuffer  : %d%d%d/%d depth %d\n", r, g, b, a, depth);
+		PROF_LOG("max texture : %d\n", max_tex);
+		PROF_LOG("max viewport: %dx%d\n", max_vp[0], max_vp[1]);
+		PROF_LOG("tex units   : %d\n", units);
+		PROF_LOG("extensions  : %s\n\n", (const char*)glGetString(GL_EXTENSIONS));
+	}
+#endif
+
 	SDL_GL_SetSwapInterval(1); // Enable VSync
 
 	printf("Compiling shaders...\n");
@@ -482,6 +502,10 @@ void PLAT_quitVideo(void) {
 void PLAT_clearVideo(SDL_Surface* screen) {
 	memset(screen->pixels, 0, vid.pitch * vid.height);
 }
+// see PLAT_setUILayer in api.h
+static int ui_layer_visible = 1;
+void PLAT_setUILayer(int visible) { ui_layer_visible = visible; }
+
 void PLAT_clearAll(void) {
 	PLAT_clearVideo(vid.screen);
 	vid.cleared = 1;
@@ -641,6 +665,7 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		// Rebuild game VBO only when geometry changed
 		// Ahora pasamos u_max para recortar la "basura" del padding a la derecha
 		if (gles_blit.dirty) {
+			PROF_COUNT(PROF_VBO_REBUILDS, 1);
 			upload_quad_vbo_uv(vid.vbo_game, 
 							   (float)gles_blit.dx, (float)gles_blit.dy, 
 							   (float)gles_blit.dw, (float)gles_blit.dh,
@@ -653,6 +678,8 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
 		// Verificamos si las dimensiones DE MEMORIA (stride) han cambiado, no solo las visibles
+		PROF_BEGIN(PROF_TEX_GAME);
+		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)stride_w * gles_blit.sh * 2);
 		if (gles_blit.last_stride_w == stride_w && gles_blit.last_sh == gles_blit.sh) {
 			// Dimensions unchanged: cheaper sub-image update
 			// Usamos stride_w como el ancho de la textura
@@ -666,9 +693,13 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 			gles_blit.last_sh = gles_blit.sh;
 		}
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		PROF_END(PROF_TEX_GAME);
 
 		// Draw game quad (cached VBO)
+		PROF_BEGIN(PROF_DRAW);
 		draw_cached_quad(vid.vbo_game, vid.game_tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 		gles_blit.src = NULL;
 	}
 
@@ -678,26 +709,53 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 
 	// 2. Draw Game Overlay (e.g. bezels)
 	if(ovl_game.enabled && ovl_game.surface) {
+		PROF_BEGIN(PROF_DRAW);
 		draw_cached_quad(vid.vbo_game_overlay, ovl_game.tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 	}
 
 	// 3. Draw Screen Overlay (UI) — cached VBO, only pixels change
-	glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.width, vid.height, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, vid.screen->pixels);
-	draw_cached_quad(vid.vbo_screen, vid.screen_tex);
+	// Skipping the draw as well as the upload is what makes this safe: the
+	// texture may still hold stale pixels, but nothing composites them.
+	if (ui_layer_visible) {
+		PROF_BEGIN(PROF_TEX_UI);
+		glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.width, vid.height, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, vid.screen->pixels);
+		PROF_END(PROF_TEX_UI);
+		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)vid.width * vid.height * 2);
+
+		PROF_BEGIN(PROF_DRAW);
+		draw_cached_quad(vid.vbo_screen, vid.screen_tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
+	}
 
 	// 4. Draw Pill Overlay (Battery/Volume popup) if enabled
 	if (ovl.enabled && ovl.surface) {
 		glBindTexture(GL_TEXTURE_2D, ovl.tex);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ovl.surface->w, ovl.surface->h, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, ovl.surface->pixels);
+		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)ovl.surface->w * ovl.surface->h * 2);
+		PROF_BEGIN(PROF_DRAW);
 		draw_cached_quad(vid.vbo_overlay, ovl.tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 	}
 
+#if PROFILE && PROFILE_GLFINISH
+	// serialises cpu and gpu: attributes gpu cost, destroys pipelining
+	PROF_BEGIN(PROF_GPU_FINISH);
+	glFinish();
+	PROF_END(PROF_GPU_FINISH);
+#endif
+
+	PROF_BEGIN(PROF_SWAP);
 	#ifndef PROFILE_GPU
 	SDL_GL_SwapWindow(vid.window);
 	#else
 	PLAT_checkGPULoad();
 	#endif
+	PROF_END(PROF_SWAP);
 
 	// Swap pages for double buffering of the UI surface
 	vid.page ^= 1;

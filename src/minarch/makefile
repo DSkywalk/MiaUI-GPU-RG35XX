@@ -100,13 +100,34 @@ INCDIR = -I. -I./libretro-common/include/ -I../common/ -I../platform/ -I/opt/rg3
 INCDIR += $(RC_INCDIR) $(CHD_INCDIR)
 LIBDIR = -L/opt/rg35xx/arm-buildroot-linux-gnueabihf/sysroot/usr/lib -L/opt/rg35xx/lib
 
-SOURCE = $(TARGET).c ra_offline.c chd_reader.c ../common/utils.c ../common/api.c ../platform/platform.c
+SOURCE = $(TARGET).c ra_offline.c chd_reader.c ../common/utils.c ../common/api.c ../common/profile.c ../platform/platform.c
 SOURCE += $(RC_SOURCE) $(CHD_SOURCE)
 
 CC = $(CROSS_COMPILE)gcc
 CFLAGS   = $(ARCH) -fomit-frame-pointer -DGL_VERTEX_SHADER -DSTBI_FAILURE_USERMSG
 CFLAGS  += $(INCDIR) -DPLATFORM=\"$(PLATFORM)\" -DUSE_$(SDL) -Ofast -std=gnu99
 CFLAGS  += $(RC_CFLAGS) $(CHD_CFLAGS)
+
+###########################################################
+# Frame profiler. Off by default and compiled out entirely; only ever enable it
+# for this target, since platform.c is shared with minui.
+#
+#   make PROFILE=1 send              normal pipeline, vsync as configured
+#   make PROFILE=1 PROFILE_VSYNC=0   vsync off, so frame time isn't pinned to 16.7ms
+#   make PROFILE=1 PROFILE_GLFINISH=1 attribute gpu time (kills pipelining)
+###########################################################
+PROFILE ?= 0
+PROFILE_FRAMES ?= 300
+PROFILE_VSYNC ?= 1
+PROFILE_GLFINISH ?= 0
+
+ifeq ($(PROFILE),1)
+CFLAGS += -DPROFILE=1 -DPROFILE_FRAMES=$(PROFILE_FRAMES)
+CFLAGS += -DPROFILE_GLFINISH=$(PROFILE_GLFINISH)
+ifeq ($(PROFILE_VSYNC),0)
+CFLAGS += -DPROFILE_FORCE_NO_VSYNC=1
+endif
+endif
 minCFLAGS	+= -flto=4
 LDFLAGS	 = $(LIBDIR) -lmsettings -l$(SDL) -l$(SDL)_image -l$(SDL)_ttf -lEGL -lGLESv2 -lGLESv1_CM -lGLES_CM -lPVROGL_MESA -lpthread -lm -lz
 # CFLAGS  += -Wall -Wno-unused-variable -Wno-unused-function -Wno-format-overflow
@@ -120,6 +141,8 @@ CFLAGS += -DBUILD_DATE=\"${BUILD_DATE}\" -DBUILD_HASH=\"${BUILD_HASH}\"
 # CFLAGS += -DBUILD_DATE=\"20230326\" -DBUILD_HASH=\"d34db33f\"
 
 PRODUCT= build/$(PLATFORM)/$(TARGET).elf
+
+.PHONY: all clean send bench bench-log bench-save bench-off
 
 all: libretro-common rcheevos $(PREFIX)/include/msettings.h
 	mkdir -p build/$(PLATFORM)
@@ -137,7 +160,43 @@ rcheevos:
 $(PREFIX)/include/msettings.h:
 	cd ../libmsettings && make
 
+ADB ?= /root/workspace/tools/adb
+PROFILE_LOG ?= /userdata/minarch_profile.log
+
 send: all
-	/root/workspace/tools/adb push $(PRODUCT) /opt/minui/bin/minarch.elf
-	/root/workspace/tools/adb shell chmod +x /opt/minui/bin/minarch.elf
-	/root/workspace/tools/adb kill-server
+	$(ADB) push $(PRODUCT) /opt/minui/bin/minarch.elf
+	$(ADB) shell chmod +x /opt/minui/bin/minarch.elf
+	$(ADB) kill-server
+
+# build an instrumented binary, clear the old log and deploy it
+bench:
+	rm -f $(PRODUCT)
+	$(MAKE) all PROFILE=1 PROFILE_FRAMES=$(PROFILE_FRAMES) \
+		PROFILE_VSYNC=$(PROFILE_VSYNC) PROFILE_GLFINISH=$(PROFILE_GLFINISH)
+	$(ADB) shell rm -f $(PROFILE_LOG)
+	$(ADB) push $(PRODUCT) /opt/minui/bin/minarch.elf
+	$(ADB) shell chmod +x /opt/minui/bin/minarch.elf
+	$(ADB) kill-server
+	@echo ""
+	@echo "Instrumented build is on the device. Launch a game, play ~30s, quit,"
+	@echo "then run:  make bench-log"
+
+# read the reports back off the device
+bench-log:
+	@$(ADB) shell cat $(PROFILE_LOG)
+	$(ADB) kill-server
+
+bench-save:
+	@mkdir -p bench
+	@$(ADB) shell cat $(PROFILE_LOG) > bench/$(NAME).log
+	@echo "saved bench/$(NAME).log"
+	$(ADB) kill-server
+
+# back to a clean, uninstrumented binary
+bench-off:
+	rm -f $(PRODUCT)
+	$(MAKE) all
+	$(ADB) push $(PRODUCT) /opt/minui/bin/minarch.elf
+	$(ADB) shell chmod +x /opt/minui/bin/minarch.elf
+	$(ADB) kill-server
+

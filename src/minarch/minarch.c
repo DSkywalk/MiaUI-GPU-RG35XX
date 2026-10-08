@@ -172,6 +172,7 @@ static int Zip_inflate(FILE* zip, FILE* dst, size_t size) { // compressed
 ///////////////////////////////////////
 
 #include "ra_offline.h"
+#include "profile.h"
 
 static struct Game {
     char path[MAX_PATH];
@@ -2427,6 +2428,8 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     // but 10 hurts PS...
     // TODO: 10 was based on rg35xx, probably different results on other supported platforms
     if (fast_forward && SDL_GetTicks()-last_flip_time<10) return;
+
+    PROF_BEGIN(PROF_VIDEO);
     
     // FFVII menus 
     // 16: 30/200
@@ -2510,6 +2513,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     }
     
     // achievement popup
+    int ra_ui_active = 0;
     {
         static SDL_Surface* ra_surface = NULL;
         static uint32_t ra_surface_id = 0;
@@ -2518,6 +2522,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         static int ra_clear_frames = 0;
 
         const char* ra_msg = RA_getMessage();
+        if (ra_msg) ra_ui_active = 1;
 
         // only rasterize when the text actually changes, not every frame
         if (ra_msg && RA_getMessageId()!=ra_surface_id) {
@@ -2543,6 +2548,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
                 ra_surface = NULL;
             }
             if (ra_clear_frames>0) {
+                ra_ui_active = 1; // still erasing, so the layer must stay up
                 // `screen` is the RGBA ui layer that PLAT_flip alpha-blends on
                 // top of the game texture, and nothing repaints it for us, so
                 // the bar has to be erased by hand. Erase to 0 (transparent),
@@ -2558,8 +2564,34 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         }
     }
     
+    // The ui layer costs ~5ms a frame to upload (the driver swizzles the whole
+    // 640x480 RGBA texture) and in game it is empty unless the debug overlay or
+    // an achievement popup is up. Tell the platform so it can skip both the
+    // upload and the composite.
+    {
+        static int ui_was_wanted = 1;
+        int ui_wanted = show_debug || ra_ui_active;
+        int ui_visible = ui_wanted;
+
+        // Clear on the way *down*, not on the way back up: clearing when it
+        // reappears would wipe whatever was just drawn into it this frame.
+        // One extra upload of a blank layer leaves both pages genuinely empty,
+        // so nothing stale can resurface the next time it is needed.
+        if (!ui_wanted && ui_was_wanted) {
+            GFX_clearAll();
+            ui_visible = 1;
+        }
+
+        GFX_setUILayer(ui_visible);
+        ui_was_wanted = ui_wanted; // intent, so the clear happens exactly once
+    }
+
+    PROF_END(PROF_VIDEO);
+
     GFX_flip(screen);
     last_flip_time = SDL_GetTicks();
+
+    PROF_FRAME();
 }
 
 ///////////////////////////////
@@ -4591,6 +4623,8 @@ static void Menu_loop(void) {
         screen = GFX_resize(DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
     }
 
+    GFX_setUILayer(1); // the menu *is* the ui layer
+
     // after the resize, so it matches the screen we'll actually draw into
     SDL_Surface* backdrop = Menu_composeBackdrop(backing);
     // sky: removed
@@ -5060,7 +5094,15 @@ int main(int argc , char* argv[]) {
     Config_readOptions(); // cores with boot logo option (eg. gb) need to load options early
     setOverclock(overclock);
     GFX_setVsync(prevent_tearing);
-    
+
+#if PROFILE && PROFILE_FORCE_NO_VSYNC
+    // With vsync on, every frame is padded out to the refresh interval and the
+    // swap absorbs all the slack, so the totals say 16.7ms no matter what the
+    // renderer costs. Turn it off for measurement runs only.
+    GFX_setVsync(0);
+    LOG_info("PROFILE: vsync forced off for measurement\n");
+#endif
+
     Core_init();
     
     // TODO: find a better place to do this
@@ -5085,15 +5127,21 @@ int main(int argc , char* argv[]) {
     PWR_disableAutosleep();
     sec_start = SDL_GetTicks();
     while (!quit) {
+        PROF_TICK();
+        PROF_BEGIN(PROF_FRAME_TOTAL);
         GFX_startFrame();
         
+        PROF_BEGIN(PROF_CORE_RUN);
         core.run();
+        PROF_END(PROF_CORE_RUN);
+
         RA_doFrame();
         limitFF();
         
         if (show_menu) Menu_loop();
         
         trackFPS();
+        PROF_END(PROF_FRAME_TOTAL);
         
         // TODO: this is working as expected 
         // but I for some reason kmsdrm isn't ready 
