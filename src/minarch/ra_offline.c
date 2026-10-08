@@ -366,8 +366,7 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
     RA_Achievement* entry = ra_findById(event->id);
     if (entry) entry->unlocked = 1;
 
-    snprintf(ra.msg, sizeof(ra.msg), "Achievement unlocked: %s",
-             title ? title : "???");
+    snprintf(ra.msg, sizeof(ra.msg), "%s", title ? title : "???");
     ra.msg_frames = RA_MSG_FRAMES;
     ra.msg_id++;
 
@@ -666,7 +665,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
         snprintf(ra.msg, sizeof(ra.msg), "Progress file was modified - progress reset");
     }
     else {
-        snprintf(ra.msg, sizeof(ra.msg), "Achievements: %u/%u", ra.unlocked_count, ra.total);
+        snprintf(ra.msg, sizeof(ra.msg), "%u / %u", ra.unlocked_count, ra.total);
     }
     ra.msg_frames = RA_MSG_FRAMES;
     ra.msg_id++;
@@ -752,7 +751,7 @@ int RA_wipeProgress(void) {
 
     LOG_info("RA: progress wiped, tracking %u/%u\n", activated, ra.total);
 
-    snprintf(ra.msg, sizeof(ra.msg), "Achievements: 0/%u", ra.total);
+    snprintf(ra.msg, sizeof(ra.msg), "0 / %u", ra.total);
     ra.msg_frames = RA_MSG_FRAMES;
     ra.msg_id++;
 

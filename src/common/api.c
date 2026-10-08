@@ -99,6 +99,7 @@ static SDL_Rect asset_rects[] = {
     [ASSET_SWAP]             = (SDL_Rect){SCALE4(95,51,10,10)},
     [ASSET_SWAP_GRAY]        = (SDL_Rect){SCALE4(105,51,10,10)},
     [ASSET_SWAP_DARK_GRAY]   = (SDL_Rect){SCALE4(114,51,10,10)},
+    [ASSET_TROPHY]           = (SDL_Rect){SCALE4(114,39,10,10)},
 };
 static uint32_t asset_rgbs[ASSET_COLORS];
 GFX_Fonts font;

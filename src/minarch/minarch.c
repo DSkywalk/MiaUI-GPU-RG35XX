@@ -43,6 +43,14 @@ static int max_ff_speed = 3; // 4x
 static int fast_forward = 0;
 static int overclock = 1; // normal
 static int achievements_enabled = 1; // FE_OPT_ACHIEVEMENTS, persisted per game
+
+// ASSET_TROPHY is 10x10 in the atlas and stands in for the word
+// "achievement" wherever it would otherwise be spelled out.
+#define RA_ICON_SIZE 10 // logical px, matches the atlas rect
+#define RA_ICON_GAP   4 // logical px between the icon and the text it labels
+
+// frames the in-game toast takes to rise into place from the bottom edge
+#define RA_TOAST_RISE_FRAMES 12
 static int DEVICE_WIDTH = FIXED_WIDTH;
 static int DEVICE_HEIGHT = FIXED_HEIGHT;
 static int DEVICE_PITCH = FIXED_PITCH;
@@ -2534,8 +2542,14 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         static SDL_Surface* ra_surface = NULL;
         static uint32_t ra_surface_id = 0;
         static int ra_clear_w = 0;
-        static int ra_clear_h = 0;
         static int ra_clear_frames = 0;
+        static int ra_rise = 0;
+
+        // the pill is a fixed height (GFX_blitPill crops rather than scales the
+        // rounded caps, so anything but PILL_SIZE clips the corners) and the
+        // strip it travels through is that plus the bottom margin
+        const int ra_pill_h  = SCALE1(PILL_SIZE);
+        const int ra_strip_h = ra_pill_h + SCALE1(PADDING);
 
         const char* ra_msg = RA_getMessage();
         if (ra_msg) ra_ui_active = 1;
@@ -2543,20 +2557,60 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         // only rasterize when the text actually changes, not every frame
         if (ra_msg && RA_getMessageId()!=ra_surface_id) {
             if (ra_surface) SDL_FreeSurface(ra_surface);
-            ra_surface = TTF_RenderUTF8_Blended(font.tiny, ra_msg, COLOR_WHITE);
+
+            // a long achievement title would run out past the rounded cap, so
+            // clip it to what fits between the insets instead
+            char ra_text[256];
+            GFX_truncateText(font.tiny, ra_msg, ra_text,
+                             screen->w - SCALE1(PADDING*2 + BUTTON_PADDING*2
+                                                + RA_ICON_SIZE + RA_ICON_GAP), 0);
+
+            ra_surface = TTF_RenderUTF8_Blended(font.tiny, ra_text, COLOR_WHITE);
             ra_surface_id = RA_getMessageId();
+            ra_rise = 0; // a new message slides in from off screen
         }
 
         if (ra_msg && ra_surface) {
-            int w = ra_surface->w + SCALE1(8);
+            // trophy, gap, text -- the icon says "achievement" so the message
+            // itself is just the title or the tally. Insets match the title
+            // pill's, so the content clears the rounded caps.
+            int pill_x = SCALE1(PADDING);
+            int icon_x = pill_x + SCALE1(BUTTON_PADDING);
+            int text_x = icon_x + SCALE1(RA_ICON_SIZE + RA_ICON_GAP);
+            int pill_w = (text_x - pill_x) + ra_surface->w + SCALE1(BUTTON_PADDING);
+            pill_w = MIN(pill_w, screen->w - SCALE1(PADDING*2));
 
-            // keep the widest bar we've drawn, so the erase below covers all of it
-            if (w>ra_clear_w) ra_clear_w = w;
-            ra_clear_h = ra_surface->h;
+            // keep the widest pill we've drawn, so the erase covers all of it
+            if (pill_x+pill_w > ra_clear_w) ra_clear_w = pill_x + pill_w;
             ra_clear_frames = PAGE_COUNT;
 
-            SDL_FillRect(screen, &(SDL_Rect){0,screen->h-ra_clear_h,ra_clear_w,ra_clear_h}, RGB_BLACK);
-            SDL_BlitSurface(ra_surface, NULL, screen, &(SDL_Rect){SCALE1(4),screen->h-ra_clear_h});
+            // quadratic ease-out off the bottom edge: quick away from the edge,
+            // settling gently into place
+            int rem  = RA_TOAST_RISE_FRAMES - ra_rise;
+            int rise = (ra_strip_h * rem * rem) / (RA_TOAST_RISE_FRAMES * RA_TOAST_RISE_FRAMES);
+            if (ra_rise<RA_TOAST_RISE_FRAMES) ra_rise++;
+
+            int strip_y = screen->h - ra_strip_h;
+            int pill_y  = strip_y + rise;
+
+            // Erase the whole strip first, every frame: the pill's corners are
+            // transparent, so painting over last frame's copy would leave its
+            // outline behind, and while it is moving the two differ. Erase to 0
+            // (transparent) rather than RGB_BLACK -- SDL_MapRGB ors in the
+            // alpha mask, so black here is an opaque box over the game.
+            SDL_FillRect(screen, &(SDL_Rect){0,strip_y,ra_clear_w,ra_strip_h}, 0);
+
+            GFX_blitPill(ASSET_DARK_GRAY_PILL, screen, &(SDL_Rect){
+                pill_x, pill_y, pill_w, ra_pill_h
+            });
+            GFX_blitAsset(ASSET_TROPHY, NULL, screen, &(SDL_Rect){
+                icon_x,
+                pill_y + (ra_pill_h - SCALE1(RA_ICON_SIZE)) / 2
+            });
+            SDL_BlitSurface(ra_surface, NULL, screen, &(SDL_Rect){
+                text_x,
+                pill_y + (ra_pill_h - ra_surface->h) / 2
+            });
         }
         else {
             if (ra_surface) {
@@ -2574,7 +2628,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
                 //
                 // Once per page, because the layer is page-flipped and each
                 // page still holds its own copy of the bar.
-                SDL_FillRect(screen, &(SDL_Rect){0,screen->h-ra_clear_h,ra_clear_w,ra_clear_h}, 0);
+                SDL_FillRect(screen, &(SDL_Rect){0,screen->h-ra_strip_h,ra_clear_w,ra_strip_h}, 0);
                 if (--ra_clear_frames==0) ra_clear_w = 0;
             }
         }
@@ -2934,6 +2988,10 @@ typedef struct MenuList {
     int menu_exits; // optional, MENU closes the whole menu stack back to the game
     char* title;    // optional, drawn in the pill at the top of the screen
     char* subtitle; // optional, centered under the title; costs one visible row
+    // optional, right-aligned on the subtitle's row (so it costs no extra
+    // height) over the value column. Needs a subtitle to sit on.
+    char* subtitle_right;
+    int subtitle_icon; // optional ASSET_* drawn left of the subtitle, 0 for none
     int value_nudge;  // optional, pull the value column this many px left
     int pill_alpha;   // optional, 1..254 to make the selected row translucent
     MenuPosition* keep; // optional, restored on entry and updated on exit
@@ -3881,12 +3939,34 @@ static int Menu_options(MenuList* list) {
 
             if (list->subtitle) {
                 text = TTF_RenderUTF8_Blended(font.small, list->subtitle, COLOR_WHITE);
-                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                    (screen->w - text->w) / 2,
-                    list_top
-                });
-                list_top += text->h;
+                int sub_x = (screen->w - text->w) / 2;
+                int sub_right = sub_x + text->w;
+                int sub_h = text->h;
+
+                // the icon badges the page from the left margin, lined up with
+                // the row pills below it; the title stays centered on its own
+                if (list->subtitle_icon) {
+                    GFX_blitAsset(list->subtitle_icon, NULL, screen, &(SDL_Rect){
+                        SCALE1(PADDING),
+                        list_top + (sub_h - SCALE1(RA_ICON_SIZE)) / 2
+                    });
+                }
+                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ sub_x, list_top });
                 SDL_FreeSurface(text);
+
+                if (list->subtitle_right) {
+                    text = TTF_RenderUTF8_Blended(font.small, list->subtitle_right, COLOR_WHITE);
+                    // right edge of the value column, so it reads as a header
+                    // over the points rather than floating off on its own
+                    int x = screen->w - SCALE1(PADDING + OPTION_PADDING) - list->value_nudge - text->w;
+                    // a long subtitle wins the row; drop this rather than overlap
+                    if (x > sub_right + SCALE1(RA_ICON_GAP)) {
+                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ x, list_top });
+                    }
+                    SDL_FreeSurface(text);
+                }
+
+                list_top += sub_h;
             }
 
             if (type==MENU_LIST) {
@@ -4149,6 +4229,8 @@ static int Menu_options(MenuList* list) {
 static MenuPosition ra_list_pos = {0};
 static int ra_list_resume = 0;
 
+#define RA_SUMMARY_SIZE 32
+
 // "12/23  52%" - percentage is by achievement count, not points
 static void Menu_achievementSummary(char* out, size_t size) {
     uint32_t unlocked = 0, total = 0;
@@ -4165,6 +4247,10 @@ static int Menu_achievements(SDL_Surface* backing) {
     if (count<=0) return 0;
 
     RA_refreshProgress();
+
+    // lives until Menu_options() returns, which is all the list needs
+    char summary[RA_SUMMARY_SIZE];
+    Menu_achievementSummary(summary, sizeof(summary));
 
     // GFX_wrapText rewrites the string in place, so it needs our own copies
     // rather than the descriptions ra_offline owns. Wrapping only ever swaps a
@@ -4259,6 +4345,8 @@ static int Menu_achievements(SDL_Surface* backing) {
         .jump_ends = 1,  // RIGHT jumps to the top, LEFT to the bottom
         .menu_exits = 1, // MENU goes straight back to the game
         .subtitle = "Achievements List",
+        .subtitle_right = summary,
+        .subtitle_icon = ASSET_TROPHY,
         .value_nudge = SCALE1(RA_VALUE_NUDGE),
         .pill_alpha = RA_PILL_ALPHA,
         .keep = &ra_list_pos,
@@ -4978,13 +5066,23 @@ static void Menu_loop(void) {
 
                 // unlocked/total and the percentage, always visible on its row
                 if (row_id==ITEM_ACHIEVEMENTS) {
-                    char progress[32];
+                    char progress[RA_SUMMARY_SIZE];
                     Menu_achievementSummary(progress, sizeof(progress));
 
                     text = TTF_RenderUTF8_Blended(font.tiny, progress, COLOR_WHITE);
+                    int row_y = SCALE1(oy + PADDING + (i * PILL_SIZE));
+                    int text_x = screen->w - SCALE1(PADDING + BUTTON_PADDING) - text->w;
+
+                    // left of the tally rather than left of the row name: the
+                    // name sits inside a pill sized to fit it exactly, and an
+                    // icon in there would have to resize it
+                    GFX_blitAsset(ASSET_TROPHY, NULL, screen, &(SDL_Rect){
+                        text_x - SCALE1(RA_ICON_GAP + RA_ICON_SIZE),
+                        row_y + (SCALE1(PILL_SIZE) - SCALE1(RA_ICON_SIZE)) / 2
+                    });
                     SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        screen->w - SCALE1(PADDING + BUTTON_PADDING) - text->w,
-                        SCALE1(oy + PADDING + (i * PILL_SIZE)) + (SCALE1(PILL_SIZE) - text->h) / 2
+                        text_x,
+                        row_y + (SCALE1(PILL_SIZE) - text->h) / 2
                     });
                     SDL_FreeSurface(text);
                 }

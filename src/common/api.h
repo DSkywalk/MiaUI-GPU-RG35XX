@@ -86,6 +86,7 @@ enum {
 	ASSET_SWAP,
 	ASSET_SWAP_GRAY,
 	ASSET_SWAP_DARK_GRAY,
+	ASSET_TROPHY,
 };
 
 typedef struct GFX_Fonts {
