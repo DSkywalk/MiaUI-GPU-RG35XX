@@ -171,6 +171,8 @@ static int Zip_inflate(FILE* zip, FILE* dst, size_t size) { // compressed
 
 ///////////////////////////////////////
 
+#include "ra_offline.h"
+
 static struct Game {
     char path[MAX_PATH];
     char name[MAX_PATH]; // TODO: rename to basename?
@@ -549,6 +551,9 @@ static void State_read(void) { // from picoarch
         LOG_error("Error restoring save state: %s (%s)\n", filename, strerror(errno));
         goto error;
     }
+
+    // the loaded state is unrelated to whatever the triggers were tracking
+    RA_resetRuntime();
 
 error:
     if (state) free(state);
@@ -1655,6 +1660,7 @@ static void Menu_afterSleep(void);
 
 static void Menu_saveState(void);
 static void Menu_loadState(void);
+static int Hardcore_active(void);
 
 static uint32_t keyboard_state[RETROK_LAST];
 static uint32_t current_input_frame = 0;
@@ -1700,9 +1706,12 @@ static void input_poll_callback(void) {
             }
             else if (PAD_justPressed(btn)) {
                 switch (i) {
-                    case SHORTCUT_SAVE_STATE: Menu_saveState(); break;
-                    case SHORTCUT_LOAD_STATE: Menu_loadState(); break;
-                    case SHORTCUT_RESET_GAME: core.reset(); break;
+                    // no save states while achievements are active, same as
+                    // RetroAchievements hardcore. The menu hides the rows, so
+                    // block the shortcuts too or it's only cosmetic.
+                    case SHORTCUT_SAVE_STATE: if (!Hardcore_active()) Menu_saveState(); break;
+                    case SHORTCUT_LOAD_STATE: if (!Hardcore_active()) Menu_loadState(); break;
+                    case SHORTCUT_RESET_GAME: core.reset(); RA_resetRuntime(); break;
                     case SHORTCUT_CYCLE_SCALE:
                         screen_scaling += 1;
                         if (screen_scaling>=SCALE_COUNT) screen_scaling -= SCALE_COUNT;
@@ -1977,7 +1986,12 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
         break;
     }
     // RETRO_ENVIRONMENT_SET_CONTROLLER_INFO 35
-    // RETRO_ENVIRONMENT_SET_MEMORY_MAPS (36 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+    case RETRO_ENVIRONMENT_SET_MEMORY_MAPS: { /* 36 | RETRO_ENVIRONMENT_EXPERIMENTAL */
+        // only consumed by the achievement runtime, which needs the core's
+        // address space to resolve the addresses baked into the triggers
+        RA_setMemoryMap((const struct retro_memory_map *)data);
+        break;
+    }
     // RETRO_ENVIRONMENT_GET_LANGUAGE 39
     // RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS (42 | RETRO_ENVIRONMENT_EXPERIMENTAL)
     // RETRO_ENVIRONMENT_GET_VFS_INTERFACE (45 | RETRO_ENVIRONMENT_EXPERIMENTAL)
@@ -2495,6 +2509,55 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         if (x>top_width) top_width = x; // keep the largest width because triple buffer
     }
     
+    // achievement popup
+    {
+        static SDL_Surface* ra_surface = NULL;
+        static uint32_t ra_surface_id = 0;
+        static int ra_clear_w = 0;
+        static int ra_clear_h = 0;
+        static int ra_clear_frames = 0;
+
+        const char* ra_msg = RA_getMessage();
+
+        // only rasterize when the text actually changes, not every frame
+        if (ra_msg && RA_getMessageId()!=ra_surface_id) {
+            if (ra_surface) SDL_FreeSurface(ra_surface);
+            ra_surface = TTF_RenderUTF8_Blended(font.tiny, ra_msg, COLOR_WHITE);
+            ra_surface_id = RA_getMessageId();
+        }
+
+        if (ra_msg && ra_surface) {
+            int w = ra_surface->w + SCALE1(8);
+
+            // keep the widest bar we've drawn, so the erase below covers all of it
+            if (w>ra_clear_w) ra_clear_w = w;
+            ra_clear_h = ra_surface->h;
+            ra_clear_frames = PAGE_COUNT;
+
+            SDL_FillRect(screen, &(SDL_Rect){0,screen->h-ra_clear_h,ra_clear_w,ra_clear_h}, RGB_BLACK);
+            SDL_BlitSurface(ra_surface, NULL, screen, &(SDL_Rect){SCALE1(4),screen->h-ra_clear_h});
+        }
+        else {
+            if (ra_surface) {
+                SDL_FreeSurface(ra_surface);
+                ra_surface = NULL;
+            }
+            if (ra_clear_frames>0) {
+                // `screen` is the RGBA ui layer that PLAT_flip alpha-blends on
+                // top of the game texture, and nothing repaints it for us, so
+                // the bar has to be erased by hand. Erase to 0 (transparent),
+                // NOT to RGB_BLACK: SDL_MapRGB ors in the alpha mask, so black
+                // here is an opaque black box sitting over the game. This is
+                // the same value PLAT_clearVideo() memsets the layer to.
+                //
+                // Once per page, because the layer is page-flipped and each
+                // page still holds its own copy of the bar.
+                SDL_FillRect(screen, &(SDL_Rect){0,screen->h-ra_clear_h,ra_clear_w,ra_clear_h}, 0);
+                if (--ra_clear_frames==0) ra_clear_w = 0;
+            }
+        }
+    }
+    
     GFX_flip(screen);
     last_flip_time = SDL_GetTicks();
 }
@@ -2639,15 +2702,16 @@ void Core_close(void) {
 
 ///////////////////////////////////////
 
-#define MENU_ITEM_COUNT 5
 #define MENU_SLOT_COUNT 8
 
 enum {
     ITEM_CONT,
-    ITEM_SAVE,
-    ITEM_LOAD,
+    ITEM_ACHIEVEMENTS,
+    ITEM_SAVELOAD,
     ITEM_OPTS,
     ITEM_QUIT,
+    ITEM_RESET,
+    ITEM_ID_COUNT,
 };
 
 enum {
@@ -2664,7 +2728,9 @@ enum {
 static struct {
     SDL_Surface* bitmap;
     SDL_Surface* overlay;
-    char* items[MENU_ITEM_COUNT];
+    char* items[ITEM_ID_COUNT];
+    int rows[ITEM_ID_COUNT]; // visible row -> ITEM_*
+    int row_count;
     char* disc_paths[9]; // up to 9 paths, Arc the Lad Collection is 7 discs
     char minui_dir[256];
     char slot_path[256];
@@ -2684,13 +2750,37 @@ static struct {
     .preview_exists = 0,
     
     .items = {
-        [ITEM_CONT] = "Continue",
-        [ITEM_SAVE] = "Save",
-        [ITEM_LOAD] = "Load",
-        [ITEM_OPTS] = "Options",
-        [ITEM_QUIT] = "Quit",
+        [ITEM_CONT]         = "Continue",
+        [ITEM_ACHIEVEMENTS] = "Achievements",
+        [ITEM_SAVELOAD]     = "Save / Load",
+        [ITEM_OPTS]         = "Options",
+        [ITEM_RESET]        = "Reset",
+        [ITEM_QUIT]         = "Quit",
     }
 };
+
+// Achievements imply hardcore rules, the same way RetroAchievements does it:
+// save states are off the table. Battery saves (SRAM) are unaffected.
+static int Hardcore_active(void) {
+    return RA_isActive();
+}
+
+// The pause menu is built per game: a game with achievements gets the
+// Achievements row and loses Save / Load, anything else keeps it.
+static void Menu_buildRows(void) {
+    int n = 0;
+    menu.rows[n++] = ITEM_CONT;
+    if (RA_isActive()) menu.rows[n++] = ITEM_ACHIEVEMENTS;
+    else               menu.rows[n++] = ITEM_SAVELOAD;
+    menu.rows[n++] = ITEM_OPTS;
+    // simple_mode turns the Options row itself into Reset, so adding a second
+    // one there would just show "Reset" twice
+    if (!simple_mode) menu.rows[n++] = ITEM_RESET;
+
+    menu.rows[n++] = ITEM_QUIT;
+
+    menu.row_count = n;
+}
 
 void Menu_init(void) {
     menu.overlay = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH,DEVICE_HEIGHT,FIXED_DEPTH,RGBA_MASK_AUTO);
@@ -2770,6 +2860,8 @@ typedef struct MenuItem {
     char* key; // optional, used by options
     int id; // optional, used by bindings
     int value;
+    int dim;  // optional, draw in gray instead of white (eg. locked achievements)
+    int skip; // optional, not selectable (eg. a section heading)
     MenuList* submenu;
     MenuList_callback_t on_confirm;
     MenuList_callback_t on_change;
@@ -2781,9 +2873,26 @@ enum {
     MENU_FIXED, // eg. emulator
     MENU_INPUT, // eg. renders like but MENU_VAR but handles input differently
 };
+// Where the cursor was left, so a list can be reopened exactly as it was.
+typedef struct MenuPosition {
+    int row; // selected item
+    int top; // first visible item
+} MenuPosition;
+
 typedef struct MenuList {
     int type;
     int max_width; // cached on first draw
+    int jump_ends;  // optional, LEFT/RIGHT jump to the ends instead of changing values
+    int menu_exits; // optional, MENU closes the whole menu stack back to the game
+    char* title;    // optional, drawn in the pill at the top of the screen
+    char* subtitle; // optional, centered under the title; costs one visible row
+    int value_nudge;  // optional, pull the value column this many px left
+    int pill_alpha;   // optional, 1..254 to make the selected row translucent
+    MenuPosition* keep; // optional, restored on entry and updated on exit
+    // optional frozen game frame to sit behind the list. PLAT_flip only draws
+    // the game texture on frames the core produced one, so with the core
+    // paused a menu has to blit the still itself or it composites over black.
+    SDL_Surface* backing;
     char* desc;
     MenuItem* items;
     MenuList_callback_t on_confirm;
@@ -3315,6 +3424,25 @@ static void OptionSaveChanges_updateDesc(void) {
     options_menu.items[4].desc = getSaveDesc();
 }
 
+#define SCROLL_WIDTH 24
+#define SCROLL_HEIGHT 4
+
+// The scroll arrows in the asset sheet are near-black (38,38,38), which is
+// invisible against these dark lists, and they're a baked sprite rather than
+// one of the tintable ASSET_COLORS, so draw them ourselves in gray.
+static void Menu_blitScrollArrow(SDL_Surface* dst, int x, int y, int up) {
+    int w = SCALE1(SCROLL_WIDTH);
+    int h = SCALE1(SCROLL_HEIGHT);
+    for (int i=0; i<h; i++) {
+        int rw = (w * (i+1)) / h;
+        SDL_FillRect(dst, &(SDL_Rect){
+            x + (w - rw) / 2,
+            y + (up ? i : h-1-i),
+            rw, 1
+        }, RGB_GRAY);
+    }
+}
+
 static int Menu_options(MenuList* list) {
     MenuItem* items = list->items;
     int type = list->type;
@@ -3323,13 +3451,48 @@ static int Menu_options(MenuList* list) {
     int show_options = 1;
     int show_settings = 0;
     int await_input = 0;
+    int exit_to_game = 0;
+
+    // A translucent copy of the selection pill, so the frozen game shows
+    // through it. GFX_blitPill writes opaque pixels and the atlas supplies the
+    // rounded ends, so build it into a surface that matches `screen` (alpha
+    // channel included, or the rounded corners would come out solid) and let
+    // SDL_SetSurfaceAlphaMod scale the whole thing on the way out.
+    SDL_Surface* row_pill = NULL;
+    if (list->pill_alpha>0 && list->pill_alpha<255) {
+        int pill_w = screen->w - SCALE1(PADDING*2);
+        row_pill = SDL_CreateRGBSurface(SDL_SWSURFACE, pill_w, SCALE1(BUTTON_SIZE),
+                                        screen->format->BitsPerPixel,
+                                        screen->format->Rmask, screen->format->Gmask,
+                                        screen->format->Bmask, screen->format->Amask);
+        if (row_pill) {
+            SDL_FillRect(row_pill, NULL, 0); // transparent, so the ends stay rounded
+            GFX_blitPill(ASSET_OPTION, row_pill, &(SDL_Rect){0,0,pill_w,SCALE1(BUTTON_SIZE)});
+            SDL_SetSurfaceBlendMode(row_pill, SDL_BLENDMODE_BLEND);
+            SDL_SetSurfaceAlphaMod(row_pill, list->pill_alpha);
+        }
+    }
     
     int count;
     for (count=0; items[count].name; count++);
-    int selected = 0;
-    int start = 0;
-    int end = MIN(count,MAX_VISIBLE_OPTIONS);
-    int visible_rows = end;
+
+    // the subtitle takes vertical space from the list, so it costs a row
+    int max_rows = MAX_VISIBLE_OPTIONS - (list->subtitle ? 1 : 0);
+    int visible_rows = MIN(count,max_rows);
+
+    // pick up where we left off, if the caller is keeping track. The list can
+    // have been rebuilt since, so treat the saved spot as a hint and clamp it.
+    int selected = (list->keep && list->keep->row>0 && list->keep->row<count) ? list->keep->row : 0;
+    while (selected<count && items[selected].skip) selected++;
+    if (selected>=count) selected = 0;
+
+    int start = (list->keep && list->keep->top>0) ? list->keep->top : 0;
+    if (start>count-visible_rows) start = count - visible_rows;
+    if (selected<start) start = selected;
+    else if (selected>=start+visible_rows) start = selected - visible_rows + 1;
+    if (start<0) start = 0;
+
+    int end = MIN(count,start+visible_rows);
     
     OptionSaveChanges_updateDesc();
     
@@ -3355,32 +3518,65 @@ static int Menu_options(MenuList* list) {
         
         GFX_startFrame();
         PAD_poll();
-        
+
+        // MENU returns straight to the game rather than unwinding to the pause
+        // menu, so progress is quick to glance at mid-play. B still goes back.
+        if (list->menu_exits && BTN_WAKE!=BTN_MENU && PAD_tappedMenu(SDL_GetTicks())) {
+            exit_to_game = 1;
+            show_options = 0;
+            continue;
+        }
+
         if (PAD_justRepeated(BTN_UP)) {
-            selected -= 1;
-            if (selected<0) {
-                selected = count - 1;
-                start = MAX(0,count - MAX_VISIBLE_OPTIONS);
-                end = count;
-            }
-            else if (selected<start) {
-                start -= 1;
-                end -= 1;
-            }
+            int guard = count; // keep stepping over headings, but never forever
+            do {
+                selected -= 1;
+                if (selected<0) {
+                    selected = count - 1;
+                    start = MAX(0,count - max_rows);
+                    end = count;
+                }
+                else if (selected<start) {
+                    start -= 1;
+                    end -= 1;
+                }
+            } while (items[selected].skip && --guard>0);
             dirty = 1;
         }
         else if (PAD_justRepeated(BTN_DOWN)) {
-            selected += 1;
-            if (selected>=count) {
+            int guard = count;
+            do {
+                selected += 1;
+                if (selected>=count) {
+                    selected = 0;
+                    start = 0;
+                    end = visible_rows;
+                }
+                else if (selected>=end) {
+                    start += 1;
+                    end += 1;
+                }
+            } while (items[selected].skip && --guard>0);
+            dirty = 1;
+        }
+        else if (list->jump_ends) {
+            // nothing to cycle through on this list, so LEFT/RIGHT jump to the
+            // ends of it instead
+            if (PAD_justRepeated(BTN_LEFT)) {
                 selected = 0;
+                while (selected<count && items[selected].skip) selected++;
+                if (selected>=count) selected = 0;
                 start = 0;
                 end = visible_rows;
+                dirty = 1;
             }
-            else if (selected>=end) {
-                start += 1;
-                end += 1;
+            else if (PAD_justRepeated(BTN_RIGHT)) {
+                selected = count - 1;
+                while (selected>0 && items[selected].skip) selected--;
+                start = MAX(0,count - max_rows);
+                end = count;
+                dirty = 1;
             }
-            dirty = 1;
         }
         else if (type!=MENU_INPUT && type!=MENU_LIST) {
             if (PAD_justRepeated(BTN_LEFT)) {
@@ -3471,10 +3667,53 @@ static int Menu_options(MenuList* list) {
         
         if (dirty) {
             GFX_clear(screen);
-            GFX_blitHardwareGroup(screen, show_settings);
-            
+
+            if (list->backing) {
+                SDL_BlitSurface(list->backing, NULL, screen, NULL);
+                SDL_BlitSurface(menu.overlay, NULL, screen, NULL); // dim it so the text stays legible
+            }
+
+            int hardware_width = GFX_blitHardwareGroup(screen, show_settings);
+
             char* desc = NULL;
             SDL_Surface* text;
+
+            if (list->title) {
+                char truncated[256];
+                int max_width = screen->w - SCALE1(PADDING * 2) - hardware_width;
+                int title_width = GFX_truncateText(font.large, list->title, truncated,
+                                                   max_width, SCALE1(BUTTON_PADDING*2));
+                max_width = MIN(max_width, title_width);
+
+                GFX_blitPill(ASSET_BLACK_PILL, screen, &(SDL_Rect){
+                    SCALE1(PADDING),
+                    SCALE1(PADDING),
+                    max_width,
+                    SCALE1(PILL_SIZE)
+                });
+                text = TTF_RenderUTF8_Blended(font.large, truncated, COLOR_WHITE);
+                SDL_BlitSurface(text, &(SDL_Rect){
+                    0, 0, max_width - SCALE1(BUTTON_PADDING*2), text->h
+                }, screen, &(SDL_Rect){
+                    SCALE1(PADDING + BUTTON_PADDING),
+                    SCALE1(PADDING + 4)
+                });
+                SDL_FreeSurface(text);
+            }
+
+            // where the rows begin: under the title pill, and under the
+            // subtitle too when there is one
+            int list_top = SCALE1(PADDING + PILL_SIZE);
+
+            if (list->subtitle) {
+                text = TTF_RenderUTF8_Blended(font.small, list->subtitle, COLOR_WHITE);
+                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                    (screen->w - text->w) / 2,
+                    list_top
+                });
+                list_top += text->h;
+                SDL_FreeSurface(text);
+            }
 
             if (type==MENU_LIST) {
                 int mw = list->max_width;
@@ -3528,29 +3767,40 @@ static int Menu_options(MenuList* list) {
                 int mw = screen->w - SCALE1(PADDING*2);
                 // int lw,rw;
                 // lw = rw = mw / 2;
-                int ox,oy;
-                ox = oy = SCALE1(PADDING);
-                oy += SCALE1(PILL_SIZE);
+                int ox = SCALE1(PADDING);
+                int oy = list_top;
                 
                 int selected_row = selected - start;
                 for (int i=start,j=0; i<end; i++,j++) {
                     MenuItem* item = &items[i];
-                    SDL_Color text_color = COLOR_WHITE;
+                    SDL_Color text_color = item->dim ? COLOR_GRAY : COLOR_WHITE;
 
                     if (j==selected_row) {
                         // gray pill
-                        GFX_blitPill(ASSET_OPTION, screen, &(SDL_Rect){
-                            ox,
-                            oy+SCALE1(j*BUTTON_SIZE),
-                            mw,
-                            SCALE1(BUTTON_SIZE)
-                        });
+                        if (row_pill) {
+                            SDL_BlitSurface(row_pill, NULL, screen, &(SDL_Rect){
+                                ox,
+                                oy+SCALE1(j*BUTTON_SIZE)
+                            });
+                        }
+                        else {
+                            GFX_blitPill(ASSET_OPTION, screen, &(SDL_Rect){
+                                ox,
+                                oy+SCALE1(j*BUTTON_SIZE),
+                                mw,
+                                SCALE1(BUTTON_SIZE)
+                            });
+                        }
                     }
                     
-                    if (item->value>=0) {
-                        text = TTF_RenderUTF8_Blended(font.tiny, item->values[item->value], COLOR_WHITE); // always white
+                    if (item->value>=0 && item->values && item->values[item->value]) {
+                        text = TTF_RenderUTF8_Blended(font.tiny, item->values[item->value],
+                                                      item->dim ? COLOR_GRAY : COLOR_WHITE);
+                        // value_nudge pulls this column toward the name. Only
+                        // the value moves, so headings (which have no value)
+                        // keep their position exactly.
                         SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            ox + mw - text->w - SCALE1(OPTION_PADDING),
+                            ox + mw - text->w - SCALE1(OPTION_PADDING) - list->value_nudge,
                             oy+SCALE1((j*BUTTON_SIZE)+3)
                         });
                         SDL_FreeSurface(text);
@@ -3663,13 +3913,11 @@ static int Menu_options(MenuList* list) {
                 }
             }
             
-            if (count>MAX_VISIBLE_OPTIONS) {
-                #define SCROLL_WIDTH 24
-                #define SCROLL_HEIGHT 4
+            if (count>max_rows) {
                 int ox = (screen->w - SCALE1(SCROLL_WIDTH))/2;
                 int oy = SCALE1((PILL_SIZE - SCROLL_HEIGHT) / 2);
-                if (start>0) GFX_blitAsset(ASSET_SCROLL_UP,   NULL, screen, &(SDL_Rect){ox, SCALE1(PADDING) + oy});
-                if (end<count) GFX_blitAsset(ASSET_SCROLL_DOWN, NULL, screen, &(SDL_Rect){ox, screen->h - SCALE1(PADDING + PILL_SIZE + BUTTON_SIZE) + oy});
+                if (start>0) Menu_blitScrollArrow(screen, ox, SCALE1(PADDING) + oy, 1);
+                if (end<count) Menu_blitScrollArrow(screen, ox, screen->h - SCALE1(PADDING + PILL_SIZE + BUTTON_SIZE) + oy, 0);
             }
             
             if (!desc && list->desc) desc = list->desc;
@@ -3692,8 +3940,172 @@ static int Menu_options(MenuList* list) {
     
     // GFX_clearAll();
     // GFX_flip(screen);
-    
-    return 0;
+
+    if (row_pill) SDL_FreeSurface(row_pill);
+
+    if (list->keep) {
+        list->keep->row = selected;
+        list->keep->top = start;
+    }
+
+    // MENU_CALLBACK_EXIT also unwinds a parent Menu_options, which is what we
+    // want: the whole stack closes and the caller resumes the game.
+    return exit_to_game ? MENU_CALLBACK_EXIT : 0;
+}
+
+///////////////////////////////////////
+// achievements
+//
+// Read-only view over the base set, grouped under "--- locked ---" and
+// "--- unlocked ---" headings: still-locked achievements (gray) first, earned
+// ones (white) at the bottom. Achievements that count something show their
+// progress instead of their points. Leaderboards and rich presence are
+// deliberately not part of this.
+
+#define RA_STATUS_SIZE 16
+#define RA_BULLET "+" // U+2022; the UI font has no check mark
+#define RA_DESC_LINES 3 // descriptions wrap onto at most this many lines
+#define RA_VALUE_NUDGE 5  // logical px to pull the points column toward the name
+#define RA_PILL_ALPHA  200 // alpha so the frozen game shows through the selection
+
+// Where the player was in the list, and whether they left it with MENU. If
+// they did, the next MENU press drops them straight back in at the same spot
+// instead of making them walk the pause menu again.
+static MenuPosition ra_list_pos = {0};
+static int ra_list_resume = 0;
+
+// "12/23  52%" - percentage is by achievement count, not points
+static void Menu_achievementSummary(char* out, size_t size) {
+    uint32_t unlocked = 0, total = 0;
+    RA_getSummary(&unlocked, &total);
+    snprintf(out, size, "%u/%u  %u%%", unlocked, total,
+             total ? (unlocked * 100 + total / 2) / total : 0);
+}
+
+// Returns MENU_CALLBACK_EXIT if the user asked to go straight back to the game.
+// `backing` is the pause menu's frozen game frame, shown behind the list the
+// same way the Save / Load submenu does it.
+static int Menu_achievements(SDL_Surface* backing) {
+    int count = RA_getAchievementCount();
+    if (count<=0) return 0;
+
+    RA_refreshProgress();
+
+    // GFX_wrapText rewrites the string in place, so it needs our own copies
+    // rather than the descriptions ra_offline owns. Wrapping only ever swaps a
+    // space for a newline, so a same-length copy is enough.
+    size_t desc_bytes = 1;
+    for (int i=0; i<count; i++) {
+        const RA_Achievement* ach = RA_getAchievement(i);
+        desc_bytes += (ach && ach->description ? strlen(ach->description) : 0) + 1;
+    }
+
+    // two headings at most, plus the rows, plus the NULL terminator
+    MenuItem* items  = calloc(count + 3, sizeof(MenuItem));
+    char*     status = calloc(count, RA_STATUS_SIZE);
+    char**    values = calloc(count * 2, sizeof(char*));
+    char*     descs  = malloc(desc_bytes);
+    if (!items || !status || !values || !descs) {
+        free(items); free(status); free(values); free(descs);
+        return 0;
+    }
+
+    // the description is centered under the list, so keep a margin either side
+    int desc_width = screen->w - SCALE1(PADDING * 2);
+    char* desc_cursor = descs;
+
+    int n = 0;    // rows written
+    int slot = 0; // status/values slots used (headings have none)
+
+    // still-locked first, earned at the bottom
+    for (int pass=0; pass<2; pass++) {
+        int heading = 0;
+        for (int i=0; i<count; i++) {
+            const RA_Achievement* ach = RA_getAchievement(i);
+            if (!ach || !!ach->unlocked != pass) continue;
+
+            if (!heading) { // only when the group turns out to be non-empty
+                heading = 1;
+                items[n].name = pass ? "--- unlocked ---" : "--- locked ---";
+                items[n].dim  = 1;
+                items[n].skip = 1;
+                n++;
+            }
+
+            char* text = status + slot * RA_STATUS_SIZE;
+            if (ach->unlocked)
+                snprintf(text, RA_STATUS_SIZE, RA_BULLET " %u", ach->points);
+            else if (ach->progress[0]) // eg. "12/76" for a counted achievement
+                snprintf(text, RA_STATUS_SIZE, "%s", ach->progress);
+            else
+                snprintf(text, RA_STATUS_SIZE, "%u", ach->points);
+
+            values[slot*2 + 0] = text;
+            values[slot*2 + 1] = NULL;
+
+            char* desc = desc_cursor;
+            const char* src = ach->description ? ach->description : "";
+            size_t len = strlen(src);
+            memcpy(desc, src, len);
+            desc[len] = '\0';
+            desc_cursor += len + 1;
+            // Wrap freely rather than passing RA_DESC_LINES: GFX_wrapText stops
+            // inserting breaks once it reaches its cap and leaves the whole
+            // remaining tail on one over-wide line. Cut it ourselves instead.
+            GFX_wrapText(font.tiny, desc, desc_width, 0);
+
+            char* at = desc;
+            char* last_line = desc;
+            char* cut = NULL;
+            for (int kept=1; kept<=RA_DESC_LINES; kept++) {
+                char* nl = strchr(at, '\n');
+                if (!nl) break;
+                if (kept==RA_DESC_LINES) { last_line = at; cut = nl; }
+                at = nl + 1;
+            }
+            if (cut) { // there was a line we're dropping, so mark the elision
+                if (cut - last_line >= 3) memcpy(cut - 3, "...", 3);
+                *cut = '\0';
+            }
+
+            items[n].name   = (char*)ach->title;
+            items[n].desc   = desc;
+            items[n].values = &values[slot*2];
+            items[n].value  = 0;
+            items[n].dim    = !ach->unlocked; // gray while locked, white once earned
+            n++;
+            slot++;
+        }
+    }
+    items[n].name = NULL;
+
+    MenuList list = {
+        .type = MENU_FIXED,
+        .jump_ends = 1,  // RIGHT jumps to the top, LEFT to the bottom
+        .menu_exits = 1, // MENU goes straight back to the game
+        .subtitle = "Achievements List",
+        .value_nudge = SCALE1(RA_VALUE_NUDGE),
+        .pill_alpha = RA_PILL_ALPHA,
+        .keep = &ra_list_pos,
+        .backing = backing,
+        .desc = NULL,
+        .items = items,
+    };
+    int result = Menu_options(&list);
+
+    free(items);
+    free(status);
+    free(values);
+    free(descs);
+
+    return result;
+}
+
+// Opens the list and records how it was left. Returns 1 if the player asked to
+// go back to the game (MENU), 0 if they just backed out of the list (B).
+static int Menu_achievementsVisit(SDL_Surface* backing) {
+    ra_list_resume = (Menu_achievements(backing)==MENU_CALLBACK_EXIT);
+    return ra_list_resume;
 }
 
 static void Menu_scale(SDL_Surface* src, SDL_Surface* dst) {
@@ -3919,6 +4331,217 @@ static void Menu_loadState(void) {
     State_read();
 }
 
+///////////////////////////////////////
+// save / load submenu
+
+// The slot thumbnail, pagination dots and all. Lifted out of the pause menu
+// unchanged - the Save / Load submenu owns it now.
+static void Menu_blitSlotPreview(SDL_Surface* preview) {
+    #define WINDOW_RADIUS 4 // TODO: this logic belongs in blitRect?
+    #define PAGINATION_HEIGHT 6
+    // unscaled
+    int hw = DEVICE_WIDTH / 2;
+    int hh = DEVICE_HEIGHT / 2;
+    int pw = hw + SCALE1(WINDOW_RADIUS*2);
+    int ph = hh + SCALE1(WINDOW_RADIUS*2 + PAGINATION_HEIGHT + WINDOW_RADIUS);
+    int ox = DEVICE_WIDTH - pw - SCALE1(PADDING);
+    int oy = (DEVICE_HEIGHT - ph) / 2;
+
+    // window
+    GFX_blitRect(ASSET_STATE_BG, screen, &(SDL_Rect){ox,oy,pw,ph});
+    ox += SCALE1(WINDOW_RADIUS);
+    oy += SCALE1(WINDOW_RADIUS);
+
+    if (menu.preview_exists) { // has save, has preview
+        // lotta memory churn here
+        SDL_Surface* bmp = IMG_Load(menu.bmp_path);
+        SDL_Surface* raw_preview = SDL_ConvertSurfaceFormat(bmp, SDL_PIXELFORMAT_RGB565, 0);
+
+        SDL_FillRect(preview, NULL, 0);
+        Menu_scale(raw_preview, preview);
+        SDL_SetSurfaceBlendMode(preview, SDL_BLENDMODE_NONE);
+        SDL_BlitSurface(preview, NULL, screen, &(SDL_Rect){ox,oy});
+        SDL_FreeSurface(raw_preview);
+        SDL_FreeSurface(bmp);
+    }
+    else {
+        SDL_Rect preview_rect = {ox,oy,hw,hh};
+        SDL_FillRect(screen, &preview_rect, 0);
+        if (menu.save_exists) GFX_blitMessage(font.large, "No Preview", screen, &preview_rect);
+        else GFX_blitMessage(font.large, "Empty Slot", screen, &preview_rect);
+    }
+
+    // pagination
+    ox += (pw-SCALE1(15*MENU_SLOT_COUNT))/2;
+    oy += hh+SCALE1(WINDOW_RADIUS);
+    for (int i=0; i<MENU_SLOT_COUNT; i++) {
+        if (i==menu.slot) GFX_blitAsset(ASSET_PAGE, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15),oy});
+        else GFX_blitAsset(ASSET_DOT, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15)+4,oy+SCALE1(2)});
+    }
+}
+
+enum {
+    SAVELOAD_SAVE,
+    SAVELOAD_LOAD,
+    SAVELOAD_BACK,
+    SAVELOAD_COUNT,
+};
+
+// Slots are 0-based on disk (<game>.st0 .. .st7); show them 1-based.
+static void Menu_saveLoadLabels(char labels[SAVELOAD_COUNT][24]) {
+    snprintf(labels[SAVELOAD_SAVE], 24, "Save / Slot %i", menu.slot + 1);
+    snprintf(labels[SAVELOAD_LOAD], 24, "Load / Slot %i", menu.slot + 1);
+    snprintf(labels[SAVELOAD_BACK], 24, "Back");
+}
+
+// Returns the STATUS_* the pause menu should adopt and close on, or -1 to stay
+// open. `backing` is the pause menu's dimmed game shot, reused so the two
+// screens look like one.
+static int Menu_saveLoad(SDL_Surface* backing) {
+    char labels[SAVELOAD_COUNT][24];
+    SDL_Surface* preview = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH/2,DEVICE_HEIGHT/2,FIXED_DEPTH,RGBA_MASK_565);
+
+    int selected = 0;
+    int dirty = 1;
+    int show_setting = 0;
+    int result = -1;
+    int running = 1;
+
+    Menu_updateState(); // thumbnail and save_exists for the current slot
+    Menu_saveLoadLabels(labels);
+
+    while (running) {
+        GFX_startFrame();
+        PAD_poll();
+
+        if (PAD_justPressed(BTN_UP)) {
+            selected -= 1;
+            if (selected<0) selected += SAVELOAD_COUNT;
+            dirty = 1;
+        }
+        else if (PAD_justPressed(BTN_DOWN)) {
+            selected += 1;
+            if (selected>=SAVELOAD_COUNT) selected -= SAVELOAD_COUNT;
+            dirty = 1;
+        }
+        else if (PAD_justPressed(BTN_LEFT)) {
+            menu.slot -= 1;
+            if (menu.slot<0) menu.slot += MENU_SLOT_COUNT;
+            Menu_updateState();
+            Menu_saveLoadLabels(labels);
+            dirty = 1;
+        }
+        else if (PAD_justPressed(BTN_RIGHT)) {
+            menu.slot += 1;
+            if (menu.slot>=MENU_SLOT_COUNT) menu.slot -= MENU_SLOT_COUNT;
+            Menu_updateState();
+            Menu_saveLoadLabels(labels);
+            dirty = 1;
+        }
+
+        if (PAD_justPressed(BTN_B)) {
+            running = 0; // same as picking Back
+        }
+        else if (PAD_justPressed(BTN_A)) {
+            switch (selected) {
+                case SAVELOAD_SAVE:
+                    Menu_saveState();
+                    result = STATUS_SAVE;
+                    running = 0;
+                break;
+                case SAVELOAD_LOAD:
+                    Menu_loadState();
+                    result = STATUS_LOAD;
+                    running = 0;
+                break;
+                case SAVELOAD_BACK:
+                    running = 0;
+                break;
+            }
+        }
+
+        PWR_update(&dirty, &show_setting, Menu_beforeSleep, Menu_afterSleep);
+
+        if (dirty) {
+            GFX_clear(screen);
+            SDL_BlitSurface(backing, NULL, screen, NULL);
+            SDL_BlitSurface(menu.overlay, NULL, screen, NULL);
+
+            SDL_Surface* text;
+            int ow = GFX_blitHardwareGroup(screen, show_setting);
+            int max_width = screen->w - SCALE1(PADDING * 2) - ow;
+
+            // title
+            char title[64];
+            int title_width = GFX_truncateText(font.large, "Save / Load", title,
+                                               max_width, SCALE1(BUTTON_PADDING*2));
+            max_width = MIN(max_width, title_width);
+
+            GFX_blitPill(ASSET_BLACK_PILL, screen, &(SDL_Rect){
+                SCALE1(PADDING), SCALE1(PADDING), max_width, SCALE1(PILL_SIZE)
+            });
+            text = TTF_RenderUTF8_Blended(font.large, title, COLOR_WHITE);
+            SDL_BlitSurface(text, &(SDL_Rect){
+                0, 0, max_width-SCALE1(BUTTON_PADDING*2), text->h
+            }, screen, &(SDL_Rect){
+                SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + 4)
+            });
+            SDL_FreeSurface(text);
+
+            if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
+            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU","SLEEP", NULL }, 0, screen, 0);
+            GFX_blitButtonGroup((char*[]){ "B","BACK", "A","OKAY", NULL }, 1, screen, 1);
+
+            // rows, drawn like the pause menu's
+            int oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (SAVELOAD_COUNT * PILL_SIZE)) / 2;
+            for (int i=0; i<SAVELOAD_COUNT; i++) {
+                char* item = labels[i];
+                SDL_Color text_color = COLOR_WHITE;
+
+                if (i==selected) {
+                    int pill_width = 0;
+                    TTF_SizeUTF8(font.large, item, &pill_width, NULL);
+                    pill_width += SCALE1(BUTTON_PADDING*2);
+
+                    GFX_blitPill(ASSET_WHITE_PILL, screen, &(SDL_Rect){
+                        SCALE1(PADDING),
+                        SCALE1(oy + PADDING + (i * PILL_SIZE)),
+                        pill_width,
+                        SCALE1(PILL_SIZE)
+                    });
+                    text_color = COLOR_BLACK;
+                }
+                else {
+                    // shadow
+                    text = TTF_RenderUTF8_Blended(font.large, item, COLOR_BLACK);
+                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                        SCALE1(2 + PADDING + BUTTON_PADDING),
+                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4)
+                    });
+                    SDL_FreeSurface(text);
+                }
+
+                text = TTF_RenderUTF8_Blended(font.large, item, text_color);
+                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                    SCALE1(PADDING + BUTTON_PADDING),
+                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4)
+                });
+                SDL_FreeSurface(text);
+            }
+
+            Menu_blitSlotPreview(preview);
+
+            GFX_flip(screen);
+            dirty = 0;
+        }
+        else GFX_sync();
+    }
+
+    SDL_FreeSurface(preview);
+    PAD_reset(); // don't let the A/B that left this screen leak upstream
+    return result;
+}
+
 static void Menu_loop(void) {
     menu.bitmap = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h, FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
     //LOG_info("Menu_loop:menu.bitmap %ix%i\n", menu.bitmap->w,menu.bitmap->h);
@@ -3966,6 +4589,8 @@ static void Menu_loop(void) {
         sprintf(disc_name, "Disc %i", menu.disc+1);
     }
         
+    Menu_buildRows();
+
     int selected = 0; // resets every launch
     Menu_initState();
     
@@ -3975,61 +4600,61 @@ static void Menu_loop(void) {
     int ignore_menu = 0;
     int menu_start = 0;
     
-    SDL_Surface* preview = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH/2,DEVICE_HEIGHT/2,FIXED_DEPTH,RGBA_MASK_565); // TODO: retain until changed?
-    
+    // The player left the achievements list with MENU last time, so put them
+    // back in it rather than making them find it again. MENU again returns to
+    // the game and keeps the spot; B drops through to the pause menu below.
+    if (ra_list_resume && RA_isActive()) {
+        if (Menu_achievementsVisit(backing)) {
+            status = STATUS_CONT;
+            show_menu = 0;
+        }
+        else dirty = 1;
+    }
+
     while (show_menu) {
         GFX_startFrame();
         uint32_t now = SDL_GetTicks();
 
         PAD_poll();
         
+        int item_id = menu.rows[selected];
+
         if (PAD_justPressed(BTN_UP)) {
             selected -= 1;
-            if (selected<0) selected += MENU_ITEM_COUNT;
+            if (selected<0) selected += menu.row_count;
             dirty = 1;
         }
         else if (PAD_justPressed(BTN_DOWN)) {
             selected += 1;
-            if (selected>=MENU_ITEM_COUNT) selected -= MENU_ITEM_COUNT;
+            if (selected>=menu.row_count) selected -= menu.row_count;
             dirty = 1;
         }
         else if (PAD_justPressed(BTN_LEFT)) {
-            if (menu.total_discs>1 && selected==ITEM_CONT) {
+            if (menu.total_discs>1 && item_id==ITEM_CONT) {
                 menu.disc -= 1;
                 if (menu.disc<0) menu.disc += menu.total_discs;
                 dirty = 1;
                 sprintf(disc_name, "Disc %i", menu.disc+1);
             }
-            else if (selected==ITEM_SAVE || selected==ITEM_LOAD) {
-                menu.slot -= 1;
-                if (menu.slot<0) menu.slot += MENU_SLOT_COUNT;
-                dirty = 1;
-            }
         }
         else if (PAD_justPressed(BTN_RIGHT)) {
-            if (menu.total_discs>1 && selected==ITEM_CONT) {
+            if (menu.total_discs>1 && item_id==ITEM_CONT) {
                 menu.disc += 1;
                 if (menu.disc==menu.total_discs) menu.disc -= menu.total_discs;
                 dirty = 1;
                 sprintf(disc_name, "Disc %i", menu.disc+1);
             }
-            else if (selected==ITEM_SAVE || selected==ITEM_LOAD) {
-                menu.slot += 1;
-                if (menu.slot>=MENU_SLOT_COUNT) menu.slot -= MENU_SLOT_COUNT;
-                dirty = 1;
-            }
         }
-        
-        if (dirty && (selected==ITEM_SAVE || selected==ITEM_LOAD)) {
-            Menu_updateState();
-        }
+
+        // the row under the cursor may have just changed
+        item_id = menu.rows[selected];
         
         if (PAD_justPressed(BTN_B) || (BTN_WAKE!=BTN_MENU && PAD_tappedMenu(now))) {
             status = STATUS_CONT;
             show_menu = 0;
         }
         else if (PAD_justPressed(BTN_A)) {
-            switch(selected) {
+            switch(item_id) {
                 case ITEM_CONT:
                 if (menu.total_discs && rom_disc!=menu.disc) {
                         status = STATUS_DISC;
@@ -4042,21 +4667,21 @@ static void Menu_loop(void) {
                     show_menu = 0;
                 break;
                 
-                case ITEM_SAVE: {
-                    Menu_saveState();
-                    status = STATUS_SAVE;
-                    show_menu = 0;
-                }
-                break;
-                case ITEM_LOAD: {
-                    Menu_loadState();
-                    status = STATUS_LOAD;
-                    show_menu = 0;
+                case ITEM_SAVELOAD: {
+                    // the submenu owns the slot, its thumbnail and the actions;
+                    // it only reports back when something was actually done
+                    int result = Menu_saveLoad(backing);
+                    if (result>=0) {
+                        status = result;
+                        show_menu = 0;
+                    }
+                    dirty = 1;
                 }
                 break;
                 case ITEM_OPTS: {
                     if (simple_mode) {
                         core.reset();
+                        RA_resetRuntime();
                         status = STATUS_RESET;
                         show_menu = 0;
                     }
@@ -4078,10 +4703,24 @@ static void Menu_loop(void) {
                     }
                 }
                 break;
+                case ITEM_ACHIEVEMENTS:
+                    // MENU inside the list skips the pause menu entirely
+                    if (Menu_achievementsVisit(backing)) {
+                        status = STATUS_CONT;
+                        show_menu = 0;
+                    }
+                    dirty = 1;
+                break;
                 case ITEM_QUIT:
                     status = STATUS_QUIT;
                     show_menu = 0;
                     quit = 1; // TODO: tmp?
+                break;
+                case ITEM_RESET:
+                    core.reset();
+                    RA_resetRuntime(); // drop any half-satisfied triggers
+                    status = STATUS_RESET;
+                    show_menu = 0;
                 break;
             }
             if (!show_menu) break;
@@ -4127,14 +4766,28 @@ static void Menu_loop(void) {
             GFX_blitButtonGroup((char*[]){ "B","BACK", "A","OKAY", NULL }, 1, screen, 1);
             
             // list
-            oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (MENU_ITEM_COUNT * PILL_SIZE)) / 2;
-            for (int i=0; i<MENU_ITEM_COUNT; i++) {
-                char* item = menu.items[i];
+            oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (menu.row_count * PILL_SIZE)) / 2;
+            for (int i=0; i<menu.row_count; i++) {
+                int row_id = menu.rows[i];
+                char* item = menu.items[row_id];
                 SDL_Color text_color = COLOR_WHITE;
-                
+
+                // unlocked/total and the percentage, always visible on its row
+                if (row_id==ITEM_ACHIEVEMENTS) {
+                    char progress[32];
+                    Menu_achievementSummary(progress, sizeof(progress));
+
+                    text = TTF_RenderUTF8_Blended(font.tiny, progress, COLOR_WHITE);
+                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                        screen->w - SCALE1(PADDING + BUTTON_PADDING) - text->w,
+                        SCALE1(oy + PADDING + (i * PILL_SIZE)) + (SCALE1(PILL_SIZE) - text->h) / 2
+                    });
+                    SDL_FreeSurface(text);
+                }
+
                 if (i==selected) {
                     // disc change
-                    if (menu.total_discs>1 && i==ITEM_CONT) {                
+                    if (menu.total_discs>1 && row_id==ITEM_CONT) {                
                         GFX_blitPill(ASSET_DARK_GRAY_PILL, screen, &(SDL_Rect){
                             SCALE1(PADDING),
                             SCALE1(oy + PADDING),
@@ -4180,60 +4833,11 @@ static void Menu_loop(void) {
                 SDL_FreeSurface(text);
             }
             
-            // slot preview
-            if (selected==ITEM_SAVE || selected==ITEM_LOAD) {
-                #define WINDOW_RADIUS 4 // TODO: this logic belongs in blitRect?
-                #define PAGINATION_HEIGHT 6
-                // unscaled
-                int hw = DEVICE_WIDTH / 2;
-                int hh = DEVICE_HEIGHT / 2;
-                int pw = hw + SCALE1(WINDOW_RADIUS*2);
-                int ph = hh + SCALE1(WINDOW_RADIUS*2 + PAGINATION_HEIGHT + WINDOW_RADIUS);
-                ox = DEVICE_WIDTH - pw - SCALE1(PADDING);
-                oy = (DEVICE_HEIGHT - ph) / 2;
-                
-                // window
-                GFX_blitRect(ASSET_STATE_BG, screen, &(SDL_Rect){ox,oy,pw,ph});
-                ox += SCALE1(WINDOW_RADIUS);
-                oy += SCALE1(WINDOW_RADIUS);
-                
-                if (menu.preview_exists) { // has save, has preview
-                    // lotta memory churn here
-                    SDL_Surface* bmp = IMG_Load(menu.bmp_path);
-                    SDL_Surface* raw_preview = SDL_ConvertSurfaceFormat(bmp, SDL_PIXELFORMAT_RGB565, 0);
-                    
-                    //LOG_info("raw_preview %ix%i fixed to RGB565\n", raw_preview->w, raw_preview->h);
-                    
-                    SDL_FillRect(preview, NULL, 0);
-                    Menu_scale(raw_preview, preview);
-                    SDL_SetSurfaceBlendMode(preview, SDL_BLENDMODE_NONE);
-                    SDL_BlitSurface(preview, NULL, screen, &(SDL_Rect){ox,oy});
-                    SDL_FreeSurface(raw_preview);
-                    SDL_FreeSurface(bmp);
-                }
-                else {
-                    SDL_Rect preview_rect = {ox,oy,hw,hh};
-                    SDL_FillRect(screen, &preview_rect, 0);
-                    if (menu.save_exists) GFX_blitMessage(font.large, "No Preview", screen, &preview_rect);
-                    else GFX_blitMessage(font.large, "Empty Slot", screen, &preview_rect);
-                }
-                
-                // pagination
-                ox += (pw-SCALE1(15*MENU_SLOT_COUNT))/2;
-                oy += hh+SCALE1(WINDOW_RADIUS);
-                for (int i=0; i<MENU_SLOT_COUNT; i++) {
-                    if (i==menu.slot)GFX_blitAsset(ASSET_PAGE, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15),oy});
-                    else GFX_blitAsset(ASSET_DOT, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15)+4,oy+SCALE1(2)});
-                }
-            }
-    
             GFX_flip(screen);
             dirty = 0;
         }
         else GFX_sync();
     }
-    
-    SDL_FreeSurface(preview);
     
     PAD_reset();
 
@@ -4393,6 +4997,12 @@ int main(int argc , char* argv[]) {
     Core_open(core_path, tag_name);
     Game_open(rom_path);
     if (!game.is_open) goto finish;
+
+    // achievements are armed before Core_load() so the memory map the core
+    // reports while loading isn't thrown away again
+    RA_init(USERDATA_PATH "/retroachievements");
+    RA_setMemoryFuncs(core.get_memory_data, core.get_memory_size);
+    RA_loadGame((char*)core.tag, game.tmp_path[0]?game.tmp_path:game.path, game.data, game.size);
     
     simple_mode = exists(SIMPLE_MODE_PATH);
     
@@ -4430,6 +5040,7 @@ int main(int argc , char* argv[]) {
         GFX_startFrame();
         
         core.run();
+        RA_doFrame();
         limitFF();
         
         if (show_menu) Menu_loop();
@@ -4453,6 +5064,7 @@ int main(int argc , char* argv[]) {
     
 finish:
 
+    RA_unloadGame();
     Game_close();
     Core_unload();
     

@@ -50,7 +50,7 @@ clean:
 	rm -f $(PRODUCT)
 
 $(PREFIX)/include/msettings.h:
-	cd /root/workspace/libmsettings && make
+	cd /root/workspace/src/libmsettings && make
 
 send: all
 	/root/workspace/tools/adb push $(PRODUCT) /opt/minui/bin/$(TARGET).elf
