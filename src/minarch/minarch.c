@@ -42,6 +42,7 @@ static int show_debug = 0;
 static int max_ff_speed = 3; // 4x
 static int fast_forward = 0;
 static int overclock = 1; // normal
+static int achievements_enabled = 1; // FE_OPT_ACHIEVEMENTS, persisted per game
 static int DEVICE_WIDTH = FIXED_WIDTH;
 static int DEVICE_HEIGHT = FIXED_HEIGHT;
 static int DEVICE_PITCH = FIXED_PITCH;
@@ -680,6 +681,7 @@ enum {
     FE_OPT_OVERCLOCK,
     FE_OPT_DEBUG,
     FE_OPT_MAXFF,
+    FE_OPT_ACHIEVEMENTS,
     FE_OPT_COUNT,
 };
 
@@ -1025,6 +1027,16 @@ static struct Config {
                 .values = max_ff_labels,
                 .labels = max_ff_labels,
             },
+            [FE_OPT_ACHIEVEMENTS] = {
+                .key    = "minarch_achievements",
+                .name    = "Achievements",
+                .desc    = "Track RetroAchievements for this game.\nTurning this off restores save states.",
+                .default_value = 1,
+                .value = 1,
+                .count = 2,
+                .values = onoff_labels,
+                .labels = onoff_labels,
+            },
             [FE_OPT_COUNT] = {NULL}
         }
     },
@@ -1101,6 +1113,10 @@ static void Config_syncFrontend(char* key, int value) {
     else if (exactMatch(key,config.frontend.options[FE_OPT_MAXFF].key)) {
         max_ff_speed = value;
         i = FE_OPT_MAXFF;
+    }
+    else if (exactMatch(key,config.frontend.options[FE_OPT_ACHIEVEMENTS].key)) {
+        achievements_enabled = value;
+        i = FE_OPT_ACHIEVEMENTS;
     }
     if (i==-1) return;
     Option* option = &config.frontend.options[i];
@@ -2931,14 +2947,19 @@ typedef struct MenuList {
     MenuList_callback_t on_change;
 } MenuList;
 
-static int Menu_message(char* message, char** pairs) {
+// Modal prompt. Returns 1 if the user accepted with A, 0 if they backed out
+// with B. Menu_message() ignores the answer, Menu_confirm() is the guard in
+// front of anything destructive.
+static int Menu_prompt(char* message, char** pairs) {
     GFX_setMode(MODE_MAIN);
     int dirty = 1;
+    int confirmed = 0;
     while (1) {
         GFX_startFrame();
         PAD_poll();
 
-        if (PAD_justPressed(BTN_A) || PAD_justPressed(BTN_B)) break;
+        if (PAD_justPressed(BTN_A)) { confirmed = 1; break; }
+        if (PAD_justPressed(BTN_B)) break;
         
         PWR_update(&dirty, NULL, Menu_beforeSleep, Menu_afterSleep);
         
@@ -2952,7 +2973,17 @@ static int Menu_message(char* message, char** pairs) {
         else GFX_sync();
     }
     GFX_setMode(MODE_MENU);
-    return MENU_CALLBACK_NOP; // TODO: this should probably be an arg
+    return confirmed;
+}
+
+static int Menu_message(char* message, char** pairs) {
+    Menu_prompt(message, pairs);
+    return MENU_CALLBACK_NOP;
+}
+
+// B is the default here: the user has to reach for A on purpose.
+static int Menu_confirm(char* message) {
+    return Menu_prompt(message, (char*[]){ "B","CANCEL", "A","CONFIRM", NULL });
 }
 
 #define OPTION_PADDING 8
@@ -2981,6 +3012,7 @@ static int OptionFrontend_openMenu(MenuList* list, int i) {
         if (!config.frontend.enabled_count) {
             int enabled_count = 0;
             for (int i=0; i<config.frontend.count; i++) {
+                if (i==FE_OPT_ACHIEVEMENTS) continue; // has its own submenu
                 if (!config.frontend.options[i].lock) enabled_count += 1;
             }
             config.frontend.enabled_count = enabled_count;
@@ -2988,6 +3020,7 @@ static int OptionFrontend_openMenu(MenuList* list, int i) {
             int j = 0;
             for (int i=0; i<config.frontend.count; i++) {
                 Option* item = &config.frontend.options[i];
+                if (i==FE_OPT_ACHIEVEMENTS) continue; // has its own submenu
                 if (item->lock) continue;
                 config.frontend.enabled_options[j] = item;
                 j += 1;
@@ -3437,6 +3470,64 @@ static int OptionKeyboard_openMenu(MenuList* list, int i) {
 }
 // --- FIN DE IMPLEMENTACIÓN DEL MENÚ DE TECLADO ---
 
+///////////////////////////////////////
+// achievements options
+
+enum {
+    ACHIEVEMENT_OPT_ENABLED,
+    ACHIEVEMENT_OPT_RESET,
+};
+
+static int OptionAchievements_toggled(MenuList* list, int i) {
+    MenuItem* item = &list->items[ACHIEVEMENT_OPT_ENABLED];
+
+    // routed through the config so Save Changes persists it per game
+    Config_syncFrontend(config.frontend.options[FE_OPT_ACHIEVEMENTS].key, item->value);
+
+    // Deliberately *not* applied to the running session. Switching them off
+    // mid-game would hand back the save state menu, which is a free way around
+    // hardcore: load a state before the boss, switch achievements back on,
+    // collect. Whatever was decided when the game booted stays decided, so
+    // RA_isActive(), the hardcore gates and the pause menu rows never move.
+    Menu_message("Save options (for game or console)\nand restart to apply", (char*[]){ "A","OKAY", NULL });
+    return MENU_CALLBACK_NOP;
+}
+
+static int OptionAchievements_reset(MenuList* list, int i) {
+    if (!RA_isActive()) {
+        // either the game has no set, or they were switched off at launch and
+        // the set was never read -- nothing is loaded to erase either way
+        Menu_message("Achievements are off for this game.\nRestart with them on to erase progress.",
+                     (char*[]){ "A","OKAY", NULL });
+        return MENU_CALLBACK_NOP;
+    }
+
+    if (!Menu_confirm("Erase all achievement progress\nfor this game?\n\nThis cannot be undone.")) {
+        return MENU_CALLBACK_NOP;
+    }
+
+    RA_wipeProgress();
+    Menu_message("Achievement progress erased", (char*[]){ "A","OKAY", NULL });
+    return MENU_CALLBACK_NOP;
+}
+
+static MenuList OptionAchievements_menu = {
+    .type = MENU_FIXED,
+    .desc = "The switch takes effect next launch.\nReset erases all progress for this game.",
+    .items = (MenuItem[]){
+        {"Achievements", .values = onoff_labels, .on_change = OptionAchievements_toggled},
+        {"Reset Achievements", .on_confirm = OptionAchievements_reset},
+        {NULL},
+    }
+};
+
+static int OptionAchievements_openMenu(MenuList* list, int i) {
+    // the switch can also be changed by loading a config, so re-read it here
+    OptionAchievements_menu.items[ACHIEVEMENT_OPT_ENABLED].value = achievements_enabled;
+    Menu_options(&OptionAchievements_menu);
+    return MENU_CALLBACK_NOP;
+}
+
 static MenuList options_menu = {
     .type = MENU_LIST,
     .items = (MenuItem[]) {
@@ -3445,6 +3536,7 @@ static MenuList options_menu = {
         {"Controls",.on_confirm=OptionControls_openMenu},
         {"Shortcuts",.on_confirm=OptionShortcuts_openMenu}, 
         {"Keyboard",.on_confirm=OptionKeyboard_openMenu}, 
+        {"Achievements",.on_confirm=OptionAchievements_openMenu},
         {"Save Changes",.on_confirm=OptionSaveChanges_openMenu},
         {NULL},
         {NULL},
@@ -3452,8 +3544,29 @@ static MenuList options_menu = {
     }
 };
 
+// Only worth showing when there is a set to manage, or when achievements are
+// off and the user needs a way to turn them back on. Called once, after the
+// load attempt, because that is when both of those are known.
+static void OptionAchievements_syncRow(void) {
+    if (RA_isActive() || !achievements_enabled) return;
+
+    MenuItem* items = options_menu.items;
+    for (int i=0; items[i].name; i++) {
+        if (items[i].on_confirm != OptionAchievements_openMenu) continue;
+        for (int j=i; items[j].name; j++) items[j] = items[j+1]; // close the gap
+        break;
+    }
+}
+
 static void OptionSaveChanges_updateDesc(void) {
-    options_menu.items[4].desc = getSaveDesc();
+    // by callback rather than index: the Achievements row above it is dropped
+    // for games that have no set, which shifts everything after it up one
+    MenuItem* items = options_menu.items;
+    for (int i=0; items[i].name; i++) {
+        if (items[i].on_confirm != OptionSaveChanges_openMenu) continue;
+        items[i].desc = getSaveDesc();
+        break;
+    }
 }
 
 // The frozen game frame and the dim overlay don't change while a menu is open,
@@ -3635,7 +3748,8 @@ static int Menu_options(MenuList* list) {
         else if (type!=MENU_INPUT && type!=MENU_LIST) {
             if (PAD_justRepeated(BTN_LEFT)) {
                 MenuItem* item = &items[selected];
-                if (item->value>0) item->value -= 1;
+                if (!item->values) { /* action row, nothing to cycle */ }
+                else if (item->value>0) item->value -= 1;
                 else {
                     int j;
                     for (j=0; item->values[j]; j++);
@@ -3649,7 +3763,8 @@ static int Menu_options(MenuList* list) {
             }
             else if (PAD_justRepeated(BTN_RIGHT)) {
                 MenuItem* item = &items[selected];
-                if (item->values[item->value+1]) item->value += 1;
+                if (!item->values) { /* action row, nothing to cycle */ }
+                else if (item->values[item->value+1]) item->value += 1;
                 else item->value = 0;
                 
                 if (item->on_change) item->on_change(list, selected);
@@ -4302,6 +4417,14 @@ static void Menu_scale(SDL_Surface* src, SDL_Surface* dst) {
         }
     
     // LOG_info("successful\n");
+}
+
+// Hashing the rom and parsing the set; also used when achievements are turned
+// back on mid-session, which is why it isn't inline in main().
+static void RA_loadForGame(void) {
+    RA_init(USERDATA_PATH "/retroachievements");
+    RA_setMemoryFuncs(core.get_memory_data, core.get_memory_size);
+    RA_loadGame((char*)core.tag, game.tmp_path[0]?game.tmp_path:game.path, game.data, game.size);
 }
 
 static void Menu_initState(void) {
@@ -5080,18 +5203,18 @@ int main(int argc , char* argv[]) {
     Game_open(rom_path);
     if (!game.is_open) goto finish;
 
-    // achievements are armed before Core_load() so the memory map the core
-    // reports while loading isn't thrown away again
-    RA_init(USERDATA_PATH "/retroachievements");
-    RA_setMemoryFuncs(core.get_memory_data, core.get_memory_size);
-    RA_loadGame((char*)core.tag, game.tmp_path[0]?game.tmp_path:game.path, game.data, game.size);
-    
     simple_mode = exists(SIMPLE_MODE_PATH);
     
     // restore options
     Config_load();
     Config_init();
     Config_readOptions(); // cores with boot logo option (eg. gb) need to load options early
+
+    // After the config, so the per-game switch is known, but still before
+    // Core_load() so the memory map the core reports isn't thrown away.
+    // Switched off means we never hash the rom or parse the set at all.
+    if (achievements_enabled) RA_loadForGame();
+    OptionAchievements_syncRow();
     setOverclock(overclock);
     GFX_setVsync(prevent_tearing);
 

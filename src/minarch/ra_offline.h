@@ -65,8 +65,18 @@ const char* RA_getMessage(void);
 // rendered surface instead of rasterising the same string every frame.
 uint32_t RA_getMessageId(void);
 
-// 1 while a game with achievements is loaded.
+// 1 while a game with achievements is loaded. Everything downstream keys off
+// this: the pause menu rows, hardcore, the popups and the per-frame
+// evaluation. Decided once by RA_loadGame() and fixed for the session -- the
+// per-game on/off switch is read at launch and never applied to a running
+// game, or turning it off would hand back the save state menu mid-run.
 int RA_isActive(void);
+
+// Erase every local unlock for this game: forget them, delete the progress
+// file and re-arm the whole set so it can be earned again right away.
+// Destructive and not undoable; confirm with the user first.
+// Returns 1 if the set was re-armed, 0 if nothing was loaded.
+int RA_wipeProgress(void);
 
 // unlocked/total for the loaded game.
 void RA_getSummary(uint32_t* unlocked, uint32_t* total);

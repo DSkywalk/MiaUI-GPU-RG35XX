@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <libretro.h>
 
@@ -66,6 +67,7 @@ static struct {
     int        progress_stale;// the file on disk no longer matches what we hold
     char      hash[33];
     char      root[MAX_PATH];
+    char      data_path[MAX_PATH];     // the set we parsed, so we can re-read it
     char      progress_path[MAX_PATH];
 
     char      msg[RA_MSG_SIZE];
@@ -100,6 +102,39 @@ static char* ra_readFile(const char* path, size_t* out_len) {
     buf[read] = '\0';
     if (out_len) *out_len = read;
     return buf;
+}
+
+static int ra_fileExists(const char* path) {
+    struct stat st;
+    return stat(path, &st)==0 && st.st_size>0;
+}
+
+// Reads a saved `r=patch` body and hands it to rcheevos' own parser. On
+// success the caller owns `out` and must destroy it.
+static int ra_readSet(const char* path, rc_api_fetch_game_data_response_t* out) {
+    size_t json_len = 0;
+    char* json = ra_readFile(path, &json_len);
+    if (!json) return 0;
+
+    memset(out, 0, sizeof(*out));
+
+    // the _server_response form is the supported one; the plain
+    // rc_api_process_fetch_game_data_response() is marked deprecated upstream
+    rc_api_server_response_t server_response;
+    memset(&server_response, 0, sizeof(server_response));
+    server_response.body = json;
+    server_response.body_length = json_len;
+    server_response.http_status_code = 200; // the file is a saved 200 body
+
+    int result = rc_api_process_fetch_game_data_server_response(out, &server_response);
+    free(json);
+
+    if (result!=RC_OK || !out->num_achievements) {
+        LOG_warn("RA: %s is not a usable patch response (%s)\n", path, rc_error_str(result));
+        rc_api_destroy_fetch_game_data_response(out);
+        return 0;
+    }
+    return 1;
 }
 
 static int ra_isUnlocked(uint32_t id) {
@@ -427,6 +462,26 @@ static void ra_buildList(const rc_api_fetch_game_data_response_t* game) {
     ra_list.count = at;
 }
 
+// Arms every base-set achievement that isn't already unlocked. The runtime
+// must be freshly initialised; it won't deactivate anything.
+static uint32_t ra_activateSet(const rc_api_fetch_game_data_response_t* game) {
+    uint32_t activated = 0;
+    for (uint32_t i=0; i<game->num_achievements; i++) {
+        const rc_api_achievement_definition_t* ach = &game->achievements[i];
+
+        if (!ra_isBaseSet(ach)) continue;
+        if (ra_isUnlocked(ach->id)) continue;
+
+        if (rc_runtime_activate_achievement(&ra.runtime, ach->id, ach->definition, NULL, 0)==RC_OK) {
+            activated++;
+        }
+        else {
+            LOG_warn("RA: skipping achievement %u (%s)\n", ach->id, ach->title ? ach->title : "");
+        }
+    }
+    return activated;
+}
+
 ///////////////////////////////////////
 // public api
 
@@ -548,41 +603,17 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
 
     // 2. the set has to be on the card already. Sets are filed per console so
     // a big library doesn't end up as one directory with thousands of entries.
-    char data_path[MAX_PATH];
-    snprintf(data_path, sizeof(data_path), "%s/data/%s/%s.json", ra.root, emu_tag, ra.hash);
-
-    size_t json_len = 0;
-    char* json = ra_readFile(data_path, &json_len);
-    if (!json) {
+    snprintf(ra.data_path, sizeof(ra.data_path), "%s/data/%s/%s.json", ra.root, emu_tag, ra.hash);
+    if (!ra_fileExists(ra.data_path)) {
         // tolerate a flat data/ folder from an older run of the fetch tool
-        snprintf(data_path, sizeof(data_path), "%s/data/%s.json", ra.root, ra.hash);
-        json = ra_readFile(data_path, &json_len);
-    }
-    if (!json) {
-        LOG_info("RA: no achievement data for %s (%s)\n", ra.hash, emu_tag);
-        ra.hash[0] = '\0';
-        return 0;
+        snprintf(ra.data_path, sizeof(ra.data_path), "%s/data/%s.json", ra.root, ra.hash);
     }
 
     // 3. reuse rcheevos' own parser for the `patch` response we downloaded
     rc_api_fetch_game_data_response_t game;
-    memset(&game, 0, sizeof(game));
-
-    // the _server_response form is the supported one; the plain
-    // rc_api_process_fetch_game_data_response() is marked deprecated upstream
-    rc_api_server_response_t server_response;
-    memset(&server_response, 0, sizeof(server_response));
-    server_response.body = json;
-    server_response.body_length = json_len;
-    server_response.http_status_code = 200; // the file is a saved 200 body
-
-    int result = rc_api_process_fetch_game_data_server_response(&game, &server_response);
-    free(json);
-
-    if (result!=RC_OK || !game.num_achievements) {
-        LOG_warn("RA: %s is not a usable patch response (%s)\n",
-                 data_path, rc_error_str(result));
-        rc_api_destroy_fetch_game_data_response(&game);
+    if (!ra_readSet(ra.data_path, &game)) {
+        LOG_info("RA: no usable achievement data for %s (%s)\n", ra.hash, emu_tag);
+        ra.data_path[0] = '\0';
         ra.hash[0] = '\0';
         return 0;
     }
@@ -610,20 +641,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     ra.total = ra_list.count;
     ra_pruneUnlocked();
 
-    uint32_t activated = 0;
-    for (uint32_t i=0; i<game.num_achievements; i++) {
-        const rc_api_achievement_definition_t* ach = &game.achievements[i];
-
-        if (!ra_isBaseSet(ach)) continue;
-        if (ra_isUnlocked(ach->id)) continue;
-
-        if (rc_runtime_activate_achievement(&ra.runtime, ach->id, ach->definition, NULL, 0)==RC_OK) {
-            activated++;
-        }
-        else {
-            LOG_warn("RA: skipping achievement %u (%s)\n", ach->id, ach->title ? ach->title : "");
-        }
-    }
+    uint32_t activated = ra_activateSet(&game);
 
     rc_api_destroy_fetch_game_data_response(&game);
 
@@ -632,6 +650,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
         rc_runtime_destroy(&ra.runtime);
         ra_freeList();
         ra.hash[0] = '\0';
+        ra.data_path[0] = '\0';
         ra.progress_path[0] = '\0';
         return 0;
     }
@@ -666,7 +685,7 @@ void RA_unloadGame(void) {
     free(ra.unlocked);
     free(ra.descriptors);
 
-    // keep root, memory funcs survive the core
+    // keep root and the memory funcs; they outlive the game
     RA_GetMemoryData get_data = ra.get_data;
     RA_GetMemorySize get_size = ra.get_size;
     char root[MAX_PATH];
@@ -698,6 +717,46 @@ void RA_doFrame(void) {
 
 void RA_resetRuntime(void) {
     if (ra.active) rc_runtime_reset(&ra.runtime);
+}
+
+int RA_wipeProgress(void) {
+    if (!ra.active) return 0;
+
+    // the file goes first: if anything below fails we still end up with a
+    // clean slate on the next launch rather than a half-erased one
+    if (ra.progress_path[0]) unlink(ra.progress_path);
+
+    ra.unlocked_count = 0;
+    ra.invalidated = 0;
+    ra.progress_stale = 1; // nothing on disk now, so the next save must write
+    for (uint32_t i=0; i<ra_list.count; i++) ra_list.items[i].unlocked = 0;
+
+    // Earned achievements were either never activated or were deactivated the
+    // moment they fired, so clearing the unlock list isn't enough to make them
+    // earnable again -- the runtime has to be rebuilt from the set. Cheap
+    // enough: this only ever runs from the menu.
+    rc_runtime_destroy(&ra.runtime);
+    rc_runtime_init(&ra.runtime);
+
+    rc_api_fetch_game_data_response_t game;
+    uint32_t activated = 0;
+    if (ra_readSet(ra.data_path, &game)) {
+        activated = ra_activateSet(&game);
+        rc_api_destroy_fetch_game_data_response(&game);
+    }
+    else {
+        // the set is gone or unreadable; progress is still wiped, but nothing
+        // can be tracked until the next launch
+        LOG_warn("RA: wiped progress but could not re-arm from %s\n", ra.data_path);
+    }
+
+    LOG_info("RA: progress wiped, tracking %u/%u\n", activated, ra.total);
+
+    snprintf(ra.msg, sizeof(ra.msg), "Achievements: 0/%u", ra.total);
+    ra.msg_frames = RA_MSG_FRAMES;
+    ra.msg_id++;
+
+    return activated>0;
 }
 
 const char* RA_getMessage(void) {
