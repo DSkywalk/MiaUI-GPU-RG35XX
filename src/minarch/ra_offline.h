@@ -78,8 +78,9 @@ int RA_isActive(void);
 // Returns 1 if the set was re-armed, 0 if nothing was loaded.
 int RA_wipeProgress(void);
 
-// unlocked/total for the loaded game.
-void RA_getSummary(uint32_t* unlocked, uint32_t* total);
+// unlocked/total for the loaded game, and the points earned so far. Any of
+// the three may be NULL. All are 0 when nothing is loaded.
+void RA_getSummary(uint32_t* unlocked, uint32_t* total, uint32_t* points);
 
 // Base-set achievements for the loaded game, in the order the set defines
 // them. Leaderboards, rich presence and non-core sets are never included.

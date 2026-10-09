@@ -45,6 +45,7 @@ void SND_playChime(void); // common/api.h, declared here to keep this file stand
 static const char* ra_titleForId(uint32_t id);
 static RA_Achievement* ra_findById(uint32_t id);
 static int ra_isBaseSet(const rc_api_achievement_definition_t* ach);
+static void ra_countPoints(void); // defined with the achievement list
 
 static struct {
     rc_runtime_t runtime;
@@ -60,6 +61,7 @@ static struct {
     uint32_t  unlocked_count;
     uint32_t  unlocked_cap;
     uint32_t  total;
+    uint32_t  points;      // sum of what's been earned, cached (see ra_countPoints)
 
     uint32_t  console_id;
     uint32_t  set_check;     // fingerprint of the base set in the data json
@@ -365,8 +367,12 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
 
     RA_Achievement* entry = ra_findById(event->id);
     if (entry) entry->unlocked = 1;
+    ra_countPoints();
 
-    snprintf(ra.msg, sizeof(ra.msg), "%s", title ? title : "???");
+    // the trophy the toast draws is the points symbol, so the number needs no
+    // unit beside it
+    snprintf(ra.msg, sizeof(ra.msg), "%u   %s",
+             entry ? entry->points : 0, title ? title : "???");
     ra.msg_frames = RA_MSG_FRAMES;
     ra.msg_id++;
 
@@ -459,6 +465,17 @@ static void ra_buildList(const rc_api_fetch_game_data_response_t* game) {
         cursor += len + 1;
     }
     ra_list.count = at;
+}
+
+// The earned score. Recounted rather than accumulated so it can't drift out of
+// step with the unlock list after a prune, a reload or a wipe; the set is a few
+// hundred entries at most and this only runs when something actually changes.
+static void ra_countPoints(void) {
+    uint32_t points = 0;
+    for (uint32_t i=0; i<ra_list.count; i++) {
+        if (ra_list.items[i].unlocked) points += ra_list.items[i].points;
+    }
+    ra.points = points;
 }
 
 // Arms every base-set achievement that isn't already unlocked. The runtime
@@ -639,6 +656,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     ra_buildList(&game);
     ra.total = ra_list.count;
     ra_pruneUnlocked();
+    ra_countPoints();
 
     uint32_t activated = ra_activateSet(&game);
 
@@ -665,7 +683,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
         snprintf(ra.msg, sizeof(ra.msg), "Progress file was modified - progress reset");
     }
     else {
-        snprintf(ra.msg, sizeof(ra.msg), "%u / %u", ra.unlocked_count, ra.total);
+        snprintf(ra.msg, sizeof(ra.msg), "%u   %u/%u", ra.points, ra.unlocked_count, ra.total);
     }
     ra.msg_frames = RA_MSG_FRAMES;
     ra.msg_id++;
@@ -729,6 +747,7 @@ int RA_wipeProgress(void) {
     ra.invalidated = 0;
     ra.progress_stale = 1; // nothing on disk now, so the next save must write
     for (uint32_t i=0; i<ra_list.count; i++) ra_list.items[i].unlocked = 0;
+    ra.points = 0;
 
     // Earned achievements were either never activated or were deactivated the
     // moment they fired, so clearing the unlock list isn't enough to make them
@@ -751,7 +770,7 @@ int RA_wipeProgress(void) {
 
     LOG_info("RA: progress wiped, tracking %u/%u\n", activated, ra.total);
 
-    snprintf(ra.msg, sizeof(ra.msg), "0 / %u", ra.total);
+    snprintf(ra.msg, sizeof(ra.msg), "0   0/%u", ra.total);
     ra.msg_frames = RA_MSG_FRAMES;
     ra.msg_id++;
 
@@ -770,9 +789,10 @@ int RA_isActive(void) {
     return ra.active;
 }
 
-void RA_getSummary(uint32_t* unlocked, uint32_t* total) {
+void RA_getSummary(uint32_t* unlocked, uint32_t* total, uint32_t* points) {
     if (unlocked) *unlocked = ra.unlocked_count;
     if (total)    *total    = ra.total;
+    if (points)   *points   = ra.points;
 }
 
 int RA_getAchievementCount(void) {

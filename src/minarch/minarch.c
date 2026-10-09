@@ -2576,7 +2576,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
             // pill's, so the content clears the rounded caps.
             int pill_x = SCALE1(PADDING);
             int icon_x = pill_x + SCALE1(BUTTON_PADDING);
-            int text_x = icon_x + SCALE1(RA_ICON_SIZE + RA_ICON_GAP);
+            int text_x = icon_x + SCALE1(RA_ICON_SIZE);
             int pill_w = (text_x - pill_x) + ra_surface->w + SCALE1(BUTTON_PADDING);
             pill_w = MIN(pill_w, screen->w - SCALE1(PADDING*2));
 
@@ -2991,7 +2991,8 @@ typedef struct MenuList {
     // optional, right-aligned on the subtitle's row (so it costs no extra
     // height) over the value column. Needs a subtitle to sit on.
     char* subtitle_right;
-    int subtitle_icon; // optional ASSET_* drawn left of the subtitle, 0 for none
+    char* subtitle_left; // optional, follows the icon on the left margin
+    int subtitle_icon;   // optional ASSET_* on the left margin, 0 for none
     int value_nudge;  // optional, pull the value column this many px left
     int pill_alpha;   // optional, 1..254 to make the selected row translucent
     MenuPosition* keep; // optional, restored on entry and updated on exit
@@ -3943,16 +3944,28 @@ static int Menu_options(MenuList* list) {
                 int sub_right = sub_x + text->w;
                 int sub_h = text->h;
 
-                // the icon badges the page from the left margin, lined up with
-                // the row pills below it; the title stays centered on its own
-                if (list->subtitle_icon) {
-                    GFX_blitAsset(list->subtitle_icon, NULL, screen, &(SDL_Rect){
-                        SCALE1(PADDING),
-                        list_top + (sub_h - SCALE1(RA_ICON_SIZE)) / 2
-                    });
-                }
                 SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ sub_x, list_top });
                 SDL_FreeSurface(text);
+
+                // the icon badges the page from the left margin, lined up with
+                // the row pills below it, and anything that follows reads as
+                // its value; the title stays centered on its own
+                int left_x = SCALE1(PADDING);
+                if (list->subtitle_icon) {
+                    GFX_blitAsset(list->subtitle_icon, NULL, screen, &(SDL_Rect){
+                        left_x,
+                        list_top + (sub_h - SCALE1(RA_ICON_SIZE)) / 2
+                    });
+                    left_x += SCALE1(RA_ICON_SIZE + 1);
+                }
+                if (list->subtitle_left) {
+                    text = TTF_RenderUTF8_Blended(font.small, list->subtitle_left, COLOR_WHITE);
+                    // as on the right, the centered title wins the row
+                    if (left_x + text->w < sub_x - SCALE1(RA_ICON_GAP)) {
+                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ left_x, list_top });
+                    }
+                    SDL_FreeSurface(text);
+                }
 
                 if (list->subtitle_right) {
                     text = TTF_RenderUTF8_Blended(font.small, list->subtitle_right, COLOR_WHITE);
@@ -4231,12 +4244,12 @@ static int ra_list_resume = 0;
 
 #define RA_SUMMARY_SIZE 32
 
-// "12/23  52%" - percentage is by achievement count, not points
+// "250 - 5/10" - points earned, then the count. The trophy drawn beside it is
+// the unit, so the score carries no suffix.
 static void Menu_achievementSummary(char* out, size_t size) {
-    uint32_t unlocked = 0, total = 0;
-    RA_getSummary(&unlocked, &total);
-    snprintf(out, size, "%u/%u  %u%%", unlocked, total,
-             total ? (unlocked * 100 + total / 2) / total : 0);
+    uint32_t unlocked = 0, total = 0, points = 0;
+    RA_getSummary(&unlocked, &total, &points);
+    snprintf(out, size, "%u   %u/%u", points, unlocked, total);
 }
 
 // Returns MENU_CALLBACK_EXIT if the user asked to go straight back to the game.
@@ -4248,9 +4261,17 @@ static int Menu_achievements(SDL_Surface* backing) {
 
     RA_refreshProgress();
 
-    // lives until Menu_options() returns, which is all the list needs
-    char summary[RA_SUMMARY_SIZE];
-    Menu_achievementSummary(summary, sizeof(summary));
+    // both live until Menu_options() returns, which is all the list needs:
+    // the score badges the left margin next to the trophy, the tally sits on
+    // the right. No percentage -- the two numbers already say it.
+    char ra_points[RA_SUMMARY_SIZE];
+    char ra_tally[RA_SUMMARY_SIZE];
+    {
+        uint32_t unlocked = 0, total = 0, points = 0;
+        RA_getSummary(&unlocked, &total, &points);
+        snprintf(ra_points, sizeof(ra_points), "%u", points);
+        snprintf(ra_tally, sizeof(ra_tally), "%u/%u", unlocked, total);
+    }
 
     // GFX_wrapText rewrites the string in place, so it needs our own copies
     // rather than the descriptions ra_offline owns. Wrapping only ever swaps a
@@ -4345,8 +4366,9 @@ static int Menu_achievements(SDL_Surface* backing) {
         .jump_ends = 1,  // RIGHT jumps to the top, LEFT to the bottom
         .menu_exits = 1, // MENU goes straight back to the game
         .subtitle = "Achievements List",
-        .subtitle_right = summary,
         .subtitle_icon = ASSET_TROPHY,
+        .subtitle_left = ra_points,
+        .subtitle_right = ra_tally,
         .value_nudge = SCALE1(RA_VALUE_NUDGE),
         .pill_alpha = RA_PILL_ALPHA,
         .keep = &ra_list_pos,
@@ -5077,7 +5099,7 @@ static void Menu_loop(void) {
                     // name sits inside a pill sized to fit it exactly, and an
                     // icon in there would have to resize it
                     GFX_blitAsset(ASSET_TROPHY, NULL, screen, &(SDL_Rect){
-                        text_x - SCALE1(RA_ICON_GAP + RA_ICON_SIZE),
+                        text_x - SCALE1(RA_ICON_SIZE),
                         row_y + (SCALE1(PILL_SIZE) - SCALE1(RA_ICON_SIZE)) / 2
                     });
                     SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
