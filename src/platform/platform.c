@@ -721,7 +721,21 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 	if (ui_layer_visible) {
 		PROF_BEGIN(PROF_TEX_UI);
 		glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
+			// GLES2 has no GL_UNPACK_ROW_LENGTH, so the row stride it assumes
+			// is width*2 rounded up to GL_UNPACK_ALIGNMENT. This layer is
+			// SDL_CreateRGBSurfaceFrom'd with pitch exactly width*2, which at
+			// the default alignment of 4 disagrees for any odd width: gambatte
+			// resizes us to 533x480, GL reads 1068 byte rows against a real
+			// 1066, and every row lands two bytes late -- the whole UI shears
+			// diagonally. 2 is exact for any 16-bit width.
+			//
+			// It has to be set here rather than once at init: the game texture
+			// upload above runs first every frame and restores 4 on its way out.
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
 			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.width, vid.height, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, vid.screen->pixels);
+			// back to 4 for the overlays below -- those are SDL_CreateRGBSurface
+			// surfaces, whose pitch SDL already pads out to 4 bytes
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 		PROF_END(PROF_TEX_UI);
 		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)vid.width * vid.height * 2);
 
