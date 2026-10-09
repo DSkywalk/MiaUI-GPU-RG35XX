@@ -62,6 +62,7 @@ GFX_Renderer renderer;
 
 static struct Core {
     int initialized;
+    int loaded;        // retro_load_game() accepted the content
     int need_fullpath;
     
     const char tag[8]; // eg. GBC
@@ -2682,6 +2683,18 @@ void Core_getName(char* in_name, char* out_name) {
     char* tmp = strrchr(out_name, '_');
     tmp[0] = '\0';
 }
+// Stashed by Core_open and applied by Core_init. libretro.h only promises
+// these are set before the first retro_run(), but RetroArch calls them after
+// retro_init() and cores are written to that order: Mesen's retro_set_video_refresh
+// does `_console->GetVideoRenderer()->...`, and _console is the shared_ptr that
+// retro_init() fills in -- calling the setters from Core_open dereferences null
+// and dies before the core is even initialised.
+static void (*set_video_refresh_callback)(retro_video_refresh_t);
+static void (*set_audio_sample_callback)(retro_audio_sample_t);
+static void (*set_audio_sample_batch_callback)(retro_audio_sample_batch_t);
+static void (*set_input_poll_callback)(retro_input_poll_t);
+static void (*set_input_state_callback)(retro_input_state_t);
+
 void Core_open(const char* core_path, const char* tag_name) {
     LOG_info("Core_open\n");
     core.handle = dlopen(core_path, RTLD_LAZY);
@@ -2706,12 +2719,6 @@ void Core_open(const char* core_path, const char* tag_name) {
     core.get_memory_size = dlsym(core.handle, "retro_get_memory_size");
     
     void (*set_environment_callback)(retro_environment_t);
-    void (*set_video_refresh_callback)(retro_video_refresh_t);
-    void (*set_audio_sample_callback)(retro_audio_sample_t);
-    void (*set_audio_sample_batch_callback)(retro_audio_sample_batch_t);
-    void (*set_input_poll_callback)(retro_input_poll_t);
-    void (*set_input_state_callback)(retro_input_state_t);
-    
     set_environment_callback = dlsym(core.handle, "retro_set_environment");
     set_video_refresh_callback = dlsym(core.handle, "retro_set_video_refresh");
     set_audio_sample_callback = dlsym(core.handle, "retro_set_audio_sample");
@@ -2745,26 +2752,39 @@ void Core_open(const char* core_path, const char* tag_name) {
     sprintf(cmd, "mkdir -p \"%s\"; mkdir -p \"%s\"", core.config_dir, core.states_dir);
     system(cmd);
 
+    // the only one that has to happen before retro_init(); the rest wait for
+    // Core_init(), see the note above
     set_environment_callback(environment_callback);
+}
+void Core_init(void) {
+    LOG_info("Core_init\n");
+    core.init();
+    core.initialized = 1;
+
     set_video_refresh_callback(video_refresh_callback);
     set_audio_sample_callback(audio_sample_callback);
     set_audio_sample_batch_callback(audio_sample_batch_callback);
     set_input_poll_callback(input_poll_callback);
     set_input_state_callback(input_state_callback);
 }
-void Core_init(void) {
-    LOG_info("Core_init\n");
-    core.init();
-    core.initialized = 1;
-}
-void Core_load(void) {
+// Returns 0 if the core refused the content. Everything downstream (the av
+// info, the save ram, the state buffer) reads state that only exists once the
+// game is loaded, so this has to be checked -- ignoring it turns a core that
+// cleanly said "no" into a crash much further along.
+int Core_load(void) {
     LOG_info("Core_load\n");
     struct retro_game_info game_info;
     game_info.path = game.tmp_path[0]?game.tmp_path:game.path;
     game_info.data = game.data;
     game_info.size = game.size;
     
-    core.load_game(&game_info);
+    if (!core.load_game(&game_info)) {
+        LOG_error("Core_load: %s refused to load the content. Look further up the\n"
+                  "log for the reason it gave -- an unsupported pixel format or a\n"
+                  "missing system directory are the usual ones.\n", core.name);
+        return 0;
+    }
+    core.loaded = 1;
     
     SRAM_read();
     RTC_read();
@@ -2782,6 +2802,7 @@ void Core_load(void) {
     core.aspect_ratio = a;
     
     LOG_info("aspect_ratio: %f fps: %f\n", a, core.fps);
+    return 1;
 }
 void Core_reset(void) {
     core.reset();
@@ -2791,9 +2812,14 @@ void Core_unload(void) {
 }
 void Core_quit(void) {
     if (core.initialized) {
-        SRAM_write();
-        RTC_write();
-        core.unload_game();
+        // only if the content actually loaded: writing save ram the core never
+        // populated would overwrite a good .sav with whatever it hands back
+        if (core.loaded) {
+            SRAM_write();
+            RTC_write();
+            core.unload_game();
+            core.loaded = 0;
+        }
         core.deinit();
         core.initialized = 0;
     }
@@ -5354,7 +5380,7 @@ int main(int argc , char* argv[]) {
     // ah, because it's defined before options_menu...
     options_menu.items[1].desc = (char*)core.version;
     
-    Core_load();
+    if (!Core_load()) goto finish;
     Input_init(NULL);
     Config_readOptions(); // but others load and report options later (eg. nes)
     Config_readControls(); // restore controls (after the core has reported its defaults)
