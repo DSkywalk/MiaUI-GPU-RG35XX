@@ -93,9 +93,11 @@ To make life easier, 4 standalone utilities are included:
 <img width="320" alt="MiniVideo Player" src="https://github.com/user-attachments/assets/959a16fe-b8fc-436b-8352-8f4f7532d958" /> <img width="320" alt="MiniMusic Player" src="https://github.com/user-attachments/assets/a2f0b022-8ad9-4113-a5b1-2618d16a225a" />
 
 ### Shared conection using NetworkManager (linux)
-Change `enx123456789abcd` for your device name.
 ```
-  nmcli connection add con-name "RG35XX" ifname enx123456789abcd type ethernet ipv4.method shared ipv4.addresses 192.168.23.1/24
+  nmcli connection add type ethernet con-name "RG35XX" ifname "*"
+  nmcli connection modify "RG35XX" connection.interface-name ""
+  nmcli connection modify "RG35XX" match.interface-name "enx*" match.driver "rndis_host"
+  nmcli connection modify "RG35XX" ipv4.method shared ipv4.addresses 192.168.23.1/24
   nmcli connection up "RG35XX"
 ```
 
