@@ -94,7 +94,7 @@ To make life easier, 4 standalone utilities are included:
 
 ### Shared conection using NetworkManager (linux)
 ```
-  nmcli connection add con-name "RG35XX" ifname enx42221469c3f6 type ethernet ipv4.method shared ipv4.addresses 192.168.23.1/24
+  nmcli connection add con-name "RG35XX" ifname enx123456789abcd type ethernet ipv4.method shared ipv4.addresses 192.168.23.1/24
   nmcli connection up "RG35XX"
 ```
 
