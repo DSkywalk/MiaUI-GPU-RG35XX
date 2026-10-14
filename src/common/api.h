@@ -167,6 +167,8 @@ int GFX_hdmiChanged(void);
 #define GFX_clear PLAT_clearVideo // (SDL_Surface* screen)
 #define GFX_clearAll PLAT_clearAll // (void)
 #define GFX_setUILayer PLAT_setUILayer // (int visible)
+#define GFX_loadToast PLAT_loadToast // (SDL_Surface* image) upload the toast's pixels, NULL to drop them
+#define GFX_showToast PLAT_showToast // (int visible, int x, int y) per frame, in screen pixels
 #define GFX_clearLayers PLAT_clearLayers //(SDL_Surface *inputSurface,int x, int y)
 
 #define PAD_init PLAT_initInput
@@ -174,6 +176,8 @@ int GFX_hdmiChanged(void);
 
 void GFX_startFrame(void);
 void GFX_flip(SDL_Surface* screen);
+double GFX_getRefreshRate(void); // the panel's measured rate, not what SDL reports
+#define GFX_repeatFrame PLAT_repeatFrame // (void) next flip shows the last game frame again, no upload
 void GFX_sync(void); // call this to maintain 60fps when not calling GFX_flip() this frame
 void GFX_quit(void);
 
@@ -227,6 +231,7 @@ typedef struct SND_Frame {
 
 void SND_init(double sample_rate, double frame_rate);
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count);
+int SND_isVideoClocked(void); // 1 when vsync paces the emulator and audio is resampled to follow
 void SND_quit(void);
 // Mixes a short two-note chime into the output. Non-blocking and callable from
 // any thread; synthesised in the audio callback, so it never adds work to the
@@ -251,7 +256,18 @@ void VIB_init(void);
 void VIB_quit(void);
 void VIB_setStrength(int strength);
  int VIB_getStrength(void);
-	
+
+///////////////////////////////
+
+// Save data, written off the emulation thread. Every write is an atomic
+// replace (<path>.tmp, fsync, rename, fsync the directory), so a crash or a
+// power cut leaves the old file or the new one, never a truncated one.
+
+void IO_writeFile(const char* path, void* data, size_t size); // queues it; takes ownership of data (malloc'd)
+ int IO_writeFileNow(const char* path, const void* data, size_t size); // same, on this thread; 0 on success
+void IO_flush(void); // returns once everything queued so far is on disk
+void IO_quit(void);  // flush, then stop the writer thread
+
 ///////////////////////////////
 
 #define BRIGHTNESS_BUTTON_LABEL "+ -" // ew
@@ -306,6 +322,8 @@ void PLAT_clearAll(void);
 // almost always empty - so let the caller say when it has nothing in it and
 // both the upload and the composite can be skipped. Defaults to visible.
 void PLAT_setUILayer(int visible);
+void PLAT_loadToast(SDL_Surface* image);
+void PLAT_showToast(int visible, int x, int y);
 void PLAT_clearLayers(int layer);
 void PLAT_setVsync(int vsync);
 SDL_Surface* PLAT_resizeVideo(int w, int h, int pitch);
@@ -316,6 +334,7 @@ void PLAT_vsync(int remaining);
 scaler_t PLAT_getScaler(GFX_Renderer* renderer);
 void PLAT_blitRenderer(GFX_Renderer* renderer);
 void PLAT_flip(SDL_Surface* screen, int sync);
+void PLAT_repeatFrame(void);
 
 void PLAT_initGameOverlay(const char* ovl_path);
 SDL_Surface* PLAT_initOverlay(void);

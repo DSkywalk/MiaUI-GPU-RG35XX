@@ -41,6 +41,7 @@ static struct OVL_Context {
 // Forward declarations
 void PLAT_initSurfaceOverlay(const char* filename, int mode);
 void PLAT_quitGameOverlay(void);
+static void PLAT_quitToast(void);
 
 // funciona regular por que en DOSBOX aparece mucha espera y no tiene sentido, pero es un comienzo.
 //#define PROFILE_GPU 1
@@ -175,6 +176,7 @@ static struct {
 	uint32_t dw, dh, dp; // Destination width, height, pitch
 	int dx, dy;          // Destination x, y
 	int bpp;
+	int repeat;          // 1 = draw the cached frame on the next flip (core sent no new one)
 	int dirty;           // 1 = game geometry changed, VBO needs rebuild
 	uint32_t last_sw;    // Previous source width (to detect resize)
 	uint32_t last_sh;    // Previous source height
@@ -480,6 +482,7 @@ void PLAT_quitVideo(void) {
 		PLAT_quitGameOverlay();
 	}
 
+	PLAT_quitToast();
 	glDeleteTextures(1, &vid.game_tex);
 	glDeleteTextures(1, &vid.screen_tex);
 	glDeleteBuffers(1, &vid.vbo_screen);
@@ -506,13 +509,72 @@ void PLAT_clearVideo(SDL_Surface* screen) {
 static int ui_layer_visible = 1;
 void PLAT_setUILayer(int visible) { ui_layer_visible = visible; }
 
+// The achievement toast as its own small texture, so showing one doesn't
+// mean uploading the whole 640x480 ui layer every frame (measured: 5.1ms a
+// frame for the full layer against 0.02ms for this). Uploaded once per
+// message; the slide-in only moves the quad.
+static struct {
+	GLuint tex;
+	GLuint vbo;
+	int w, h;   // of the uploaded image, 0 = nothing loaded
+	int x, y;   // where the vbo currently puts it
+	int visible;
+} toast;
+
+void PLAT_loadToast(SDL_Surface* image) {
+	if (!toast.tex) {
+		glGenTextures(1, &toast.tex);
+		glBindTexture(GL_TEXTURE_2D, toast.tex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glGenBuffers(1, &toast.vbo);
+	}
+	if (!image) {
+		toast.w = toast.h = 0;
+		toast.visible = 0;
+		return;
+	}
+	glBindTexture(GL_TEXTURE_2D, toast.tex);
+	// the row stride GL assumes is width*2 rounded up to the alignment
+	glPixelStorei(GL_UNPACK_ALIGNMENT, (image->pitch % 4) ? ((image->pitch % 2) ? 1 : 2) : 4);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->w, image->h, 0, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, image->pixels);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	PROF_COUNT(PROF_TEX_BYTES, (uint64_t)image->w * image->h * 2);
+	toast.w = image->w;
+	toast.h = image->h;
+	toast.x = toast.y = -1; // force the vbo to be built for the new size
+}
+
+static void PLAT_quitToast(void) {
+	if (!toast.tex) return;
+	glDeleteTextures(1, &toast.tex);
+	glDeleteBuffers(1, &toast.vbo);
+	memset(&toast, 0, sizeof(toast));
+}
+
+void PLAT_showToast(int visible, int x, int y) {
+	toast.visible = visible && toast.w;
+	if (!toast.visible || (x==toast.x && y==toast.y)) return;
+	upload_quad_vbo(toast.vbo, x, y, toast.w, toast.h);
+	toast.x = x;
+	toast.y = y;
+}
+
 void PLAT_clearAll(void) {
 	PLAT_clearVideo(vid.screen);
 	vid.cleared = 1;
 }
 
+static int swap_interval = 1; // what the driver is set to right now (PLAT_initVideo sets 1)
 void PLAT_setVsync(int vsync) {
-	SDL_GL_SetSwapInterval(vsync ? 1 : 0);
+	swap_interval = vsync ? 1 : 0;
+	SDL_GL_SetSwapInterval(swap_interval);
+}
+
+void PLAT_repeatFrame(void) {
+	gles_blit.repeat = 1;
 }
 
 // -------------------------------------------------------------------------
@@ -646,6 +708,14 @@ void PLAT_blitRenderer(GFX_Renderer* renderer) {
 // -------------------------------------------------------------------------
 
 void PLAT_flip(SDL_Surface* IGNORED, int sync) {
+	// sync=0 on a frame that GFX_flip found already late: present it without
+	// waiting. Switching costs 7us on this driver and applies to this very
+	// swap; the next on-time frame switches back.
+	if ((sync ? 1 : 0) != swap_interval) {
+		swap_interval = sync ? 1 : 0;
+		SDL_GL_SetSwapInterval(swap_interval);
+	}
+
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	// disable for plane textures
@@ -702,6 +772,14 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		PROF_COUNT(PROF_DRAWS, 1);
 		gles_blit.src = NULL;
 	}
+	else if (gles_blit.repeat && gles_blit.last_stride_w) {
+		// no new picture from the core: the texture still holds the last one
+		PROF_BEGIN(PROF_DRAW);
+		draw_cached_quad(vid.vbo_game, vid.game_tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
+	}
+	gles_blit.repeat = 0;
 
 	// enable blending for ui/overlays
 	glEnable(GL_BLEND);
@@ -760,6 +838,14 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		PROF_COUNT(PROF_DRAWS, 1);
 	}
 
+	// 3b. Achievement toast, over the ui layer like it used to be drawn in it
+	if (toast.visible) {
+		PROF_BEGIN(PROF_DRAW);
+		draw_cached_quad(toast.vbo, toast.tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
+	}
+
 	// 4. Draw Pill Overlay (Battery/Volume popup) if enabled
 	if (ovl.enabled && ovl.surface) {
 		glBindTexture(GL_TEXTURE_2D, ovl.tex);
@@ -785,6 +871,7 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 	PLAT_checkGPULoad();
 	#endif
 	PROF_END(PROF_SWAP);
+	PROF_PRESENT();
 
 	// Swap pages for double buffering of the UI surface
 	vid.page ^= 1;

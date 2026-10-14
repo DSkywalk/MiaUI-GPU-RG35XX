@@ -458,23 +458,21 @@ static void SRAM_write(void) {
     char filename[MAX_PATH];
     SRAM_getPath(filename);
     LOG_info("sav path (write): %s\n", filename);
-        
-    FILE *sram_file = fopen(filename, "w");
-    if (!sram_file) {
-        LOG_error("Error opening SRAM file: %s\n", strerror(errno));
+
+    // A snapshot, because the core keeps running while the writer works.
+    // The writer replaces the file atomically, so a power cut mid-save leaves
+    // the previous .sav rather than a truncated one.
+    void* copy = malloc(sram_size);
+    if (!copy) {
+        LOG_error("Error allocating SRAM snapshot\n");
         return;
     }
+    memcpy(copy, sram, sram_size);
+    IO_writeFile(filename, copy, sram_size);
 
-    if (sram_size != fwrite(sram, 1, sram_size, sram_file)) {
-        LOG_error("Error writing SRAM data to file\n");
-    } else {
-        // ÉXITO: Actualizamos el hash de referencia
-        last_sram_hash = current_hash;
-        sram_hash_initialized = 1;
-    }
-
-    fclose(sram_file);
-    sync();
+    // ÉXITO: Actualizamos el hash de referencia
+    last_sram_hash = current_hash;
+    sram_hash_initialized = 1;
 }
 
 ///////////////////////////////////////
@@ -508,22 +506,15 @@ static void RTC_write(void) {
     char filename[MAX_PATH];
     RTC_getPath(filename);
     printf("rtc path (write) size(%u): %s\n", rtc_size, filename);
-        
-    FILE *rtc_file = fopen(filename, "w");
-    if (!rtc_file) {
-        LOG_error("Error opening RTC file: %s\n", strerror(errno));
-        return;
-    }
 
     void *rtc = core.get_memory_data(RETRO_MEMORY_RTC);
-
-    if (!rtc || rtc_size != fwrite(rtc, 1, rtc_size, rtc_file)) {
+    void* copy = rtc ? malloc(rtc_size) : NULL;
+    if (!copy) {
         LOG_error("Error writing RTC data to file\n");
+        return;
     }
-
-    fclose(rtc_file);
-
-    sync();
+    memcpy(copy, rtc, rtc_size);
+    IO_writeFile(filename, copy, rtc_size);
 }
 
 ///////////////////////////////////////
@@ -536,6 +527,10 @@ static void State_read(void) { // from picoarch
     size_t state_size = core.serialize_size();
     if (!state_size) return;
 
+    // a save of this slot may still be on its way to the card
+    IO_flush();
+
+    FILE *state_file = NULL;
     void *state = calloc(1, state_size);
     if (!state) {
         LOG_error("Couldn't allocate memory for state\n");
@@ -545,7 +540,7 @@ static void State_read(void) { // from picoarch
     char filename[MAX_PATH];
     State_getPath(filename);
     
-    FILE *state_file = fopen(filename, "r");
+    state_file = fopen(filename, "r");
     if (!state_file) {
         if (state_slot!=8) { // st8 is a default state in MiniUI and may not exist, that's okay
             LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
@@ -579,33 +574,21 @@ static void State_write(void) { // from picoarch
     void *state = calloc(1, state_size);
     if (!state) {
         LOG_error("Couldn't allocate memory for state\n");
-        goto error;
+        return;
     }
 
     char filename[MAX_PATH];
     State_getPath(filename);
-    
-    FILE *state_file = fopen(filename, "w");
-    if (!state_file) {
-        LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
-        goto error;
-    }
 
+    // Serialising has to happen here, between frames. Writing it out doesn't:
+    // ~300ms for a PS state on this card, so the writer thread takes it and
+    // the buffer with it.
     if (!core.serialize(state, state_size)) {
         LOG_error("Error creating save state: %s (%s)\n", filename, strerror(errno));
-        goto error;
+        free(state);
+        return;
     }
-
-    if (state_size != fwrite(state, 1, state_size, state_file)) {
-        LOG_error("Error writing state data to file: %s (%s)\n", filename, strerror(errno));
-        goto error;
-    }
-
-error:
-    if (state) free(state);
-    if (state_file) fclose(state_file);
-
-    sync();
+    IO_writeFile(filename, state, state_size);
 }
 static void State_autosave(void) {
     int last_state_slot = state_slot;
@@ -2531,13 +2514,18 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     // you can squeeze more out of every console by turning prevent tearing off
     // eg. PS@10 60/240
     
-    if (!data) return;
+    // NULL is the core saying "same picture as last time"; 30fps games do it
+    // every other frame. When the audio ring sets the pace there's nothing to
+    // do. When vsync does, every retro_run has to take exactly one refresh,
+    // or a 30fps game runs ahead of its audio - so show the last frame again.
+    int repeat = !data;
+    if (repeat && (!SND_isVideoClocked() || fast_forward)) return;
 
-    fps_ticks += 1;
+    if (!repeat) fps_ticks += 1;
     
     // if source has changed size (or forced by dst_p==0)
     // eg. true src + cropped src + fixed dst + cropped dst
-    if (renderer.dst_p==0 || width!=renderer.true_w || height!=renderer.true_h) {
+    if (!repeat && (renderer.dst_p==0 || width!=renderer.true_w || height!=renderer.true_h)) {
         selectScaler(width, height, pitch);
         GFX_clearAll();
     }
@@ -2548,10 +2536,15 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     if (top_width) SDL_FillRect(screen, &(SDL_Rect){0,0,top_width,DIGIT_HEIGHT}, RGB_BLACK);
     if (bottom_width) SDL_FillRect(screen, &(SDL_Rect){0,screen->h-DIGIT_HEIGHT,bottom_width,DIGIT_HEIGHT}, RGB_BLACK);
     
-    renderer.src = (void*)data;
-    renderer.dst = screen->pixels;
-    // LOG_info("video_refresh_callback: %ix%i@%i %ix%i@%i\n",width,height,pitch,screen->w,screen->h,screen->pitch);
-    GFX_blitRenderer(&renderer);
+    if (repeat) {
+        GFX_repeatFrame(); // renderer.src keeps the last real frame for the menu's snapshot
+    }
+    else {
+        renderer.src = (void*)data;
+        renderer.dst = screen->pixels;
+        // LOG_info("video_refresh_callback: %ix%i@%i %ix%i@%i\n",width,height,pitch,screen->w,screen->h,screen->pitch);
+        GFX_blitRenderer(&renderer);
+    }
     
     if (show_debug) {
         int x = 0;
@@ -2603,12 +2596,16 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     }
     
     // achievement popup
-    int ra_ui_active = 0;
+    //
+    // A texture of its own (GFX_loadToast), composed and uploaded once per
+    // message and slid in by moving its quad. It used to be drawn into the ui
+    // layer, which then had to be uploaded whole - 5.1ms a frame measured, for
+    // an 80px strip - and erased by hand, page by page. It's also drawn 1:1 in
+    // screen pixels now; the ui layer is sized to the game's output and
+    // stretched, which stretched the toast with it.
     {
-        static SDL_Surface* ra_surface = NULL;
-        static uint32_t ra_surface_id = 0;
-        static int ra_clear_w = 0;
-        static int ra_clear_frames = 0;
+        static uint32_t ra_toast_id = 0;
+        static int ra_toast_w = 0;
         static int ra_rise = 0;
 
         // the pill is a fixed height (GFX_blitPill crops rather than scales the
@@ -2618,95 +2615,73 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         const int ra_strip_h = ra_pill_h + SCALE1(PADDING);
 
         const char* ra_msg = RA_getMessage();
-        if (ra_msg) ra_ui_active = 1;
 
         // only rasterize when the text actually changes, not every frame
-        if (ra_msg && RA_getMessageId()!=ra_surface_id) {
-            if (ra_surface) SDL_FreeSurface(ra_surface);
+        if (ra_msg && RA_getMessageId()!=ra_toast_id) {
+            ra_toast_id = RA_getMessageId();
+            ra_toast_w = 0;
+            ra_rise = 0; // a new message slides in from off screen
 
             // a long achievement title would run out past the rounded cap, so
             // clip it to what fits between the insets instead
             char ra_text[256];
             GFX_truncateText(font.tiny, ra_msg, ra_text,
-                             screen->w - SCALE1(PADDING*2 + BUTTON_PADDING*2
-                                                + RA_ICON_SIZE + RA_ICON_GAP), 0);
+                             DEVICE_WIDTH - SCALE1(PADDING*2 + BUTTON_PADDING*2
+                                                   + RA_ICON_SIZE + RA_ICON_GAP), 0);
+            SDL_Surface* text = TTF_RenderUTF8_Blended(font.tiny, ra_text, COLOR_WHITE);
 
-            ra_surface = TTF_RenderUTF8_Blended(font.tiny, ra_text, COLOR_WHITE);
-            ra_surface_id = RA_getMessageId();
-            ra_rise = 0; // a new message slides in from off screen
+            if (text) {
+                // trophy, gap, text -- the icon says "achievement" so the message
+                // itself is just the title or the tally. Insets match the title
+                // pill's, so the content clears the rounded caps.
+                int icon_x = SCALE1(BUTTON_PADDING);
+                int text_x = icon_x + SCALE1(RA_ICON_SIZE);
+                int pill_w = MIN(text_x + text->w + SCALE1(BUTTON_PADDING),
+                                 DEVICE_WIDTH - SCALE1(PADDING*2));
+
+                // The ui layer's own format, starting transparent, so these
+                // blits blend exactly as they did when they went into the layer.
+                // Its corners stay transparent and the platform blends it.
+                SDL_PixelFormat* fmt = screen->format;
+                SDL_Surface* pill = SDL_CreateRGBSurface(0, pill_w, ra_pill_h, fmt->BitsPerPixel,
+                                                         fmt->Rmask, fmt->Gmask, fmt->Bmask, fmt->Amask);
+                if (pill) {
+                    SDL_FillRect(pill, NULL, 0);
+                    GFX_blitPill(ASSET_DARK_GRAY_PILL, pill, &(SDL_Rect){0, 0, pill_w, ra_pill_h});
+                    GFX_blitAsset(ASSET_TROPHY, NULL, pill, &(SDL_Rect){
+                        icon_x, (ra_pill_h - SCALE1(RA_ICON_SIZE)) / 2
+                    });
+                    SDL_BlitSurface(text, NULL, pill, &(SDL_Rect){
+                        text_x, (ra_pill_h - text->h) / 2
+                    });
+                    GFX_loadToast(pill); // the platform keeps a copy on the gpu
+                    SDL_FreeSurface(pill);
+                    ra_toast_w = pill_w;
+                }
+                SDL_FreeSurface(text);
+            }
         }
 
-        if (ra_msg && ra_surface) {
-            // trophy, gap, text -- the icon says "achievement" so the message
-            // itself is just the title or the tally. Insets match the title
-            // pill's, so the content clears the rounded caps.
-            int pill_x = SCALE1(PADDING);
-            int icon_x = pill_x + SCALE1(BUTTON_PADDING);
-            int text_x = icon_x + SCALE1(RA_ICON_SIZE);
-            int pill_w = (text_x - pill_x) + ra_surface->w + SCALE1(BUTTON_PADDING);
-            pill_w = MIN(pill_w, screen->w - SCALE1(PADDING*2));
-
-            // keep the widest pill we've drawn, so the erase covers all of it
-            if (pill_x+pill_w > ra_clear_w) ra_clear_w = pill_x + pill_w;
-            ra_clear_frames = PAGE_COUNT;
-
+        if (ra_msg && ra_toast_w) {
             // quadratic ease-out off the bottom edge: quick away from the edge,
             // settling gently into place
             int rem  = RA_TOAST_RISE_FRAMES - ra_rise;
             int rise = (ra_strip_h * rem * rem) / (RA_TOAST_RISE_FRAMES * RA_TOAST_RISE_FRAMES);
             if (ra_rise<RA_TOAST_RISE_FRAMES) ra_rise++;
 
-            int strip_y = screen->h - ra_strip_h;
-            int pill_y  = strip_y + rise;
-
-            // Erase the whole strip first, every frame: the pill's corners are
-            // transparent, so painting over last frame's copy would leave its
-            // outline behind, and while it is moving the two differ. Erase to 0
-            // (transparent) rather than RGB_BLACK -- SDL_MapRGB ors in the
-            // alpha mask, so black here is an opaque box over the game.
-            SDL_FillRect(screen, &(SDL_Rect){0,strip_y,ra_clear_w,ra_strip_h}, 0);
-
-            GFX_blitPill(ASSET_DARK_GRAY_PILL, screen, &(SDL_Rect){
-                pill_x, pill_y, pill_w, ra_pill_h
-            });
-            GFX_blitAsset(ASSET_TROPHY, NULL, screen, &(SDL_Rect){
-                icon_x,
-                pill_y + (ra_pill_h - SCALE1(RA_ICON_SIZE)) / 2
-            });
-            SDL_BlitSurface(ra_surface, NULL, screen, &(SDL_Rect){
-                text_x,
-                pill_y + (ra_pill_h - ra_surface->h) / 2
-            });
+            GFX_showToast(1, SCALE1(PADDING), DEVICE_HEIGHT - ra_strip_h + rise);
         }
         else {
-            if (ra_surface) {
-                SDL_FreeSurface(ra_surface);
-                ra_surface = NULL;
-            }
-            if (ra_clear_frames>0) {
-                ra_ui_active = 1; // still erasing, so the layer must stay up
-                // `screen` is the RGBA ui layer that PLAT_flip alpha-blends on
-                // top of the game texture, and nothing repaints it for us, so
-                // the bar has to be erased by hand. Erase to 0 (transparent),
-                // NOT to RGB_BLACK: SDL_MapRGB ors in the alpha mask, so black
-                // here is an opaque black box sitting over the game. This is
-                // the same value PLAT_clearVideo() memsets the layer to.
-                //
-                // Once per page, because the layer is page-flipped and each
-                // page still holds its own copy of the bar.
-                SDL_FillRect(screen, &(SDL_Rect){0,screen->h-ra_strip_h,ra_clear_w,ra_strip_h}, 0);
-                if (--ra_clear_frames==0) ra_clear_w = 0;
-            }
+            GFX_showToast(0, 0, 0);
         }
     }
     
     // The ui layer costs ~5ms a frame to upload (the driver swizzles the whole
-    // 640x480 RGBA texture) and in game it is empty unless the debug overlay or
-    // an achievement popup is up. Tell the platform so it can skip both the
-    // upload and the composite.
+    // 640x480 RGBA texture) and in game it is empty unless the debug overlay is
+    // up. Tell the platform so it can skip both the upload and the composite.
     {
         static int ui_was_wanted = 1;
-        int ui_wanted = show_debug || ra_ui_active;
+        int ui_wanted = show_debug;
         int ui_visible = ui_wanted;
 
         // Clear on the way *down*, not on the way back up: clearing when it
@@ -2737,8 +2712,13 @@ static void audio_sample_callback(int16_t left, int16_t right) {
     if (!fast_forward) SND_batchSamples(&(const SND_Frame){left,right}, 1);
 }
 static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) { 
-    if (!fast_forward) return SND_batchSamples((const SND_Frame*)data, frames);
-    else return frames;
+    if (fast_forward) return frames;
+
+    PROF_BEGIN(PROF_AUDIO);
+    PROF_COUNT(PROF_AUDIO_FRAMES, frames);
+    size_t taken = SND_batchSamples((const SND_Frame*)data, frames);
+    PROF_END(PROF_AUDIO);
+    return taken;
 };
 
 ///////////////////////////////////////
@@ -3027,6 +3007,7 @@ void Menu_quit(void) {
     SDL_FreeSurface(menu.overlay);
 }
 void Menu_beforeSleep(void) {
+    GFX_showToast(0, 0, 0); // not over the "powering off" message either
     SRAM_write();
     RTC_write();
     State_autosave();
@@ -4698,6 +4679,9 @@ static void Menu_initState(void) {
 static void Menu_updateState(void) {
     // LOG_info("Menu_updateState\n");
 
+    // the exists() checks below have to see any save still being written
+    IO_flush();
+
     int last_slot = state_slot;
     state_slot = menu.slot;
 
@@ -4743,12 +4727,20 @@ static void Menu_saveState(void) {
     }
 
     if (bitmap) {
-        SDL_RWops* out = SDL_RWFromFile(menu.bmp_path, "wb");
-        if (out) {
-            SDL_SaveBMP_RW(bitmap, out, 1);
+        // Encoded into memory and written by the IO thread with the state.
+        // Room for the worst case SDL writes: 32bpp plus the largest header.
+        size_t cap = 2048 + (size_t)bitmap->w * bitmap->h * 4 + (size_t)bitmap->h * 4;
+        void* bmp = malloc(cap);
+        SDL_RWops* out = bmp ? SDL_RWFromMem(bmp, (int)cap) : NULL;
+        if (out && SDL_SaveBMP_RW(bitmap, out, 0)==0) {
+            size_t bmp_size = (size_t)SDL_RWtell(out);
+            SDL_RWclose(out);
+            IO_writeFile(menu.bmp_path, bmp, bmp_size);
             LOG_info("BMP: %s %ix%i\n", menu.bmp_path, bitmap->w,bitmap->h);
         } else {
-            LOG_error("Failed to open %s for writing\n", menu.bmp_path);
+            if (out) SDL_RWclose(out);
+            free(bmp);
+            LOG_error("Failed to encode %s\n", menu.bmp_path);
         }
     }
 
@@ -5017,6 +5009,7 @@ static void Menu_loop(void) {
     }
 
     GFX_setUILayer(1); // the menu *is* the ui layer
+    GFX_showToast(0, 0, 0); // and it would be drawn over the menu
 
     // after the resize, so it matches the screen we'll actually draw into
     SDL_Surface* backdrop = Menu_composeBackdrop(backing);
@@ -5382,11 +5375,14 @@ static void trackFPS(void) {
         double last_time = (double)(now - sec_start) / 1000;
         fps_double = fps_ticks / last_time;
         cpu_double = cpu_ticks / last_time;
-        use_ticks = getUsage();
-        if (use_ticks && last_use_ticks) {
-            use_double = (use_ticks - last_use_ticks) / last_time;
+        if (show_debug) { // a /proc read and parse; only the debug HUD shows it
+            use_ticks = getUsage();
+            if (use_ticks && last_use_ticks) {
+                use_double = (use_ticks - last_use_ticks) / last_time;
+            }
+            last_use_ticks = use_ticks;
         }
-        last_use_ticks = use_ticks;
+        else last_use_ticks = 0; // so turning the HUD on doesn't average over the gap
         sec_start = now;
         cpu_ticks = 0;
         fps_ticks = 0;
@@ -5537,7 +5533,9 @@ int main(int argc , char* argv[]) {
         core.run();
         PROF_END(PROF_CORE_RUN);
 
+        PROF_BEGIN(PROF_RA);
         RA_doFrame();
+        PROF_END(PROF_RA);
         limitFF();
         
         if (show_menu) Menu_loop();
@@ -5567,6 +5565,7 @@ finish:
     Core_unload();
     
     Core_quit();
+    IO_quit(); // the sram Core_quit just queued, and anything before it
     Core_close();
     
     Config_quit();

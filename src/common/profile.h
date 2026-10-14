@@ -55,6 +55,7 @@ enum {
     PROF_DRAW,         // the quad draws
     PROF_GPU_FINISH,   // glFinish, only with PROFILE_GLFINISH=1
     PROF_SWAP,         // SDL_GL_SwapWindow: vsync wait plus any gpu backlog
+    PROF_RA,           // RA_doFrame: achievement triggers against core memory
     PROF_ZONE_COUNT,
 };
 
@@ -63,12 +64,24 @@ enum {
     PROF_TEX_BYTES,    // bytes pushed through glTexSubImage2D/glTexImage2D
     PROF_VBO_REBUILDS, // geometry uploads
     PROF_AUDIO_FRAMES, // audio frames handed to SND_batchSamples
+    PROF_AUDIO_SLEEPS, // SDL_Delay(1) polls while the ring was full
+    PROF_AUDIO_STARVED,// frames of silence the audio callback had to invent
     PROF_COUNTER_COUNT,
+};
+
+// min/avg/max of a sampled value
+enum {
+    PROF_G_RING_US,    // audio ring fill, sampled as each batch arrives
+    PROF_G_RATE_PPM,   // audio stretch vs the core's own rate: panel skew plus fill correction
+    PROF_G_REFRESH_MHZ,// GFX_flip's running estimate of the panel's refresh
+    PROF_GAUGE_COUNT,
 };
 
 void PROF_begin(int zone);
 void PROF_end(int zone);
 void PROF_count(int counter, uint64_t n);
+void PROF_gauge(int gauge, int64_t value);
+void PROF_present(void); // right after the swap returns: frame pacing histogram
 void PROF_frame(void);   // once per presented frame, just counts
 void PROF_tick(void);    // at the top of the main loop, reports when a window is full
 void PROF_log(const char* fmt, ...);  // free-form line into the same log
@@ -76,6 +89,8 @@ void PROF_log(const char* fmt, ...);  // free-form line into the same log
 #define PROF_BEGIN(z)     PROF_begin(z)
 #define PROF_END(z)       PROF_end(z)
 #define PROF_COUNT(c,n)   PROF_count((c),(n))
+#define PROF_GAUGE(g,v)   PROF_gauge((g),(v))
+#define PROF_PRESENT()    PROF_present()
 #define PROF_FRAME()      PROF_frame()
 #define PROF_TICK()       PROF_tick()
 #define PROF_LOG(...)     PROF_log(__VA_ARGS__)
@@ -85,6 +100,8 @@ void PROF_log(const char* fmt, ...);  // free-form line into the same log
 #define PROF_BEGIN(z)     ((void)0)
 #define PROF_END(z)       ((void)0)
 #define PROF_COUNT(c,n)   ((void)0)
+#define PROF_GAUGE(g,v)   ((void)0)
+#define PROF_PRESENT()    ((void)0)
 #define PROF_FRAME()      ((void)0)
 #define PROF_TICK()       ((void)0)
 #define PROF_LOG(...)     ((void)0)

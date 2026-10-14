@@ -12,12 +12,15 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
+#include <time.h>
 
 #include <msettings.h>
 
 #include "defines.h"
 #include "api.h"
 #include "utils.h"
+#include "profile.h"
 
 // -------------------------------------------------------------------------
 // Logging
@@ -211,13 +214,52 @@ void GFX_startFrame(void) {
     frame_start = SDL_GetTicks();
 }
 
+// The panel's real refresh, learned from swaps that waited for vsync. SDL says
+// 60Hz; this RG35XX measures 60.46Hz, and it's the gap between that and a
+// core's own rate (59.73 for GB, 60.10 for NES) that makes a frame repeat
+// every second or two when audio sets the pace.
+static double   refresh_us = 1000000.0 / 60.0;
+static uint64_t last_present_us = 0;
+static int      last_present_vsynced = 0;
+
+static uint64_t GFX_nowMicros(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000ull + t.tv_nsec / 1000;
+}
+
+double GFX_getRefreshRate(void) {
+    return 1000000.0 / refresh_us;
+}
+
 /**
  * Flips the video buffer.
  * Handles VSync logic if strict vsync is enabled.
  */
 void GFX_flip(SDL_Surface* screen) {
-    int should_vsync = (gfx.vsync!=VSYNC_OFF && (gfx.vsync==VSYNC_STRICT || frame_start==0 || SDL_GetTicks()-frame_start<FRAME_BUDGET));
+    uint64_t now = GFX_nowMicros();
+    int should_vsync = gfx.vsync!=VSYNC_OFF;
+
+    // Lenient: a frame that has already missed its refresh goes out now - one
+    // torn frame - rather than waiting a whole extra refresh, which is a 33ms
+    // stall. Only when vsync is the clock: when the audio ring sets the pace,
+    // frames are meant to be spaced by it, so "late" means nothing.
+    if (should_vsync && gfx.vsync==VSYNC_LENIENT && SND_isVideoClocked() && last_present_us) {
+        if (now - last_present_us > refresh_us) should_vsync = 0;
+    }
+
     PLAT_flip(screen, should_vsync);
+
+    // Two back-to-back swaps that each waited for vsync are one refresh apart.
+    // Anything else (a late frame, a pause, a torn swap) is left out.
+    uint64_t after = GFX_nowMicros();
+    if (should_vsync && last_present_vsynced && last_present_us) {
+        double dt = (double)(after - last_present_us);
+        if (dt > refresh_us * 0.9 && dt < refresh_us * 1.1) refresh_us += (dt - refresh_us) / 32.0;
+    }
+    last_present_us = after;
+    last_present_vsynced = should_vsync;
+    PROF_GAUGE(PROF_G_REFRESH_MHZ, (int64_t)(1e9 / refresh_us));
 }
 
 /**
@@ -929,6 +971,14 @@ static struct SND_Context {
     int frame_filled; // max_buf_w
 
     SND_Resampler resample;
+
+    SND_Frame prev;     // last input frame: the left end of the interpolation
+    uint32_t phase;     // Q16: where the next output frame falls between prev and the incoming frame
+    uint32_t step;      // Q16: input frames advanced per output frame
+    int video_clocked;  // see SND_updateClock
+    int starved;        // set by the callback when it ran out; read under the audio lock
+    double target;      // ring fill the video clock steers toward, 0..1
+    double last_fill;   // fill at the previous batch, 0..1
 } snd = {0};
 
 /**
@@ -1136,6 +1186,10 @@ static void SND_audioCallback(void* userdata, uint8_t* stream, int len) { // pla
     }
     
     // starved: the game is silent here, but the chime should still ring out
+    if (len>0) {
+        PROF_COUNT(PROF_AUDIO_STARVED, len);
+        snd.starved = 1;
+    }
     while (len>0) {
         int16_t l = 0, r = 0;
         if (chime.playing) SND_chimeMix(&l, &r);
@@ -1166,30 +1220,79 @@ static int SND_resampleNone(SND_Frame frame) { // audio_resample_passthrough
     if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
     return 1;
 }
-static int SND_resampleNear(SND_Frame frame) { // audio_resample_nearest
-    static int diff = 0;
-    int consumed = 0;
-
-    if (diff < snd.sample_rate_out) {
-        snd.buffer[snd.frame_in++] = frame;
-        if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
-        diff += snd.sample_rate_in;
+// Linear interpolation at a fractional step that can change between batches.
+// Replaces nearest-neighbour, which dropped or doubled whole samples. Emits at
+// most one output frame per call; returns 1 once `frame` is used up, 0 while
+// it's still needed for the next output frame.
+static int SND_resampleLinear(SND_Frame frame) {
+    if (snd.phase >= 0x10000) {
+        snd.phase -= 0x10000;
+        snd.prev = frame;
+        return 1;
     }
-
-    if (diff >= snd.sample_rate_out) {
-        consumed++;
-        diff -= snd.sample_rate_out;
-    }
-
-    return consumed;
+    int64_t f = snd.phase;
+    SND_Frame out;
+    out.left  = (int16_t)(snd.prev.left  + (((int32_t)(frame.left  - snd.prev.left)  * f) >> 16));
+    out.right = (int16_t)(snd.prev.right + (((int32_t)(frame.right - snd.prev.right) * f) >> 16));
+    snd.buffer[snd.frame_in++] = out;
+    if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
+    snd.phase += snd.step;
+    return 0;
 }
-static void SND_selectResampler(void) { // plat_sound_select_resampler
-    if (snd.sample_rate_in==snd.sample_rate_out) {
-        snd.resample =  SND_resampleNone;
+
+// How far from its own rate a core may run to keep step with the panel. 2%
+// covers every NTSC rate (59.73-60.10Hz) against this 60.46Hz panel, at a
+// pitch shift of at most a third of a semitone, and leaves PAL (50Hz) on the
+// audio clock.
+#define SND_MAX_SKEW 0.02
+// Proportional correction from the ring's fill on top of that, so it settles
+// at the target instead of filling up or running dry (RetroArch's
+// audio_rate_control_delta). Small enough to be inaudible.
+#define SND_RATE_DELTA 0.005
+
+// The fill it steers toward. Half full is ~41ms of latency, which cores with
+// steady frames hold indefinitely (GB/NES/SNES measured: never starved). A
+// core that stalls - PS disc reads, 70-100ms - starves at that, so a
+// starvation raises the target, to at most ~54ms, and it decays back over a
+// minute without one. The cap leaves room for what the gauge doesn't see: a
+// batch lands on top of the fill it steers by (16.7ms) and the callback
+// drains in 11.6ms steps, so the peak runs ~22ms above it.
+#define SND_TARGET_MIN   0.50
+#define SND_TARGET_MAX   0.65
+#define SND_TARGET_RAISE 0.15
+#define SND_TARGET_DECAY 0.00005 // per batch, ~60 a second
+
+int SND_isVideoClocked(void) {
+    return snd.initialized && snd.video_clocked;
+}
+
+// Who sets the pace, re-decided every batch.
+//
+// Audio clock (as before): the core runs at its own rate, the ring stays full
+// and SND_batchSamples blocks. Vsync then quantises those frames onto a panel
+// running at a slightly different rate, and every so often one refresh has no
+// new frame: a repeated frame, every 1.4s for GB.
+//
+// Video clock: when vsync is on and the rates are close, the swap paces the
+// emulator, one frame per refresh, and the audio is stretched to match - the
+// core's samples resampled by panel/core rate, plus a nudge from the ring's
+// fill. The ring never fills, so nothing blocks on it.
+static void SND_updateClock(void) {
+    double skew = GFX_getRefreshRate() / snd.frame_rate;
+    snd.video_clocked = gfx.vsync!=VSYNC_OFF && fabs(skew - 1.0) <= SND_MAX_SKEW;
+
+    double base  = (double)snd.sample_rate_in / snd.sample_rate_out;
+    double ratio = base;
+    if (snd.video_clocked) {
+        int fill = snd.frame_in - snd.frame_out;
+        if (fill < 0) fill += snd.frame_count;
+        double f = (double)fill / snd.frame_count; // 0 empty .. 1 full
+        ratio *= skew * (1.0 + SND_RATE_DELTA * 2.0 * (f - snd.target));
     }
-    else {
-        snd.resample = SND_resampleNear;
-    }
+    snd.step = (uint32_t)(ratio * 65536.0 + 0.5);
+    snd.resample = (!snd.video_clocked && snd.sample_rate_in==snd.sample_rate_out)
+                 ? SND_resampleNone : SND_resampleLinear;
+    PROF_GAUGE(PROF_G_RATE_PPM, (int64_t)((ratio / base - 1.0) * 1e6));
 }
 // Consecutive waits with the ring still full before we give up on the audio
 // device. Each is ~10 SDL_Delay(1), so this is on the order of a second of no
@@ -1207,6 +1310,34 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_s
     if (snd.frame_count==0) return 0;
     
     SDL_LockAudio();
+    SND_updateClock();
+
+    // Under the video clock the core can't run ahead to refill the ring after
+    // a stall (a PS disc read took 71ms), and the rate correction alone takes
+    // 15-20s to win back what was lost, leaving every later hiccup to starve
+    // it again. The callback has already played silence by now, so top the
+    // ring up to its target with more of it: one slightly longer gap instead
+    // of seconds of running on empty.
+    int fill = snd.frame_in - snd.frame_out;
+    if (fill < 0) fill += snd.frame_count;
+    if (snd.video_clocked && snd.starved) {
+        // only a ring that was healthy and then ran dry says the core stalls;
+        // one that was already empty is just starting up or back from the menu
+        if (snd.last_fill > 0.25) snd.target = MIN(SND_TARGET_MAX, snd.target + SND_TARGET_RAISE);
+        for (int pad = (int)(snd.frame_count * snd.target) - fill; pad > 0 && snd.frame_in != snd.frame_filled; pad--) {
+            snd.buffer[snd.frame_in++] = (SND_Frame){0, 0};
+            if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
+        }
+    }
+    else if (snd.target > SND_TARGET_MIN) {
+        snd.target = MAX(SND_TARGET_MIN, snd.target - SND_TARGET_DECAY);
+    }
+    snd.starved = 0;
+    snd.last_fill = (double)fill / snd.frame_count;
+
+    // how much audio is queued ahead of the DAC as this batch arrives
+    PROF_GAUGE(PROF_G_RING_US, (int64_t)((snd.frame_in - snd.frame_out + (int)snd.frame_count) % (int)snd.frame_count)
+                               * 1000000 / (snd.sample_rate_out ? snd.sample_rate_out : 1));
 
     size_t taken = 0;
     int stalled = 0;
@@ -1216,6 +1347,7 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_s
 
         while (tries < 10 && snd.frame_in==snd.frame_filled) {
             tries++;
+            PROF_COUNT(PROF_AUDIO_SLEEPS, 1);
             SDL_UnlockAudio();
             SDL_Delay(1);
             SDL_LockAudio();
@@ -1281,8 +1413,9 @@ void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
     snd.sample_rate_in  = sample_rate;
     snd.sample_rate_out = spec_out.freq;
     
-    SND_selectResampler();
+    snd.target = SND_TARGET_MIN;
     SND_resizeBuffer();
+    SND_updateClock();
     
     SDL_PauseAudio(0);
 
@@ -1499,46 +1632,257 @@ int PAD_tappedMenu(uint32_t now) {
 static struct VIB_Context {
     int initialized;
     pthread_t pt;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond; // queued_strength changed, or quit
     int queued_strength;
-    int strength;
+    int strength;         // what the motor was last told
+    int quit;
 } vib = {0};
 
-static void* VIB_thread(void *arg) {
-#define DEFER_FRAMES 3
-    static int defer = 0;
-    while(1) {
-        SDL_Delay(17);
-        if (vib.queued_strength!=vib.strength) {
-            if (defer<DEFER_FRAMES && vib.queued_strength==0) { // minimize vacillation between 0 and some number (which this motor doesn't like)
-                defer += 1;
-                continue;
-            }
-            vib.strength = vib.queued_strength;
-            defer = 0;
+// The motor doesn't like flicking between 0 and some strength, so a request
+// to stop is held this long in case a new strength follows straight after.
+// Same as the old polling loop: 3 ticks of 17ms.
+#define VIB_STOP_DELAY_MS 51
 
-            PLAT_setRumble(vib.strength);
+// Sleeps until there is something to do, instead of waking every 17ms for the
+// whole session. A new non-zero strength reaches the motor at once rather
+// than on the next tick.
+static void* VIB_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&vib.lock);
+    while (!vib.quit) {
+        if (vib.queued_strength==vib.strength) {
+            pthread_cond_wait(&vib.cond, &vib.lock);
+            continue;
         }
+        if (vib.queued_strength==0) {
+            struct timespec until;
+            clock_gettime(CLOCK_MONOTONIC, &until);
+            until.tv_nsec += VIB_STOP_DELAY_MS * 1000000L;
+            if (until.tv_nsec>=1000000000L) { until.tv_nsec -= 1000000000L; until.tv_sec += 1; }
+            while (!vib.quit && vib.queued_strength==0) {
+                if (pthread_cond_timedwait(&vib.cond, &vib.lock, &until)==ETIMEDOUT) break;
+            }
+            if (vib.quit) break;
+            if (vib.queued_strength!=0) continue; // a new strength arrived, start over with it
+        }
+        int strength = vib.queued_strength;
+        vib.strength = strength;
+        pthread_mutex_unlock(&vib.lock);
+        PLAT_setRumble(strength); // a sysfs write: not under the lock
+        pthread_mutex_lock(&vib.lock);
     }
+    pthread_mutex_unlock(&vib.lock);
     return 0;
 }
 void VIB_init(void) {
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC); // the stop delay mustn't follow wall clock changes
+    pthread_cond_init(&vib.cond, &attr);
+    pthread_condattr_destroy(&attr);
+    pthread_mutex_init(&vib.lock, NULL);
+
     vib.queued_strength = vib.strength = 0;
+    vib.quit = 0;
     pthread_create(&vib.pt, NULL, &VIB_thread, NULL);
     vib.initialized = 1;
 }
 void VIB_quit(void) {
     if (!vib.initialized) return;
-    
-    VIB_setStrength(0);
-    pthread_cancel(vib.pt);
+
+    pthread_mutex_lock(&vib.lock);
+    vib.queued_strength = 0;
+    vib.quit = 1;
+    pthread_cond_signal(&vib.cond);
+    pthread_mutex_unlock(&vib.lock);
     pthread_join(vib.pt, NULL);
+
+    // stop it now, without the delay: there's nothing left to wait for, and
+    // the old version could exit with the motor still running
+    if (vib.strength) {
+        PLAT_setRumble(0);
+        vib.strength = 0;
+    }
+    vib.initialized = 0;
 }
 void VIB_setStrength(int strength) {
-    if (vib.queued_strength==strength) return;
+    if (vib.queued_strength==strength) return; // cores call this every frame; most calls change nothing
+    if (!vib.initialized) {
+        vib.queued_strength = strength;
+        return;
+    }
+    pthread_mutex_lock(&vib.lock);
     vib.queued_strength = strength;
+    pthread_cond_signal(&vib.cond);
+    pthread_mutex_unlock(&vib.lock);
 }
 int VIB_getStrength(void) {
     return vib.strength;
+}
+
+// -------------------------------------------------------------------------
+// IO - Save data written off the emulation thread
+// -------------------------------------------------------------------------
+//
+// Measured on this card (ext4, mounted discard,nodelalloc): a 4MiB PS state
+// takes ~300ms to write and fsync, and sync() after an 8KiB sram costs 250ms
+// if anything else is still dirty. Done inline that is 20+ dropped frames, so
+// the writes go to a worker and the emulation thread only pays for a memcpy.
+
+typedef struct IO_Job {
+    struct IO_Job* next;
+    void*  data;
+    size_t size;
+    char   path[MAX_PATH];
+} IO_Job;
+
+static struct IO_Context {
+    pthread_mutex_t lock;
+    pthread_cond_t  work; // a job was queued, or it's time to quit
+    pthread_cond_t  idle; // the queue drained
+    IO_Job* head;
+    IO_Job* tail;
+    int busy;             // the worker is writing a job it already took off the queue
+    int running;
+    int quit;
+    pthread_t thread;
+} io = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .work = PTHREAD_COND_INITIALIZER,
+    .idle = PTHREAD_COND_INITIALIZER,
+};
+
+int IO_writeFileNow(const char* path, const void* data, size_t size) {
+    char tmp[MAX_PATH + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        LOG_error("IO: can't open %s: %s\n", tmp, strerror(errno));
+        return -1;
+    }
+
+    const uint8_t* p = data;
+    size_t left = size;
+    while (left) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        p += n;
+        left -= n;
+    }
+    int ok = (left == 0) && fsync(fd) == 0;
+    if (close(fd) != 0) ok = 0;
+
+    if (!ok || rename(tmp, path) != 0) {
+        LOG_error("IO: writing %s failed: %s\n", path, strerror(errno));
+        unlink(tmp); // the old file, if any, is still intact
+        return -1;
+    }
+
+    // the rename is a change to the directory, so that has to reach the card too
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char* slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0'; // file in /
+        else slash[0] = '\0';
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            fsync(dfd);
+            close(dfd);
+        }
+    }
+    return 0;
+}
+
+static void* IO_thread(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&io.lock);
+    for (;;) {
+        while (!io.head && !io.quit) pthread_cond_wait(&io.work, &io.lock);
+        if (!io.head) break; // quitting, and nothing left to write
+
+        IO_Job* job = io.head;
+        io.head = job->next;
+        if (!io.head) io.tail = NULL;
+        io.busy = 1;
+        pthread_mutex_unlock(&io.lock);
+
+        IO_writeFileNow(job->path, job->data, job->size);
+        free(job->data);
+        free(job);
+
+        pthread_mutex_lock(&io.lock);
+        io.busy = 0;
+        if (!io.head) pthread_cond_broadcast(&io.idle);
+    }
+    pthread_mutex_unlock(&io.lock);
+    return NULL;
+}
+
+void IO_writeFile(const char* path, void* data, size_t size) {
+    IO_Job* job = malloc(sizeof(IO_Job));
+    if (job) {
+        job->next = NULL;
+        job->data = data;
+        job->size = size;
+        snprintf(job->path, sizeof(job->path), "%s", path);
+
+        pthread_mutex_lock(&io.lock);
+        if (!io.running && pthread_create(&io.thread, NULL, IO_thread, NULL) == 0) io.running = 1;
+        if (io.running) {
+            // A newer copy of a file that is still waiting replaces it, so
+            // saving the same slot twice in a row only writes once. One that
+            // is already being written isn't in the queue: this goes after it.
+            for (IO_Job* j = io.head; j; j = j->next) {
+                if (strcmp(j->path, job->path)) continue;
+                free(j->data);
+                j->data = data;
+                j->size = size;
+                pthread_mutex_unlock(&io.lock);
+                free(job);
+                return;
+            }
+            if (io.tail) io.tail->next = job;
+            else io.head = job;
+            io.tail = job;
+            pthread_cond_signal(&io.work);
+            pthread_mutex_unlock(&io.lock);
+            return;
+        }
+        pthread_mutex_unlock(&io.lock);
+        free(job);
+    }
+
+    // no worker: still atomic, just not in the background
+    IO_writeFileNow(path, data, size);
+    free(data);
+}
+
+void IO_flush(void) {
+    pthread_mutex_lock(&io.lock);
+    while (io.head || io.busy) pthread_cond_wait(&io.idle, &io.lock);
+    pthread_mutex_unlock(&io.lock);
+}
+
+void IO_quit(void) {
+    pthread_mutex_lock(&io.lock);
+    if (!io.running) {
+        pthread_mutex_unlock(&io.lock);
+        return;
+    }
+    io.quit = 1;
+    pthread_cond_signal(&io.work);
+    pthread_mutex_unlock(&io.lock);
+
+    pthread_join(io.thread, NULL); // drains the queue first
+
+    io.running = 0;
+    io.quit = 0;
 }
 
 // -------------------------------------------------------------------------
@@ -1732,6 +2076,7 @@ void PWR_powerOff(void) {
         PLAT_clearVideo(gfx.screen);
         GFX_blitMessage(font.large, msg, gfx.screen,&(SDL_Rect){0,0,gfx.screen->w,gfx.screen->h}); //, NULL);
         GFX_flip(gfx.screen);
+        IO_flush(); // the quicksave before_sleep just queued has to be on the card first
         PLAT_powerOff();
     }
 }

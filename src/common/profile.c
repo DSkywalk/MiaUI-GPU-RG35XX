@@ -17,6 +17,7 @@ static const char* zone_names[PROF_ZONE_COUNT] = {
     "draw",
     "gpu_finish",
     "swap",
+    "ra_frame",
 };
 
 typedef struct {
@@ -27,11 +28,30 @@ typedef struct {
     uint32_t hits;
 } Zone;
 
+typedef struct {
+    int64_t  min;
+    int64_t  max;
+    int64_t  sum;
+    uint32_t n;
+} Gauge;
+
 static Zone     zones[PROF_ZONE_COUNT];
 static uint64_t counters[PROF_COUNTER_COUNT];
+static Gauge    gauges[PROF_GAUGE_COUNT];
+
+// Present-to-present intervals. Averages hide stutter: 59 frames at 16.7ms and
+// one at 33ms average out to 17ms, and that one frame is what the player sees.
+#define PRES_BUCKET_US 250
+#define PRES_BUCKETS   200 // 0..50ms, the last bucket takes everything longer
+static uint32_t pres_hist[PRES_BUCKETS + 1];
+static uint32_t pres_n;
+static uint64_t pres_max;
+static uint64_t pres_last;
 static uint32_t frames = 0;
 static uint64_t window_start = 0;
 static FILE*    logfile = NULL;
+
+static void prof_emit(const char* line);
 
 static uint64_t prof_now(void) {
     struct timespec t;
@@ -61,7 +81,63 @@ void PROF_end(int zone) {
 
 void PROF_count(int counter, uint64_t n) {
     if (counter<0 || counter>=PROF_COUNTER_COUNT) return;
-    counters[counter] += n;
+    // atomic because the audio callback counts from its own thread
+    __atomic_add_fetch(&counters[counter], n, __ATOMIC_RELAXED);
+}
+
+void PROF_gauge(int gauge, int64_t value) {
+    if (gauge<0 || gauge>=PROF_GAUGE_COUNT) return;
+    Gauge* g = &gauges[gauge];
+    if (!g->n || value < g->min) g->min = value;
+    if (!g->n || value > g->max) g->max = value;
+    g->sum += value;
+    g->n++;
+}
+
+void PROF_present(void) {
+    uint64_t t = prof_now();
+    if (pres_last) {
+        uint64_t dt = t - pres_last;
+        uint64_t b  = dt / (PRES_BUCKET_US * 1000ull);
+        pres_hist[b > PRES_BUCKETS ? PRES_BUCKETS : b]++;
+        pres_n++;
+        if (dt > pres_max) pres_max = dt;
+    }
+    pres_last = t;
+}
+
+// upper edge of the bucket holding the q-th fraction of intervals, in ms
+static double pres_quantile(double q) {
+    uint32_t want = (uint32_t)(q * pres_n), seen = 0;
+    for (int b = 0; b <= PRES_BUCKETS; b++) {
+        seen += pres_hist[b];
+        if (seen > want) return (b + 1) * PRES_BUCKET_US / 1000.0;
+    }
+    return PRES_BUCKETS * PRES_BUCKET_US / 1000.0;
+}
+
+static void pres_report(void) {
+    char line[512];
+    if (pres_n < 2) return;
+    double p50 = pres_quantile(0.50);
+    uint32_t hitches = 0;
+    for (int b = 0; b <= PRES_BUCKETS; b++) {
+        if ((b + 1) * PRES_BUCKET_US / 1000.0 > p50 * 1.5) hitches += pres_hist[b];
+    }
+    snprintf(line, sizeof(line),
+             "present: %u intervals  p50 %.2f  p95 %.2f  p99 %.2f  max %.2f ms  hitches %u (>1.5x p50)\n",
+             pres_n, p50, pres_quantile(0.95), pres_quantile(0.99), pres_max / 1e6, hitches);
+    prof_emit(line);
+
+    // the non-empty buckets, so a bimodal 16.7/33.4 split is visible at a glance
+    int len = snprintf(line, sizeof(line), "present hist (ms:count):");
+    for (int b = 0; b <= PRES_BUCKETS && len < (int)sizeof(line) - 24; b++) {
+        if (!pres_hist[b]) continue;
+        len += snprintf(line + len, sizeof(line) - len, " %s%.2f:%u",
+                        b == PRES_BUCKETS ? ">" : "", (b + 1) * PRES_BUCKET_US / 1000.0, pres_hist[b]);
+    }
+    snprintf(line + len, sizeof(line) - len, "\n");
+    prof_emit(line);
 }
 
 // two sinks: stdout for when you can see it, and a file because launch.sh
@@ -132,11 +208,44 @@ static void prof_report(void) {
              counters[PROF_AUDIO_FRAMES]/f);
     prof_emit(line);
 
+    // core_run wraps every libretro callback, so it bills the core for our
+    // upload, swap and audio wait. Take those out to see what the core costs.
+    {
+        double inside = 0;
+        static const int callbacks[] = { PROF_VIDEO, PROF_AUDIO, PROF_TEX_GAME, PROF_TEX_UI,
+                                         PROF_DRAW, PROF_GPU_FINISH, PROF_SWAP };
+        for (unsigned i=0; i<sizeof(callbacks)/sizeof(callbacks[0]); i++) inside += zones[callbacks[i]].total;
+        double emu_only = (zones[PROF_CORE_RUN].total - inside) / 1e6 / iters;
+        Gauge* r = &gauges[PROF_G_RING_US];
+        Gauge* q = &gauges[PROF_G_RATE_PPM];
+        snprintf(line, sizeof(line),
+                 "derived: emulation only %.3f ms/iter  audio ring %.1f/%.1f/%.1f ms (min/avg/max)"
+                 "  sleeps %.1f/frame  starved %llu frames  rate %+.0f/%+.0f/%+.0f ppm\n",
+                 iters ? emu_only : 0,
+                 r->n ? r->min / 1000.0 : 0, r->n ? (double)r->sum / r->n / 1000.0 : 0, r->n ? r->max / 1000.0 : 0,
+                 counters[PROF_AUDIO_SLEEPS]/f, (unsigned long long)counters[PROF_AUDIO_STARVED],
+                 q->n ? (double)q->min : 0, q->n ? (double)q->sum / q->n : 0, q->n ? (double)q->max : 0);
+        prof_emit(line);
+    }
+    {
+        Gauge* g = &gauges[PROF_G_REFRESH_MHZ];
+        if (g->n) {
+            snprintf(line, sizeof(line), "refresh estimate: %.3f/%.3f Hz (min/max)\n", g->min / 1000.0, g->max / 1000.0);
+            prof_emit(line);
+        }
+    }
+    pres_report();
+
     if (logfile) fflush(logfile);
     fflush(stdout);
 
     memset(zones, 0, sizeof(zones));
     memset(counters, 0, sizeof(counters));
+    memset(gauges, 0, sizeof(gauges));
+    memset(pres_hist, 0, sizeof(pres_hist));
+    pres_n = 0;
+    pres_max = 0;
+    pres_last = 0; // an interval spanning the report isn't a frame's
     frames = 0;
     window_start = 0; // re-armed by the next PROF_begin
 }
