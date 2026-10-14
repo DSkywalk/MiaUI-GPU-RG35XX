@@ -951,8 +951,8 @@ static struct SND_Context {
 
 #define CHIME_LUT_BITS   8
 #define CHIME_LUT_SIZE   (1 << CHIME_LUT_BITS)
-#define CHIME_ATTACK_MS  8      // long enough not to click, short enough to be a chime
-#define CHIME_VOLUME     48     // out of 256, ie. a quarter of full scale
+#define CHIME_ATTACK_MS  8         // long enough not to click, short enough to be a chime
+#define CHIME_VOLUME     6         // volume shift (2^6 = 64): 64 out of 256
 #define CHIME_ENV_ONE    (1 << 24) // envelope accumulates in Q24...
 #define CHIME_ENV_SHIFT  9         // ...and is applied in Q15, so the multiply can't overflow
 
@@ -992,12 +992,41 @@ static const int16_t chime_sine[CHIME_LUT_SIZE] = {
      -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804,
 };
 
+/*
+ * Musical frequency reference (A4 = 440 Hz)
+ * Rounded values for uint16_t hz:
+ *
+ * Octave 4 (Low / Mid):
+ * C4  : 262    C#4 : 277    D4  : 294    D#4 : 311
+ * E4  : 330    F4  : 349    F#4 : 370    G4  : 392
+ * G#4 : 415    A4  : 440    A#4 : 466    B4  : 494
+ *
+ * Octave 5 (Standard High):
+ * C5  : 523    C#5 : 554    D5  : 587    D#5 : 622
+ * E5  : 659    F5  : 698    F#5 : 740    G5  : 784
+ * G#5 : 831    A5  : 880    A#5 : 932    B5  : 988
+ *
+ * Octave 6 (Very High / Chimes):
+ * C6  : 1046   C#6 : 1109   D6  : 1175   D#6 : 1245
+ * E6  : 1319   F6  : 1397   F#6 : 1480   G6  : 1568
+ * G#6 : 1661   A6  : 1760   A#6 : 1865   B6  : 1976
+ *
+ */
+
+// static const struct { uint16_t hz; uint16_t ms; } chime_notes[] = {
+//     { 659,   40 }, // E5  - Blip inicial muy rápido
+//     { 831,   40 }, // G#5 - Blip intermedio
+//     { 988,   40 }, // B5  - Blip alto
+//     { 1319, 400 }  // E6  - Campana final que se desvanece suavemente
+// };
+
 static const struct { uint16_t hz; uint16_t ms; } chime_notes[] = {
-    { 659,   40 }, // E5  - Blip inicial muy rápido
-    { 831,   40 }, // G#5 - Blip intermedio
-    { 988,   40 }, // B5  - Blip alto
-    { 1319, 400 }  // E6  - Campana final que se desvanece suavemente
+    { 880,  100 }, // A5  - (u)  La
+    { 1046, 100 }, // C6  - (Mi) Do
+    { 1397, 100 }, // F6  - (a)  Fa
+    { 1568, 400 }  // G6  - (a) Sol
 };
+
 #define CHIME_NOTE_COUNT ((int)(sizeof(chime_notes)/sizeof(chime_notes[0])))
 
 // Touched only by the audio thread, except chime_request.
@@ -1023,7 +1052,7 @@ static void SND_chimeNote(int n) {
     uint32_t attack = (uint32_t)((uint64_t)CHIME_ATTACK_MS * rate / 1000);
 
     if (total < 2) total = 2;
-    if (attack < 1) attack = 1;
+        if (attack < 1) attack = 1;
     if (attack > total/2) attack = total/2;
 
     chime.note      = n;
@@ -1057,7 +1086,7 @@ static inline int32_t SND_chimeSample(void) {
         if (chime.note + 1 < CHIME_NOTE_COUNT) SND_chimeNote(chime.note + 1);
         else chime.playing = 0;
     }
-    return (s * CHIME_VOLUME) >> 8;
+     return (s << CHIME_VOLUME) >> 8;
 }
 
 // Mix one chime sample into a stereo pair, clamping rather than wrapping.
