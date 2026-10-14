@@ -128,7 +128,13 @@ ifeq ($(PROFILE_VSYNC),0)
 CFLAGS += -DPROFILE_FORCE_NO_VSYNC=1
 endif
 endif
-minCFLAGS	+= -flto=4
+# Link-time optimisation across the frontend, rcheevos and libchdr (it was
+# `minCFLAGS += -flto=4` before, a typo, so it never applied).
+# With it GCC inlines rc_runtime_destroy() into ra_offline.c, where the runtime
+# is a static, and flags its `if (self->owns_self) free(self)`: a branch that is
+# never taken, rc_runtime_init() having set owns_self to 0. rcheevos is a
+# pinned clone rather than ours to patch, so that one warning is silenced here.
+CFLAGS	+= -flto=4 -Wno-free-nonheap-object
 LDFLAGS	 = $(LIBDIR) -lmsettings -l$(SDL) -l$(SDL)_image -l$(SDL)_ttf -lEGL -lGLESv2 -lGLESv1_CM -lGLES_CM -lPVROGL_MESA -lpthread -lm -lz
 # CFLAGS  += -Wall -Wno-unused-variable -Wno-unused-function -Wno-format-overflow
 # CFLAGS  += -fsanitize=address -fno-common

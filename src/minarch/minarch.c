@@ -38,6 +38,7 @@ void __log_finite(void){}
 static int screen_scaling = SCALE_ASPECT;
 static int screen_sharpness = SHARPNESS_CRISP;
 static int prevent_tearing = 1; // lenient
+static int sync_to = 0; // FE_OPT_SYNC: 0 video, 1 audio
 static int show_debug = 0;
 static int max_ff_speed = 3; // 4x
 static int fast_forward = 0;
@@ -654,6 +655,11 @@ static char* tearing_labels[] = {
     "Strict",
     NULL
 };
+static char* sync_labels[] = {
+    "Video",
+    "Audio",
+    NULL
+};
 static char* max_ff_labels[] = {
     "None",
     "2x",
@@ -672,6 +678,7 @@ enum {
     FE_OPT_SCALING,
     FE_OPT_SHARPNESS,
     FE_OPT_TEARING,
+    FE_OPT_SYNC,
     FE_OPT_OVERCLOCK,
     FE_OPT_DEBUG,
     FE_OPT_MAXFF,
@@ -1024,6 +1031,16 @@ static struct Config {
                 .values = tearing_labels,
                 .labels = tearing_labels,
             },
+            [FE_OPT_SYNC] = {
+                .key    = "minarch_sync_to",
+                .name    = "Sync To",
+                .desc    = "Video: smooth, the game runs up to 2% fast\nto match the screen. Audio: exact speed, a\nframe repeats now and then. 50Hz uses Audio.",
+                .default_value = 0, // Video
+                .value = 0,
+                .count = 2,
+                .values = sync_labels,
+                .labels = sync_labels,
+            },
             [FE_OPT_OVERCLOCK] = {
                 .key    = "minarch_cpu_speed",
                 .name    = "CPU Speed",
@@ -1148,6 +1165,11 @@ static void Config_syncFrontend(char* key, int value) {
     else if (exactMatch(key,config.frontend.options[FE_OPT_TEARING].key)) {
         prevent_tearing = value;
         i = FE_OPT_TEARING;
+    }
+    else if (exactMatch(key,config.frontend.options[FE_OPT_SYNC].key)) {
+        sync_to = value;
+        SND_setVideoSync(sync_to==0); // re-decided on the next audio batch, so it applies at once
+        i = FE_OPT_SYNC;
     }
     else if (exactMatch(key,config.frontend.options[FE_OPT_OVERCLOCK].key)) {
         overclock = value;

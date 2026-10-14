@@ -1262,6 +1262,13 @@ static int SND_resampleLinear(SND_Frame frame) {
 #define SND_TARGET_RAISE 0.15
 #define SND_TARGET_DECAY 0.00005 // per batch, ~60 a second
 
+// Frontend "Sync To": 1 lets SND_updateClock pick the video clock, 0 keeps the
+// audio clock always. Outside snd because the config is read before SND_init.
+static int snd_video_sync = 1;
+void SND_setVideoSync(int enabled) {
+    snd_video_sync = enabled ? 1 : 0;
+}
+
 int SND_isVideoClocked(void) {
     return snd.initialized && snd.video_clocked;
 }
@@ -1279,7 +1286,7 @@ int SND_isVideoClocked(void) {
 // fill. The ring never fills, so nothing blocks on it.
 static void SND_updateClock(void) {
     double skew = GFX_getRefreshRate() / snd.frame_rate;
-    snd.video_clocked = gfx.vsync!=VSYNC_OFF && fabs(skew - 1.0) <= SND_MAX_SKEW;
+    snd.video_clocked = snd_video_sync && gfx.vsync!=VSYNC_OFF && fabs(skew - 1.0) <= SND_MAX_SKEW;
 
     double base  = (double)snd.sample_rate_in / snd.sample_rate_out;
     double ratio = base;

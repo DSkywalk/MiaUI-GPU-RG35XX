@@ -232,6 +232,7 @@ typedef struct SND_Frame {
 void SND_init(double sample_rate, double frame_rate);
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count);
 int SND_isVideoClocked(void); // 1 when vsync paces the emulator and audio is resampled to follow
+void SND_setVideoSync(int enabled); // 0 = always pace by audio (exact core speed)
 void SND_quit(void);
 // Mixes a short two-note chime into the output. Non-blocking and callable from
 // any thread; synthesised in the audio callback, so it never adds work to the
