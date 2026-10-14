@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <libretro.h>
@@ -34,6 +35,21 @@ void SND_playChime(void); // common/api.h, declared here to keep this file stand
 
 ///////////////////////////////////////
 
+// One earned achievement: its id and date it was earned, epoch seconds.
+//
+// 32-bit on purpose. time_t is 32-bit on this target, so `date` takes the
+// value time() returns with no widening and no 64-bit register pairs in the
+// hash and compare loops below. The 2038 rollover is well past the life of
+// this console.
+typedef struct {
+    uint32_t id;
+    uint32_t date;
+} RA_Unlock;
+
+// The checksum hashes these records as raw bytes, so any padding the compiler
+// inserted would be uninitialised and make the result nondeterministic.
+typedef char ra_unlock_is_packed[(sizeof(RA_Unlock) == 2*sizeof(uint32_t)) ? 1 : -1];
+
 // how long a popup stays on screen, in frames (~4s at 60fps)
 #define RA_MSG_FRAMES 240
 #define RA_MSG_SIZE   160
@@ -57,7 +73,7 @@ static struct {
     RA_GetMemoryData get_data;
     RA_GetMemorySize get_size;
 
-    uint32_t* unlocked;
+    RA_Unlock* unlocked;
     uint32_t  unlocked_count;
     uint32_t  unlocked_cap;
     uint32_t  total;
@@ -141,22 +157,25 @@ static int ra_readSet(const char* path, rc_api_fetch_game_data_response_t* out) 
 
 static int ra_isUnlocked(uint32_t id) {
     for (uint32_t i=0; i<ra.unlocked_count; i++) {
-        if (ra.unlocked[i]==id) return 1;
+        if (ra.unlocked[i].id==id) return 1;
     }
     return 0;
 }
 
-static void ra_addUnlocked(uint32_t id) {
+// `date` is epoch seconds, or 0 date it isn't known.
+static void ra_addUnlocked(uint32_t id, uint32_t date) {
     if (ra_isUnlocked(id)) return;
 
     if (ra.unlocked_count==ra.unlocked_cap) {
         uint32_t cap = ra.unlocked_cap ? ra.unlocked_cap*2 : 32;
-        uint32_t* grown = realloc(ra.unlocked, cap*sizeof(uint32_t));
+        RA_Unlock* grown = realloc(ra.unlocked, cap*sizeof(RA_Unlock));
         if (!grown) return;
         ra.unlocked = grown;
         ra.unlocked_cap = cap;
     }
-    ra.unlocked[ra.unlocked_count++] = id;
+    ra.unlocked[ra.unlocked_count].id = id;
+    ra.unlocked[ra.unlocked_count].date = date;
+    ra.unlocked_count++;
 }
 
 ///////////////////////////////////////
@@ -207,9 +226,25 @@ static uint32_t ra_progressChecksum(uint32_t set_check) {
     sum = ra_fnv(sum, &set_check, sizeof(set_check));
     sum = ra_fnv(sum, &ra.unlocked_count, sizeof(ra.unlocked_count));
     for (uint32_t i=0; i<ra.unlocked_count; i++) {
+        // the whole record, so the timestamps are covered as well as the ids -
+        // editing a date in the file invalidates it just like editing an id
         sum = ra_fnv(sum, &ra.unlocked[i], sizeof(ra.unlocked[i]));
     }
     return sum;
+}
+
+// Pulls `"<key>":<number>` out of the region [from, to). Bounded so one
+// object's keys can never be satisfied by the next object's.
+static int ra_readUNum(const char* from, const char* to, const char* key, uint32_t* out) {
+    const char* at = strstr(from, key);
+    if (!at || at>=to) return 0;
+    at = strchr(at, ':');
+    if (!at || at>=to) return 0;
+    at++;
+    while (at<to && (*at==' ' || *at=='\t')) at++;
+    if (at>=to || *at<'0' || *at>'9') return 0;
+    *out = (uint32_t)strtoul(at, NULL, 10);
+    return 1;
 }
 
 // Pulls `"<key>":"<value>"` out of our own output. Returns 0 if absent.
@@ -243,14 +278,23 @@ static void ra_loadProgress(void) {
     int hash_ok = ra_readField(json, "\"hash\"", field, sizeof(field)) &&
                   strcasecmp(field, ra.hash)==0;
 
-    // we wrote this file ourselves, so a digit scan over the array is enough
-    char* p = strstr(json, "\"unlocked\"");
+    // "unlocked":[{"id":N,"date":N},...] - we wrote this file ourselves, so
+    // walking { to } and pulling the two keys out of each object is enough.
+    // An entry missing "date" reads as 0, meaning "earned, time unknown".
+    const char* p = strstr(json, "\"unlocked\"");
     if (p) p = strchr(p, '[');
-    while (p && *p && *p!=']') {
-        p++;
-        if (*p>='0' && *p<='9') {
-            ra_addUnlocked((uint32_t)strtoul(p, &p, 10));
+    while (p) {
+        const char* open = strchr(p, '{');
+        if (!open) break;
+        const char* close = strchr(open, '}');
+        if (!close) break;
+
+        uint32_t id = 0, date = 0;
+        if (ra_readUNum(open, close, "\"id\"", &id)) {
+            ra_readUNum(open, close, "\"date\"", &date);
+            ra_addUnlocked(id, date);
         }
+        p = close + 1;
     }
 
     free(json);
@@ -280,7 +324,8 @@ static void ra_loadProgress(void) {
 static void ra_pruneUnlocked(void) {
     uint32_t kept = 0;
     for (uint32_t i=0; i<ra.unlocked_count; i++) {
-        if (ra_findById(ra.unlocked[i])) ra.unlocked[kept++] = ra.unlocked[i];
+        if (!ra_findById(ra.unlocked[i].id)) continue;
+        ra.unlocked[kept++] = ra.unlocked[i];
     }
     if (kept!=ra.unlocked_count) {
         LOG_info("RA: dropped %u unlocked id(s) no longer in the set\n",
@@ -314,7 +359,8 @@ static void ra_saveProgress(void) {
     fprintf(f, "{\"hash\":\"%s\",\"set\":\"%08x\",\"total\":%u,\"unlocked\":[",
             ra.hash, ra.set_check, ra.total);
     for (uint32_t i=0; i<ra.unlocked_count; i++) {
-        fprintf(f, "%s%u", i ? "," : "", ra.unlocked[i]);
+        fprintf(f, "%s{\"id\":%u,\"date\":%u}", i ? "," : "",
+                ra.unlocked[i].id, ra.unlocked[i].date);
     }
     fprintf(f, "],\"check\":\"%08x\"}\n", ra_progressChecksum(ra.set_check));
 
@@ -371,7 +417,10 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
 
     const char* title = ra_titleForId(event->id);
 
-    ra_addUnlocked(event->id);
+    // time(NULL) rather than clock_gettime: this target has no vDSO so every
+    // one of them is a real syscall anyway (~800ns, measured), and seconds is
+    // exactly the unit both the file and RetroAchievements' own API use.
+    ra_addUnlocked(event->id, (uint32_t)time(NULL));
     rc_runtime_deactivate_achievement(&ra.runtime, event->id);
 
     RA_Achievement* entry = ra_findById(event->id);
