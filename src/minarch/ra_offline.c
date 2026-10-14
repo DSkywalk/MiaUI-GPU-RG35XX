@@ -90,7 +90,11 @@ static struct {
 
     char      msg[RA_MSG_SIZE];
     int       msg_frames;
+    int       msg_kind;    // RA_MSG_*, so a mode change can retire a live toast
     uint32_t  msg_id;      // bumped per message so the ui can cache its render
+
+    int       notify;      // RA_NOTIFY_*, how talkative the toasts are
+    int       chime;       // 0 silences the unlock sound
 
     int       active;      // runtime holds a valid achievement set
     int       mem_ready;   // rc_libretro memory regions resolved
@@ -120,6 +124,21 @@ static char* ra_readFile(const char* path, size_t* out_len) {
     buf[read] = '\0';
     if (out_len) *out_len = read;
     return buf;
+}
+
+// Which toasts the user wants to see. Suppressing at the source rather than at
+// the draw call matters: with nothing posted, RA_getMessage() stays NULL, the
+// ui layer is never marked active, and PLAT_flip skips the full-screen RGBA
+// upload that costs 3-5ms a frame.
+enum { RA_MSG_GENERAL, RA_MSG_UNLOCK };
+
+static int ra_wantsMsg(int kind) {
+    switch (ra.notify) {
+        case RA_NOTIFY_ALL:     return 1;
+        case RA_NOTIFY_UNLOCKS: return kind==RA_MSG_UNLOCK;
+        case RA_NOTIFY_GENERAL: return kind==RA_MSG_GENERAL;
+        default:                return 0; // RA_NOTIFY_NONE
+    }
 }
 
 static int ra_fileExists(const char* path) {
@@ -428,15 +447,21 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
     ra_countPoints();
 
     // the trophy the toast draws is the points symbol, so the number needs no
-    // unit beside it
-    snprintf(ra.msg, sizeof(ra.msg), "%u   %s",
-             entry ? entry->points : 0, title ? title : "???");
-    ra.msg_frames = RA_MSG_FRAMES;
-    ra.msg_id++;
+    // unit beside it. Only the toast is suppressed here - the unlock itself is
+    // recorded and saved below either way.
+    if (ra_wantsMsg(RA_MSG_UNLOCK)) {
+        snprintf(ra.msg, sizeof(ra.msg), "%u   %s",
+                 entry ? entry->points : 0, title ? title : "???");
+        ra.msg_kind = RA_MSG_UNLOCK;
+        ra.msg_frames = RA_MSG_FRAMES;
+        ra.msg_id++;
+    }
 
     //LOG_debug("RA: unlocked %u (%s)\n", event->id, title ? title : "???");
 
-    SND_playChime(); // just sets a flag; the audio thread does the work
+    // separate from the toast on purpose: some people want the sound without
+    // anything covering the screen, and some the reverse
+    if (ra.chime) SND_playChime(); // just sets a flag; the audio thread does the work
 
     // Written immediately rather than deferred to exit. There are no signal
     // handlers, and powering the device off mid-game runs PWR_powerOff() ->
@@ -568,6 +593,20 @@ static uint32_t ra_activateSet(const rc_api_fetch_game_data_response_t* game) {
 void RA_init(const char* root) {
     memset(&ra, 0, sizeof(ra));
     if (root) strncpy(ra.root, root, sizeof(ra.root)-1);
+    ra.notify = RA_NOTIFY_ALL; // until the caller says otherwise
+    ra.chime = 1;
+}
+
+void RA_setNotify(int mode) {
+    ra.notify = (mode>=RA_NOTIFY_ALL && mode<=RA_NOTIFY_NONE) ? mode : RA_NOTIFY_ALL;
+
+    // Retire a toast that is still on screen but no longer wanted, so picking
+    // "Off" takes the current one down rather than leaving it to time out.
+    if (ra.msg_frames>0 && !ra_wantsMsg(ra.msg_kind)) ra.msg_frames = 0;
+}
+
+void RA_setChime(int enabled) {
+    ra.chime = enabled ? 1 : 0;
 }
 
 void RA_setMemoryFuncs(RA_GetMemoryData get_data, RA_GetMemorySize get_size) {
@@ -744,14 +783,17 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     // loading actually changed something, which for a good file it does not.
     ra_saveProgress();
 
-    if (ra.invalidated) {
-        snprintf(ra.msg, sizeof(ra.msg), "Progress file was modified - progress reset");
+    if (ra_wantsMsg(RA_MSG_GENERAL)) {
+        if (ra.invalidated) {
+            snprintf(ra.msg, sizeof(ra.msg), "Progress file was modified - progress reset");
+        }
+        else {
+            snprintf(ra.msg, sizeof(ra.msg), "%u   %u/%u", ra.points, ra.unlocked_count, ra.total);
+        }
+        ra.msg_kind = RA_MSG_GENERAL;
+        ra.msg_frames = RA_MSG_FRAMES;
+        ra.msg_id++;
     }
-    else {
-        snprintf(ra.msg, sizeof(ra.msg), "%u   %u/%u", ra.points, ra.unlocked_count, ra.total);
-    }
-    ra.msg_frames = RA_MSG_FRAMES;
-    ra.msg_id++;
 
     return 1;
 }
@@ -844,9 +886,12 @@ int RA_wipeProgress(void) {
 
     LOG_info("RA: progress wiped, tracking %u/%u\n", activated, ra.total);
 
-    snprintf(ra.msg, sizeof(ra.msg), "0   0/%u", ra.total);
-    ra.msg_frames = RA_MSG_FRAMES;
-    ra.msg_id++;
+    if (ra_wantsMsg(RA_MSG_GENERAL)) {
+        snprintf(ra.msg, sizeof(ra.msg), "0   0/%u", ra.total);
+        ra.msg_kind = RA_MSG_GENERAL;
+        ra.msg_frames = RA_MSG_FRAMES;
+        ra.msg_id++;
+    }
 
     return activated>0;
 }

@@ -58,6 +58,20 @@ void RA_doFrame(void);
 // Reset trigger state (hit counts) after a core reset / state load.
 void RA_resetRuntime(void);
 
+// How much the on-screen toasts should say. The order matches the labels in
+// minarch's option table, so the config value indexes straight into this.
+enum {
+    RA_NOTIFY_ALL = 0,  // startup summary, unlocks, warnings
+    RA_NOTIFY_UNLOCKS,  // only "you just earned X"
+    RA_NOTIFY_GENERAL,  // everything except the unlocks
+    RA_NOTIFY_NONE,     // nothing at all
+};
+
+// Both are cosmetic, so unlike the per-game on/off switch they take effect
+// straight away rather than at the next launch.
+void RA_setNotify(int mode);
+void RA_setChime(int enabled);
+
 // Currently active toast, or NULL when there is nothing to draw.
 const char* RA_getMessage(void);
 

@@ -25,6 +25,7 @@
 
 #define FAUX_RECENT_PATH SDCARD_PATH "/Recently Played"
 #define COLLECTIONS_PATH SDCARD_PATH "/Collections"
+#define RETROACHIVEMENTS_PATH USERDATA_PATH "/retroachievements"
 
 #define LAST_PATH "/tmp/last.txt" // transient
 #define CHANGE_DISC_PATH "/tmp/change_disc.txt"
