@@ -11,6 +11,7 @@ static const char* zone_names[PROF_ZONE_COUNT] = {
     "frame_total",
     "core_run",
     "video_refresh",
+    "audio_batch",
     "tex_game",
     "tex_ui",
     "draw",
@@ -125,9 +126,10 @@ static void prof_report(void) {
                   ? iters / (zones[PROF_FRAME_TOTAL].total / 1e9) : 0;
     snprintf(line, sizeof(line),
              "per frame: draws %.1f  uploaded %.1f KiB  vbo_rebuilds %.3f"
-             "  iters/frame %.2f  emu %.1f Hz\n",
+             "  iters/frame %.2f  emu %.1f Hz  audio %.0f frames/frame\n",
              counters[PROF_DRAWS]/f, counters[PROF_TEX_BYTES]/f/1024.0,
-             counters[PROF_VBO_REBUILDS]/f, iters/f, emu_hz);
+             counters[PROF_VBO_REBUILDS]/f, iters/f, emu_hz,
+             counters[PROF_AUDIO_FRAMES]/f);
     prof_emit(line);
 
     if (logfile) fflush(logfile);
@@ -149,7 +151,14 @@ void PROF_frame(void) {
 // span that is still open. PROF_tick runs at the top of the loop, where
 // nothing is open and the window boundary is clean.
 void PROF_tick(void) {
-    if (frames >= PROFILE_FRAMES) prof_report();
+    if (frames >= PROFILE_FRAMES) { prof_report(); return; }
+
+    // A window that has been open a long time with few frames in it is the
+    // interesting case, not one to wait out -- report on elapsed time too.
+    if (window_start) {
+        uint64_t elapsed = prof_now() - window_start;
+        if (elapsed >= (uint64_t)PROFILE_SECONDS * 1000000000ULL) prof_report();
+    }
 }
 
 #endif // PROFILE

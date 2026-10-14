@@ -25,6 +25,13 @@
 #define PROFILE_FRAMES 300
 #endif
 
+// ...or this many seconds of wall time, whichever comes first. Without the
+// time limit a stalled core never reports at all: at 0.1 fps a 300 frame
+// window takes 50 minutes, which is exactly the case you most want measured.
+#ifndef PROFILE_SECONDS
+#define PROFILE_SECONDS 5
+#endif
+
 #ifndef PROFILE_LOG
 #define PROFILE_LOG "/userdata/minarch_profile.log"
 #endif
@@ -41,6 +48,8 @@ enum {
     PROF_FRAME_TOTAL,  // one whole main-loop iteration
     PROF_CORE_RUN,     // libretro emulation
     PROF_VIDEO,        // video_refresh_callback, excluding the flip
+    PROF_AUDIO,        // SND_batchSamples: blocks while the ring buffer is full,
+                       // so this is where a stalled frame clock shows up
     PROF_TEX_GAME,     // uploading the core framebuffer as a texture
     PROF_TEX_UI,       // uploading the full-screen ui layer
     PROF_DRAW,         // the quad draws
@@ -53,6 +62,7 @@ enum {
     PROF_DRAWS,        // draw calls
     PROF_TEX_BYTES,    // bytes pushed through glTexSubImage2D/glTexImage2D
     PROF_VBO_REBUILDS, // geometry uploads
+    PROF_AUDIO_FRAMES, // audio frames handed to SND_batchSamples
     PROF_COUNTER_COUNT,
 };
 

@@ -927,7 +927,7 @@ static struct SND_Context {
     int frame_in;     // buf_w
     int frame_out;    // buf_r
     int frame_filled; // max_buf_w
-    
+
     SND_Resampler resample;
 } snd = {0};
 
@@ -1162,12 +1162,25 @@ static void SND_selectResampler(void) { // plat_sound_select_resampler
         snd.resample = SND_resampleNear;
     }
 }
+// Consecutive waits with the ring still full before we give up on the audio
+// device. Each is ~10 SDL_Delay(1), so this is on the order of a second of no
+// drain at all -- far beyond any legitimate backlog of an 83ms ring buffer.
+#define SND_STALL_PASSES 100
+
+// Returns the number of input frames taken, per the libretro contract for
+// retro_audio_sample_batch_t. Most cores ignore it and assume everything was
+// consumed; the ones that don't (Mesen) resubmit whatever they think is left,
+// so getting this wrong is catastrophic rather than cosmetic: returning 1 for
+// a 734 frame batch made Mesen hand back 733, then 732, then 731... 734 calls
+// and 269,745 frames for a single video frame, which is six seconds of audio
+// the ring then has to drain in real time. That is a 0.2fps emulator.
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_sound_write / plat_sound_write_resample
     if (snd.frame_count==0) return 0;
     
     SDL_LockAudio();
 
-    int consumed = 0;
+    size_t taken = 0;
+    int stalled = 0;
     while (frame_count > 0) {
         int tries = 0;
         int amount = MIN(BATCH_SIZE, frame_count);
@@ -1179,16 +1192,31 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_s
             SDL_LockAudio();
         }
 
+        // Blocking here is deliberate -- the ring draining at the DAC rate is
+        // what paces the emulator. But if it never drains the device has died,
+        // and waiting forever takes the whole emulator down with it. Hand back
+        // a short count instead: the core keeps the rest, and the worst case
+        // is dropped audio rather than a frozen game.
+        if (snd.frame_in==snd.frame_filled) {
+            if (++stalled >= SND_STALL_PASSES) break;
+            continue;
+        }
+        stalled = 0;
+
         while (amount && snd.frame_in != snd.frame_filled) {
-            consumed = snd.resample(*frames);
-            frames += consumed;
-            amount -= consumed;
+            // 0 is legitimate when upsampling: the resampler wrote an output
+            // frame but is not done with this input frame yet. frame_in still
+            // advances, so the ring fills and this loop always terminates.
+            int consumed = snd.resample(*frames);
+            frames      += consumed;
+            amount      -= consumed;
             frame_count -= consumed;
+            taken       += consumed;
         }
     }
     SDL_UnlockAudio();
     
-    return consumed;
+    return taken;
 }
 
 void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
