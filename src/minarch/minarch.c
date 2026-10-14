@@ -949,6 +949,29 @@ static char* button_labels[] = {
     "MENU+R3",
     NULL,
 };
+
+// How a (button, mod) pair is packed into an index into button_labels:
+//   0            NONE
+//   1 .. N       the plain buttons
+//   N+1 .. 2N    the same list again, with MENU+ in front
+//
+// N is the number of buttons a user may bind: everything before MENU in the
+// BTN_ID_* enum. MENU itself and what follows it (PLUS, MINUS, POWER,
+// POWEROFF) belong to the system, have no label here, and must never be
+// packed into one of these indices.
+//
+// Deliberately NOT LOCAL_BUTTON_COUNT. That counts every button the device
+// reports - 23 - which is seven more than button_labels has entries for, so
+// using it as the offset put MENU+SELECT and everything after it past the end
+// of the table.
+#define BINDABLE_BUTTON_COUNT BTN_ID_MENU
+
+// Compile check:
+// Fails the build if the table and the constant ever drift: NONE + N + N + NULL.
+typedef char button_labels_size_check[
+    (sizeof(button_labels) / sizeof(button_labels[0])
+     == 2 * BINDABLE_BUTTON_COUNT + 2) ? 1 : -1];
+
 static char* overclock_labels[] = {
     "Powersave",
     "Normal",
@@ -1267,8 +1290,8 @@ static void Config_readControlsString(char* cfg) {
             }
             
             int mod = 0;
-            if (id >= LOCAL_BUTTON_COUNT) {
-                id -= LOCAL_BUTTON_COUNT;
+            if (id >= BINDABLE_BUTTON_COUNT) {
+                id -= BINDABLE_BUTTON_COUNT;
                 mod = 1;
             }
             
@@ -1313,8 +1336,8 @@ static void Config_readControlsString(char* cfg) {
         }
         
         int mod = 0;
-        if (id>=LOCAL_BUTTON_COUNT) {
-            id -= LOCAL_BUTTON_COUNT;
+        if (id>=BINDABLE_BUTTON_COUNT) {
+            id -= BINDABLE_BUTTON_COUNT;
             mod = 1;
         }
         // LOG_info("shortcut %s:%s (%i:%i)\n", key,value, id, mod);
@@ -1393,7 +1416,7 @@ static void Config_write(int override) {
         ButtonMapping* mapping = &config.controls[i];
         
         int j = mapping->local + 1;
-        if (mapping->mod) j += LOCAL_BUTTON_COUNT;
+        if (mapping->mod) j += BINDABLE_BUTTON_COUNT;
         
         // Si este botón tiene una tecla asignada, guardamos SOLO el bind_key
         if (mapping->retro_key > 0 && mapping->retro_key < RETROK_LAST) {
@@ -1412,7 +1435,7 @@ static void Config_write(int override) {
     for (int i=0; config.shortcuts[i].name; i++) {
         ButtonMapping* mapping = &config.shortcuts[i];
         int j = mapping->local + 1;
-        if (mapping->mod) j += LOCAL_BUTTON_COUNT;
+        if (mapping->mod) j += BINDABLE_BUTTON_COUNT;
         fprintf(file, "bind %s = %s\n", mapping->name, button_labels[j]);
     }
     
@@ -3216,21 +3239,19 @@ int OptionControls_bind(MenuList* list, int i) {
         GFX_startFrame();
         PAD_poll();
         
-        // NOTE: off by one because of the initial NONE value
-        for (int id=0; id<=LOCAL_BUTTON_COUNT; id++) {
-            if (PAD_justPressed(1 << (id-1))) {
-                item->value = id;
-                button->local = id - 1;
-                if (PAD_isPressed(BTN_MENU)) {
-                    item->value += LOCAL_BUTTON_COUNT;
-                    button->mod = 1;
-                }
-                else {
-                    button->mod = 0;
-                }
-                bound = 1;
-                break;
-            }
+        // Only the bindable buttons are listened for. MENU is strictly the
+        // modifier here: it has no label of its own, so binding it would pack
+        // an index past the end of button_labels, and it is also how the pause
+        // menu is opened. Pressing it alone simply keeps waiting.
+        for (int id=0; id<BINDABLE_BUTTON_COUNT; id++) {
+            if (!PAD_justPressed(1 << id)) continue;
+
+            button->local = id;
+            button->mod = PAD_isPressed(BTN_MENU) ? 1 : 0;
+            // +1 for the NONE entry the list starts with
+            item->value = id + 1 + (button->mod ? BINDABLE_BUTTON_COUNT : 0);
+            bound = 1;
+            break;
         }
         GFX_sync();
     }
@@ -3269,7 +3290,7 @@ static int OptionControls_openMenu(MenuList* list, int i) {
             item->name = button->name;
             item->desc = NULL;
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
             item->values = button_labels;
         }
     }
@@ -3282,7 +3303,7 @@ static int OptionControls_openMenu(MenuList* list, int i) {
             
             MenuItem* item = &OptionControls_menu.items[k++];
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
         }
     }
     Menu_options(&OptionControls_menu);
@@ -3297,21 +3318,19 @@ static int OptionShortcuts_bind(MenuList* list, int i) {
         GFX_startFrame();
         PAD_poll();
         
-        // NOTE: off by one because of the initial NONE value
-        for (int id=0; id<=LOCAL_BUTTON_COUNT; id++) {
-            if (PAD_justPressed(1 << (id-1))) {
-                item->value = id;
-                button->local = id - 1;
-                if (PAD_isPressed(BTN_MENU)) {
-                    item->value += LOCAL_BUTTON_COUNT;
-                    button->mod = 1;
-                }
-                else {
-                    button->mod = 0;
-                }
-                bound = 1;
-                break;
-            }
+        // Only the bindable buttons are listened for. MENU is strictly the
+        // modifier here: it has no label of its own, so binding it would pack
+        // an index past the end of button_labels, and it is also how the pause
+        // menu is opened. Pressing it alone simply keeps waiting.
+        for (int id=0; id<BINDABLE_BUTTON_COUNT; id++) {
+            if (!PAD_justPressed(1 << id)) continue;
+
+            button->local = id;
+            button->mod = PAD_isPressed(BTN_MENU) ? 1 : 0;
+            // +1 for the NONE entry the list starts with
+            item->value = id + 1 + (button->mod ? BINDABLE_BUTTON_COUNT : 0);
+            bound = 1;
+            break;
         }
         GFX_sync();
     }
@@ -3352,7 +3371,7 @@ static int OptionShortcuts_openMenu(MenuList* list, int i) {
             item->name = button->name;
             item->desc = NULL;
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
             item->values = button_labels;
         }
     }
@@ -3362,7 +3381,7 @@ static int OptionShortcuts_openMenu(MenuList* list, int i) {
             ButtonMapping* button = &config.shortcuts[j];
             MenuItem* item = &OptionShortcuts_menu.items[j];
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
         }
     }
     Menu_options(&OptionShortcuts_menu);
