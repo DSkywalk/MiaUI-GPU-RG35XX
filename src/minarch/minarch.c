@@ -4590,6 +4590,15 @@ static void Menu_updateState(void) {
     // LOG_info("save_path: %s (%i)\n", save_path, menu.save_exists);
     // LOG_info("bmp_path: %s txt_path: %s (%i)\n", menu.bmp_path, menu.txt_path, menu.preview_exists);
 }
+// The core's framebuffer as an RGB565 surface. Menu_scale() and the slot
+// thumbnails are both written against 16-bit pixels
+static SDL_Surface* Menu_gameFrame(void) {
+    if (!renderer.src) return NULL;
+
+    return SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h,
+        FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+}
+
 static void Menu_saveState(void) {
     // LOG_info("Menu_saveState\n");
 
@@ -4604,7 +4613,7 @@ static void Menu_saveState(void) {
     SDL_Surface* temp_surface = NULL;
 
     if (!bitmap) {
-        temp_surface = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h, FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+        temp_surface = Menu_gameFrame();
         bitmap = temp_surface;
     }
 
@@ -4869,11 +4878,11 @@ static int Menu_saveLoad(SDL_Surface* backing) {
 }
 
 static void Menu_loop(void) {
-    menu.bitmap = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h, FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+    menu.bitmap = Menu_gameFrame();
     //LOG_info("Menu_loop:menu.bitmap %ix%i\n", menu.bitmap->w,menu.bitmap->h);
     
     SDL_Surface* backing = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH,DEVICE_HEIGHT,FIXED_DEPTH,RGBA_MASK_565); 
-    Menu_scale(menu.bitmap, backing);
+    if (menu.bitmap) Menu_scale(menu.bitmap, backing);
     
     int restore_w = screen->w;
     int restore_h = screen->h;
@@ -5028,7 +5037,7 @@ static void Menu_loop(void) {
                             screen = GFX_resize(DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
                         
                             SDL_FillRect(backing, NULL, 0);
-                            Menu_scale(menu.bitmap, backing);
+                            if (menu.bitmap) Menu_scale(menu.bitmap, backing);
 
                             // both the screen and the still just changed
                             if (backdrop) SDL_FreeSurface(backdrop);
