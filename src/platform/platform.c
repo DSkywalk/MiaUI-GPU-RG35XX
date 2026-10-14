@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/fb.h>
@@ -1062,18 +1063,36 @@ void PLAT_powerOff(void) {
 	system("shutdown");
 }
 
+static void writeSysfs(const char* path, const char* value, int len) {
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	if (write(fd, value, len) != len) LOG_warn("can't write %s: %s\n", path, strerror(errno));
+	close(fd);
+}
+
+// What overclock.elf does, minus the shell: it's a bash script, so every
+// call was sh then bash then four echos, ~10ms each time the menu opened or
+// closed. Its mapping is kept as is, including running "normal" (1296000) at
+// 1.2GHz, and so is /tmp/cpu_freq, which it leaves behind for others to read.
 void PLAT_setCPUSpeed(int speed) {
-	int freq = 0;
+	int freq;
 	switch (speed) {
 		case CPU_SPEED_MENU: 		freq =  504000; break;
 		case CPU_SPEED_POWERSAVE:	freq = 1104000; break;
-		case CPU_SPEED_NORMAL: 		freq = 1296000; break;
 		case CPU_SPEED_PERFORMANCE: freq = 1488000; break;
+		case CPU_SPEED_NORMAL:      // overclock.elf maps 1296000 to 1200000
+		default: 					freq = 1200000; break;
 	}
-	
-	char cmd[32];
-	sprintf(cmd, "overclock.elf %d\n", freq);
-	system(cmd);
+
+	char value[16];
+	int len = snprintf(value, sizeof(value), "%d\n", freq);
+	for (int cpu=0; cpu<4; cpu++) {
+		char path[64];
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
+		writeSysfs(path, value, len);
+	}
+	writeSysfs("/tmp/cpu_freq", value, len);
+	LOG_info("overclocked to: %d\n", freq);
 }
 
 #define RUMBLE_PATH "/sys/class/power_supply/battery/moto"
