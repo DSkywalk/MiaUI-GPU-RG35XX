@@ -290,8 +290,17 @@ static void ra_pruneUnlocked(void) {
     }
 }
 
+// The only thing here that writes to the SD card.
+//
+// `progress_stale` is the dirty flag and the sole authority: every caller goes
+// through this, so a session that changes nothing never touches the card at
+// all. It is set where the state actually diverges from what is on disk - a
+// new unlock, a prune, a failed checksum, a wipe - and cleared by a successful
+// write. In particular ra_addUnlocked() does NOT set it, because loading the
+// file calls that too and reading is not a change.
 static void ra_saveProgress(void) {
     if (!ra.progress_path[0]) return;
+    if (!ra.progress_stale) return;
 
     char tmp_path[MAX_PATH];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", ra.progress_path);
@@ -380,6 +389,12 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
 
     SND_playChime(); // just sets a flag; the audio thread does the work
 
+    // Written immediately rather than deferred to exit. There are no signal
+    // handlers, and powering the device off mid-game runs PWR_powerOff() ->
+    // PLAT_powerOff() without ever reaching RA_unloadGame() - so a deferred
+    // unlock would simply be lost, which is the one outcome this feature
+    // cannot afford. ~150 bytes per unlock is not the write worth saving.
+    ra.progress_stale = 1;
     ra_saveProgress();
 }
 
@@ -676,8 +691,9 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     LOG_info("RA: %u/%u unlocked, tracking %u\n", ra.unlocked_count, ra.total, activated);
 
     // put a well-formed file back on the card, so a rejected or outdated one
-    // isn't re-read (and re-warned about) on every launch
-    if (ra.progress_stale) ra_saveProgress();
+    // isn't re-read (and re-warned about) on every launch. A no-op unless
+    // loading actually changed something, which for a good file it does not.
+    ra_saveProgress();
 
     if (ra.invalidated) {
         snprintf(ra.msg, sizeof(ra.msg), "Progress file was modified - progress reset");
@@ -693,7 +709,16 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
 
 void RA_unloadGame(void) {
     if (ra.active) {
-        ra_saveProgress();
+        // Normally a no-op: an unlock writes as it happens, so by the time a
+        // game is closed there is usually nothing left to flush. This is the
+        // backstop for the paths that only mark the state dirty - a wipe, or a
+        // prune whose write failed earlier.
+        if (ra.progress_stale) {
+            ra_saveProgress();
+        }
+        else {
+            LOG_info("RA: no change this session, card not touched\n");
+        }
         rc_runtime_destroy(&ra.runtime);
     }
     if (ra.mem_ready) rc_libretro_memory_destroy(&ra.regions);
