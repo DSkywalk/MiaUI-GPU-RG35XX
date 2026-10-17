@@ -47,6 +47,27 @@ static int achievements_enabled = 1; // FE_OPT_ACHIEVEMENTS, persisted per game
 static int achievement_sound = 1;    // FE_OPT_ACHIEVEMENT_SOUND
 static int achievement_notify = 0;   // FE_OPT_ACHIEVEMENT_NOTIFY, RA_NOTIFY_ALL
 
+// PLAT_VIDEO_* from the command line (--32bits, --gl), fixed for the session
+static int video_mode = 0;
+
+// Bytes per pixel of the core's framebuffer, from RETRO_ENVIRONMENT_SET_PIXEL_FORMAT.
+// 2 = RGB565 (the default every core gets if it never asks), 4 = XRGB8888,
+// which is only ever accepted with --32bits or --gl.
+static int core_pixel_bpp = 2;
+
+// which state shortcut waits for the end of the frame, in GL mode (see input_poll_callback)
+enum { HW_PENDING_NONE, HW_PENDING_SAVE, HW_PENDING_LOAD };
+
+// Hardware rendering state (--gl), see HW_setRender
+static struct {
+    int requested; // the core's SET_HW_RENDER was accepted
+    int active;    // the FBO exists and context_reset has run
+    int sw_frame;  // the last frame shown was a software one
+    int pending;   // HW_PENDING_*
+    unsigned fbo;
+    struct retro_hw_render_callback cb;
+} hwr;
+
 // ASSET_TROPHY is 10x10 in the atlas and stands in for the word
 // "achievement" wherever it would otherwise be spelled out.
 #define RA_ICON_SIZE 10 // logical px, matches the atlas rect
@@ -1805,8 +1826,11 @@ static void input_poll_callback(void) {
                     // no save states while achievements are active, same as
                     // RetroAchievements hardcore. The menu hides the rows, so
                     // block the shortcuts too or it's only cosmetic.
-                    case SHORTCUT_SAVE_STATE: if (!Hardcore_active()) Menu_saveState(); break;
-                    case SHORTCUT_LOAD_STATE: if (!Hardcore_active()) Menu_loadState(); break;
+                    // With a hardware core this runs in the middle of its frame, its
+                    // GL state bound: the thumbnail readback would trample it, so in
+                    // GL mode both wait for the frame to be handed over.
+                    case SHORTCUT_SAVE_STATE: if (!Hardcore_active()) { if (hwr.active) hwr.pending = HW_PENDING_SAVE; else Menu_saveState(); } break;
+                    case SHORTCUT_LOAD_STATE: if (!Hardcore_active()) { if (hwr.active) hwr.pending = HW_PENDING_LOAD; else Menu_loadState(); } break;
                     case SHORTCUT_RESET_GAME: core.reset(); RA_resetRuntime(); break;
                     case SHORTCUT_CYCLE_SCALE:
                         screen_scaling += 1;
@@ -1955,6 +1979,42 @@ static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uin
     VIB_setStrength(strength);
     return 1;
 }
+///////////////////////////////
+// Hardware rendering (--gl)
+//
+// The core renders into an FBO in minarch's own GLES2 context, and that FBO's
+// texture is drawn as the game layer (see PLAT_hwInit).
+
+static uintptr_t HW_getCurrentFramebuffer(void) {
+    return hwr.fbo;
+}
+static retro_proc_address_t HW_getProcAddress(const char* sym) {
+    // not eglGetProcAddress: on this driver it returns NULL for anything
+    // that isn't an extension (glDrawElements, glBindFramebuffer...)
+    return (retro_proc_address_t)SDL_GL_GetProcAddress(sym);
+}
+static bool HW_setRender(unsigned cmd, struct retro_hw_render_callback* cb) {
+    if (!cb) return false;
+
+    // EGL here offers OpenGL ES 2.0 and nothing else
+    int ok = cb->context_type==RETRO_HW_CONTEXT_OPENGLES2
+          || (cb->context_type==RETRO_HW_CONTEXT_OPENGLES_VERSION && cb->version_major==2);
+    LOG_info("SET_HW_RENDER: context %i (%u.%u) depth %i stencil %i bottom_left %i: %s\n",
+             cb->context_type, cb->version_major, cb->version_minor,
+             cb->depth, cb->stencil, cb->bottom_left_origin, ok ? "accepted" : "refused, GLES2 only");
+    if (!ok) return false;
+
+    cb->get_current_framebuffer = HW_getCurrentFramebuffer;
+    cb->get_proc_address = HW_getProcAddress;
+
+    // the old experimental ABI ends before stencil: don't copy garbage
+    memset(&hwr.cb, 0, sizeof(hwr.cb));
+    if (cmd & RETRO_ENVIRONMENT_EXPERIMENTAL) memcpy(&hwr.cb, cb, offsetof(struct retro_hw_render_callback, stencil));
+    else memcpy(&hwr.cb, cb, sizeof(hwr.cb));
+    hwr.requested = 1;
+    return true;
+}
+
 static bool environment_callback(unsigned cmd, void *data) { // copied from picoarch initially
     // LOG_info("environment_callback: %i\n", cmd);
     
@@ -1996,11 +2056,37 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: { /* 10 */
         const enum retro_pixel_format *format = (enum retro_pixel_format *)data;
 
-        if (*format != RETRO_PIXEL_FORMAT_RGB565) { // TODO: pull from platform.h?
-            /* 565 is only supported format */
-            return false;
+        if (*format == RETRO_PIXEL_FORMAT_RGB565) {
+            core_pixel_bpp = 2;
+            break;
         }
-        break;
+
+        // XRGB8888 goes to the GPU untouched as BGRA, so it only costs the
+        // doubled upload - but only when asked for (--32bits, --gl), so the
+        // default stays the 16-bit path. Cores that insist on it (Mesen, the
+        // GL cores) refuse to load without it.
+        if (*format == RETRO_PIXEL_FORMAT_XRGB8888 && PLAT_supports32Bit()) {
+            core_pixel_bpp = 4;
+            LOG_info("pixel format: XRGB8888 (32-bit)\n");
+            break;
+        }
+
+        /* 0RGB1555 is deprecated upstream and nothing we ship asks for it */
+        return false;
+    }
+    case RETRO_ENVIRONMENT_SET_HW_RENDER: /* 14 */
+    case RETRO_ENVIRONMENT_SET_HW_RENDER | RETRO_ENVIRONMENT_EXPERIMENTAL: {
+        if (!(video_mode & PLAT_VIDEO_GL)) return false; // as before: software only
+        return HW_setRender(cmd, (struct retro_hw_render_callback*)data);
+    }
+    // RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER (56) stays unanswered on
+    // purpose, like RetroArch with driver switching off: cores then walk
+    // their own list down to GLES2. Answering GLES2 outright breaks PPSSPP,
+    // which only builds its GL context for DUMMY, OPENGL or OPENGLES3.
+    case RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT: { /* 44 | RETRO_ENVIRONMENT_EXPERIMENTAL */
+        // Not implemented yet: logged so we know which cores ask for it
+        if (video_mode & PLAT_VIDEO_GL) LOG_info("SET_HW_SHARED_CONTEXT requested (not supported)\n");
+        return false;
     }
     case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: { /* 11 */
         // puts("RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS\n");
@@ -2475,6 +2561,7 @@ static void selectScaler(int src_w, int src_h, int src_p) {
     renderer.src_w = src_w;
     renderer.src_h = src_h;
     renderer.src_p = src_p;
+    renderer.src_bpp = core_pixel_bpp;
     renderer.dst_x = dst_x;
     renderer.dst_y = dst_y;
     renderer.dst_w = dst_w;
@@ -2726,6 +2813,37 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
     PROF_FRAME();
 }
+// Only registered once a core's hardware context is up (Core_load). A frame
+// from the GPU goes through the software callback above untouched: for it,
+// PLAT_getScaler hands out a "scaler" that points the game layer at the FBO
+// instead of queueing an upload, and the pointer (RETRO_HW_FRAME_BUFFER_VALID)
+// is never read. So the software path is the same code it always was.
+static void video_refresh_callback_hw(const void *data, unsigned width, unsigned height, size_t pitch) {
+    // whatever the core left bound, the compositor needs its own state back
+    // before it draws anything - the UI resize and the toast upload included
+    PLAT_hwRestoreState();
+
+    // A HW core may still hand over a software frame now and then; that goes
+    // through the normal upload, into the software texture. Either switch
+    // re-selects the scaler.
+    int sw = data!=RETRO_HW_FRAME_BUFFER_VALID;
+    if (data && sw!=hwr.sw_frame) { // NULL is a repeat of whichever it was
+        PLAT_hwPresent(!sw);
+        hwr.sw_frame = sw;
+        renderer.dst_p = 0;
+    }
+    video_refresh_callback(data, width, height, pitch);
+
+    // a state shortcut from this frame's input poll: the frame is complete
+    // and in the FBO now, and the GL state is ours, as RetroArch has it
+    // whenever it saves or loads
+    if (hwr.pending) {
+        int pending = hwr.pending;
+        hwr.pending = HW_PENDING_NONE;
+        if (pending==HW_PENDING_SAVE) Menu_saveState();
+        else Menu_loadState();
+    }
+}
 
 ///////////////////////////////
 
@@ -2813,7 +2931,8 @@ int Core_open(const char* core_path, const char* tag_name) {
     Core_getName((char*)core_path, (char*)core.name);
     sprintf((char*)core.version, "%s (%s)", info.library_name, info.library_version);
     strcpy((char*)core.tag, tag_name);
-    strcpy((char*)core.extensions, info.valid_extensions);
+    // NULL is allowed and means anything goes (the GL test cores do it)
+    strcpy((char*)core.extensions, info.valid_extensions ? info.valid_extensions : "");
     
     core.need_fullpath = info.need_fullpath;
     
@@ -2849,6 +2968,30 @@ void Core_init(void) {
     set_input_poll_callback(input_poll_callback);
     set_input_state_callback(input_state_callback);
 }
+static int HW_init(const struct retro_system_av_info* av_info) {
+    hwr.fbo = PLAT_hwInit(av_info->geometry.max_width, av_info->geometry.max_height,
+                          hwr.cb.depth, hwr.cb.stencil, hwr.cb.bottom_left_origin);
+    if (!hwr.fbo) return 0;
+    hwr.active = 1;
+
+    // From here on the frames come from the GPU. Re-registering is allowed at
+    // any point and RetroArch does it itself (run-ahead), so cores expect it.
+    set_video_refresh_callback(video_refresh_callback_hw);
+
+    if (hwr.cb.context_reset) hwr.cb.context_reset();
+    PLAT_hwRestoreState(); // whatever the core's setup left bound
+    return 1;
+}
+static void HW_quit(void) {
+    if (!hwr.active) return;
+    // the context outlives this, so the core can still delete what it made
+    if (hwr.cb.context_destroy) hwr.cb.context_destroy();
+    PLAT_hwRestoreState();
+    PLAT_hwQuit();
+    hwr.active = 0;
+    hwr.fbo = 0;
+}
+
 // Returns 0 if the core refused the content. Everything downstream (the av
 // info, the save ram, the state buffer) reads state that only exists once the
 // game is loaded, so this has to be checked -- ignoring it turns a core that
@@ -2884,6 +3027,13 @@ int Core_load(void) {
     core.aspect_ratio = a;
     
     LOG_info("aspect_ratio: %f fps: %f\n", a, core.fps);
+
+    // A core asks for its context from retro_load_game; it gets it now that
+    // the av info says how big a frame can be, the same order as RetroArch.
+    if (hwr.requested && !HW_init(&av_info)) {
+        LOG_error("Core_load: %s needs hardware rendering and its GL context could not be set up\n", core.name);
+        return 0;
+    }
     return 1;
 }
 void Core_reset(void) {
@@ -2899,6 +3049,7 @@ void Core_quit(void) {
         if (core.loaded) {
             SRAM_write();
             RTC_write();
+            HW_quit(); // context_destroy comes before retro_unload_game, as in RetroArch
             core.unload_game();
             core.loaded = 0;
         }
@@ -3044,6 +3195,9 @@ void Menu_quit(void) {
     SDL_FreeSurface(menu.overlay);
 }
 void Menu_beforeSleep(void) {
+    // sleep comes from the input poll, mid-frame for a HW core, and the
+    // sleep screen is a flip: it needs the compositor's GL state, not the core's
+    if (hwr.active) PLAT_hwRestoreState();
     GFX_showToast(0, 0, 0); // not over the "powering off" message either
     SRAM_write();
     RTC_write();
@@ -4737,12 +4891,28 @@ static void Menu_updateState(void) {
     // LOG_info("bmp_path: %s txt_path: %s (%i)\n", menu.bmp_path, menu.txt_path, menu.preview_exists);
 }
 // The core's framebuffer as an RGB565 surface. Menu_scale() and the slot
-// thumbnails are both written against 16-bit pixels
+// thumbnails are both written against 16-bit pixels, so a 32-bit core gets
+// converted once here rather than teaching every consumer two formats -- it
+// only ever runs on pause or on a save, never per frame.
 static SDL_Surface* Menu_gameFrame(void) {
+    // a hardware frame only exists on the GPU: read back a copy (~40ms)
+    if (hwr.active && !hwr.sw_frame) return PLAT_hwCapture(renderer.true_w, renderer.true_h);
     if (!renderer.src) return NULL;
 
-    return SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h,
-        FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+    if (core_pixel_bpp!=4) {
+        return SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h,
+            FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+    }
+
+    // XRGB8888 is B,G,R,X in memory on little endian
+    SDL_Surface* raw = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h,
+                                                32, renderer.src_p,
+                                                0x00FF0000, 0x0000FF00, 0x000000FF, 0);
+    if (!raw) return NULL;
+
+    SDL_Surface* out = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGB565, 0);
+    SDL_FreeSurface(raw);
+    return out;
 }
 
 static void Menu_saveState(void) {
@@ -5032,6 +5202,9 @@ static int Menu_saveLoad(SDL_Surface* backing) {
 }
 
 static void Menu_loop(void) {
+    // the core may have kept drawing after its last frame went out
+    if (hwr.active) PLAT_hwRestoreState();
+
     menu.bitmap = Menu_gameFrame();
     //LOG_info("Menu_loop:menu.bitmap %ix%i\n", menu.bitmap->w,menu.bitmap->h);
     
@@ -5363,7 +5536,10 @@ static void Menu_loop(void) {
             screen = GFX_resize(restore_w,restore_h,restore_p);
         }
         GFX_clear(screen);
-        video_refresh_callback(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
+        // the FBO still holds the core's last frame: nothing has drawn into it since
+        // (renderer.src is RETRO_HW_FRAME_BUFFER_VALID then)
+        if (hwr.active) video_refresh_callback_hw(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
+        else video_refresh_callback(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
 
         setOverclock(overclock); // restore overclock value
         if (rumble_strength) VIB_setStrength(rumble_strength);
@@ -5492,10 +5668,27 @@ int main(int argc , char* argv[]) {
     char tag_name[MAX_PATH];
     char ovlpath[MAX_PATH];
 
-    strcpy(core_path, argv[1]);
-    strcpy(rom_path, argv[2]);
+    // minarch.elf [--32bits] [--gl] <core> <rom>, the options anywhere
+    char* positional[2] = {NULL, NULL};
+    int npositional = 0;
+    for (int i=1; i<argc; i++) {
+        if (!strcmp(argv[i], "--gl")) video_mode |= PLAT_VIDEO_GL | PLAT_VIDEO_32BIT;
+        else if (!strcmp(argv[i], "--32bits")) video_mode |= PLAT_VIDEO_32BIT;
+        else if (!strncmp(argv[i], "--", 2)) LOG_warn("unknown option %s ignored\n", argv[i]);
+        else if (npositional<2) positional[npositional++] = argv[i];
+    }
+    if (npositional<2) {
+        LOG_error("usage: %s [--32bits] [--gl] <core> <rom>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (video_mode) LOG_info("video mode:%s%s\n", (video_mode & PLAT_VIDEO_32BIT) ? " 32bits" : "",
+                             (video_mode & PLAT_VIDEO_GL) ? " gl" : "");
+
+    strcpy(core_path, positional[0]);
+    strcpy(rom_path, positional[1]);
     getEmuName(rom_path, tag_name);
-    
+
+    PLAT_setVideoFlags(video_mode); // before GFX_init: it picks the window's config
     screen = GFX_init(MODE_MENU);
     DEVICE_WIDTH = screen->w; // yea or nay?
     DEVICE_HEIGHT = screen->h; // yea or nay?

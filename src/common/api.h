@@ -118,6 +118,7 @@ typedef struct GFX_Renderer {
 	int src_w;
 	int src_h;
 	int src_p;
+	int src_bpp; // bytes per pixel of src, from the negotiated retro_pixel_format (0 = 2)
 	
 	// TODO: I think this is overscaled
 	int dst_x;
@@ -313,6 +314,27 @@ typedef void (*scaler_t)(void* __restrict src, void* __restrict dst, uint32_t sw
 
 void PLAT_initInput();
 void PLAT_quitInput();
+
+// Opt-in video modes, set before GFX_init (minarch's --32bits and --gl).
+// Without any, the window gets the lightest config the driver has: 565, no
+// depth, no stencil.
+#define PLAT_VIDEO_32BIT 1 // 8888 window with depth/stencil, XRGB8888 cores accepted
+#define PLAT_VIDEO_GL    2 // libretro hardware rendering (implies the above)
+void PLAT_setVideoFlags(int flags);
+// 1 if the core's 32-bit XRGB8888 output can go to the GPU directly. Always 0
+// without PLAT_VIDEO_32BIT.
+int PLAT_supports32Bit(void);
+
+// Hardware rendering, only ever called with PLAT_VIDEO_GL. The core renders
+// into an FBO in the frontend's own context; its colour texture then stands
+// in for the game layer, and while it does PLAT_getScaler hands out a scaler
+// that draws it instead of uploading - so a hardware frame goes through the
+// same renderer calls as a software one.
+unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_left); // the FBO, 0 on failure
+void PLAT_hwQuit(void);
+void PLAT_hwRestoreState(void); // put back what the core may have changed
+void PLAT_hwPresent(int hw_frame); // 1: the FBO is the game layer, 0: software frames again
+SDL_Surface* PLAT_hwCapture(int w, int h); // the last frame as RGB565 (~40ms), NULL on failure
 
 SDL_Surface* PLAT_initVideo(void);
 void PLAT_quitVideo(void);

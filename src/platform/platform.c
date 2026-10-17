@@ -168,6 +168,7 @@ static struct VID_Context {
 
 	int nearest;            // Filtering mode: 1=Nearest, 0=Linear
 	int cleared;            // Flag to indicate if screen was cleared
+	GLint game_filter;      // last filter set on the game layer, for a texture that takes its place
 } vid;
 
 // Struct to track game blit state for optimized texture updates
@@ -182,7 +183,44 @@ static struct {
 	uint32_t last_sw;    // Previous source width (to detect resize)
 	uint32_t last_sh;    // Previous source height
 	uint32_t last_stride_w;
+	// How the source goes to GL, decided once per scaler selection rather
+	// than per frame: RGB565 at alignment 1, or XRGB8888 as BGRA at 4.
+	GLenum gl_format;
+	GLenum gl_type;
+	GLint align;
 } gles_blit;
+
+// GL_BGRA_EXT from GL_EXT_texture_format_BGRA8888. XRGB8888 is B,G,R,X in
+// memory on little endian, and GLES2 has no core BGRA, so without this
+// extension a 32-bit core would need a swizzle in the fragment shader.
+#ifndef GL_BGRA_EXT
+#define GL_BGRA_EXT 0x80E1
+#endif
+
+// Hardware rendering state (--gl), see PLAT_hwInit
+static struct {
+	GLuint fbo;
+	GLuint tex;      // the FBO's colour, which becomes the game layer
+	GLuint depth;    // depth (and stencil) renderbuffer, 0 if the core wants neither
+	GLuint sw_tex;   // the software game texture, set aside while tex is in its place
+	int w, h;        // allocated size
+	int bottom_left; // the core draws with GL's own origin, first row at the bottom
+	int presenting;  // frames are the FBO's (0: the core sent software ones)
+	int dirty;       // the game VBO needs rebuilding for the FBO's texture rect
+	GFX_Renderer* renderer; // where scale_hw finds the crop, from PLAT_getScaler
+	GLint max_attribs;
+	PFNGLBINDVERTEXARRAYOESPROC bind_vao; // NULL without OES_vertex_array_object
+} hw;
+
+static int video_flags = 0;  // PLAT_VIDEO_*, from PLAT_setVideoFlags
+static int gles_has_bgra = 0; // only looked up with PLAT_VIDEO_32BIT
+
+void PLAT_setVideoFlags(int flags) {
+	// GL output always comes with the 32-bit window
+	if (flags & PLAT_VIDEO_GL) flags |= PLAT_VIDEO_32BIT;
+	video_flags = flags;
+}
+int PLAT_supports32Bit(void) { return gles_has_bgra; }
 
 /**
  * Uploads vertex data for a quad (x, y, w, h) to a specific VBO.
@@ -202,6 +240,20 @@ static void upload_quad_vbo_uv(GLuint vbo, float x, float y, float w, float h, f
 
 static void upload_quad_vbo(GLuint vbo, float x, float y, float w, float h) {
 	upload_quad_vbo_uv(vbo, x, y, w, h, 1.0f, 1.0f);
+}
+
+// Same quad, any texture rect: v_top is what the top edge samples, so a
+// bottom-up image is just v_top > v_bottom.
+static void upload_quad_vbo_rect(GLuint vbo, float x, float y, float w, float h,
+                                 float u_left, float v_top, float u_right, float v_bottom) {
+	GLfloat vertices[] = {
+		x,     y,     0.0f,   u_left,  v_top,
+		x,     y + h, 0.0f,   u_left,  v_bottom,
+		x + w, y + h, 0.0f,   u_right, v_bottom,
+		x + w, y,     0.0f,   u_right, v_top
+	};
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
 }
 
 /**
@@ -269,12 +321,18 @@ SDL_Surface* PLAT_initVideo(void) {
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 
-	// Setup framebuffer attributes
-	SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+	// Setup framebuffer attributes. Nothing here ever reads the window's depth,
+	// stencil or alpha, so by default ask for none and the lowest colour
+	// depth: the driver hands out the cheapest config that satisfies it (it
+	// used to give out 8888 with D24S8 for the old 4444/D16 request).
+	// --32bits/--gl ask for the full 8888 + D24S8 config.
+	int full = video_flags & PLAT_VIDEO_32BIT;
+	SDL_GL_SetAttribute(SDL_GL_RED_SIZE,     full ? 8 : 5);
+	SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE,   full ? 8 : 6);
+	SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE,    full ? 8 : 5);
+	SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE,   full ? 8 : 0);
+	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,   full ? 24 : 0);
+	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, full ? 8 : 0);
 
 	printf("Creating window...\n");
 	vid.window = SDL_CreateWindow("MiaUI", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, FIXED_WIDTH, FIXED_HEIGHT, SDL_WINDOW_OPENGL);
@@ -283,13 +341,15 @@ SDL_Surface* PLAT_initVideo(void) {
 	vid.context = SDL_GL_CreateContext(vid.window);
 	
 	// Debug info
-	int r, g, b, a, depth;
+	int r, g, b, a, depth, stencil;
 	SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &r);
 	SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &g);
 	SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &b);
 	SDL_GL_GetAttribute(SDL_GL_ALPHA_SIZE, &a);
 	SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &depth);
-	printf("GPU Backbuffer format: %d%d%d/%d Depth: %dbits\n", r, g, b, a, depth);
+	SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &stencil);
+	printf("GPU Backbuffer format: %d%d%d/%d Depth: %dbits Stencil: %dbits (video flags %d)\n",
+	       r, g, b, a, depth, stencil, video_flags);
 	printGLString("Version", GL_VERSION);
 	printGLString("Vendor", GL_VENDOR);
 	printGLString("Renderer", GL_RENDERER);
@@ -312,6 +372,14 @@ SDL_Surface* PLAT_initVideo(void) {
 		PROF_LOG("extensions  : %s\n\n", (const char*)glGetString(GL_EXTENSIONS));
 	}
 #endif
+
+	if (video_flags & PLAT_VIDEO_32BIT) {
+		const char* exts = (const char*)glGetString(GL_EXTENSIONS);
+		gles_has_bgra = exts && (strstr(exts, "GL_EXT_texture_format_BGRA8888") ||
+		                         strstr(exts, "GL_IMG_texture_format_BGRA8888"));
+		printf("32-bit (XRGB8888) core output: %s\n",
+		       gles_has_bgra ? "supported (native BGRA upload)" : "UNSUPPORTED (no BGRA extension)");
+	}
 
 	SDL_GL_SetSwapInterval(1); // Enable VSync
 
@@ -391,6 +459,7 @@ SDL_Surface* PLAT_initVideo(void) {
 	// Game Texture
 	glGenTextures(1, &vid.game_tex);
 	glBindTexture(GL_TEXTURE_2D, vid.game_tex);
+	vid.game_filter = GL_NEAREST;
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -406,6 +475,9 @@ SDL_Surface* PLAT_initVideo(void) {
 	gles_blit.last_sw = 0;
 	gles_blit.last_sh = 0;
 	gles_blit.last_stride_w = 0;
+	gles_blit.gl_format = GL_RGB;
+	gles_blit.gl_type = GL_UNSIGNED_SHORT_5_6_5;
+	gles_blit.align = 1;
 
 	// Global GL state
 	glViewport(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
@@ -621,6 +693,7 @@ void PLAT_setNearestNeighbor(int enabled) {
 	glBindTexture(GL_TEXTURE_2D, vid.game_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+	vid.game_filter = filter;
 
 	printf("setNearestNeighbor: %i\n", enabled);
 }
@@ -631,6 +704,7 @@ void PLAT_setSharpness(int sharpness) {
 	glBindTexture(GL_TEXTURE_2D, vid.game_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+	vid.game_filter = filter;
 
 	printf("setSharpness: %i\n", sharpness);
 }
@@ -680,8 +754,64 @@ GLES_SCALER(4)
 GLES_SCALER(5)
 GLES_SCALER(6)
 
+// XRGB8888 cores (--32bits). The scale factor means nothing to the GPU
+// upload, so one wrapper does for all of them.
+static void scale_n32(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dw, uint32_t dh, uint32_t dp) {
+	scale_gles(src, dst, sw, sh, sp, dw, dh, dp, 4);
+}
+
+// A hardware frame's "scaler": nothing to upload, the FBO's texture already
+// is the picture. It goes in the game texture's place and the flip draws it
+// like a repeated frame. Only the VBO changes, and only with the geometry.
+static void scale_hw(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dw, uint32_t dh, uint32_t dp) {
+	if (hw.dirty) {
+		// The frame is the bottom-left (or top-left) true_w x true_h of the
+		// FBO, cropped like a software one would be.
+		GFX_Renderer* r = hw.renderer;
+		float tw = hw.w;
+		float th = hw.h;
+		float v_top, v_bottom;
+		if (hw.bottom_left) {
+			v_top    = (r->true_h - r->src_y) / th;
+			v_bottom = (r->true_h - r->src_y - r->src_h) / th;
+		}
+		else {
+			v_top    = r->src_y / th;
+			v_bottom = (r->src_y + r->src_h) / th;
+		}
+		PROF_COUNT(PROF_VBO_REBUILDS, 1);
+		upload_quad_vbo_rect(vid.vbo_game, r->dst_x, r->dst_y, r->dst_w, r->dst_h,
+		                     r->src_x / tw, v_top, (r->src_x + r->src_w) / tw, v_bottom);
+		hw.dirty = 0;
+	}
+	gles_blit.src = NULL;
+	gles_blit.repeat = 1;           // draw the game texture as it is
+	gles_blit.last_stride_w = hw.w; // which needs this to be non-zero
+}
+
 // Returns the appropriate scaler function (which just sets up state for GL upload)
 scaler_t PLAT_getScaler(GFX_Renderer* renderer) {
+	if (hw.presenting) {
+		hw.renderer = renderer;
+		hw.dirty = 1;
+		return scale_hw;
+	}
+
+	// The upload format follows the source's pixel size. Settled here, which
+	// only runs when the geometry changes, so the per-frame upload in
+	// PLAT_flip has nothing to decide.
+	int is32 = renderer->src_bpp==4 && gles_has_bgra;
+	GLenum format = is32 ? GL_BGRA_EXT : GL_RGB;
+	if (format != gles_blit.gl_format) {
+		gles_blit.gl_format = format;
+		gles_blit.gl_type   = is32 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_SHORT_5_6_5;
+		// 1 is right for every 16-bit source (see the table in PLAT_flip);
+		// 4 is exact for a 4-byte format
+		gles_blit.align     = is32 ? 4 : 1;
+		gles_blit.last_stride_w = 0; // the texture has to be reallocated in the new format
+	}
+	if (is32) return scale_n32;
+
 	switch (renderer->scale) {
 		case 6:  return scale6x6_n16;
 		case 5:  return scale5x5_n16;
@@ -746,18 +876,20 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 
 		// Upload game texture pixels DIRECTAMENTE (Sin memcpy)
 		glBindTexture(GL_TEXTURE_2D, vid.game_tex);
-		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		// RGB565 at 1, or XRGB8888 as BGRA_EXT at 4 (B,G,R,X in memory, taken
+		// as-is: no swizzle, no second shader program) - see PLAT_getScaler
+		glPixelStorei(GL_UNPACK_ALIGNMENT, gles_blit.align);
 
 		// Verificamos si las dimensiones DE MEMORIA (stride) han cambiado, no solo las visibles
 		PROF_BEGIN(PROF_TEX_GAME);
-		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)stride_w * gles_blit.sh * 2);
+		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)stride_w * gles_blit.sh * gles_blit.bpp);
 		if (gles_blit.last_stride_w == stride_w && gles_blit.last_sh == gles_blit.sh) {
 			// Dimensions unchanged: cheaper sub-image update
 			// Usamos stride_w como el ancho de la textura
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stride_w, gles_blit.sh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, gles_blit.src);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stride_w, gles_blit.sh, gles_blit.gl_format, gles_blit.gl_type, gles_blit.src);
 		} else {
-			// Dimensions changed: reallocate texture
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, stride_w, gles_blit.sh, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, gles_blit.src);
+			// Dimensions or format changed: reallocate texture
+			glTexImage2D(GL_TEXTURE_2D, 0, gles_blit.gl_format, stride_w, gles_blit.sh, 0, gles_blit.gl_format, gles_blit.gl_type, gles_blit.src);
 			
 			gles_blit.last_sw = gles_blit.sw; // Mantenemos esto por referencia
 			gles_blit.last_stride_w = stride_w; // Actualizamos el stride trackeado
@@ -882,6 +1014,245 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		PLAT_clearVideo(vid.screen);
 		vid.cleared = 0;
 	}
+}
+
+// -------------------------------------------------------------------------
+// Hardware Rendering (--gl)
+// -------------------------------------------------------------------------
+//
+// The core gets an FBO in this same context, the way RetroArch's gl driver
+// does it on this device: a second shared context measured 1.2ms a frame
+// more (3.27 vs 4.45ms) for nothing, since the frontend and the core never
+// run at the same time. The price is putting the frontend's state back after
+// the core has run, ~25 calls, measured at 2.6us.
+//
+// Nothing here runs, or even exists on the GPU, unless a core launched with
+// --gl asks for it: no FBO, no extra texture, no extra state work.
+
+static void set_filter(GLuint tex, GLint filter) {
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+}
+
+unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_left) {
+	const char* exts = (const char*)glGetString(GL_EXTENSIONS);
+	if (!exts) exts = "";
+
+	GLint max_tex = 0, max_rb = 0;
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+	glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_rb);
+	if (width<=0 || height<=0) {
+		width = FIXED_WIDTH;
+		height = FIXED_HEIGHT;
+	}
+	// non-power-of-two is fine here, so exactly what the core says it needs
+	hw.w = MIN(width,  MIN(max_tex, max_rb));
+	hw.h = MIN(height, MIN(max_tex, max_rb));
+
+	glGenTextures(1, &hw.tex);
+	glBindTexture(GL_TEXTURE_2D, hw.tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, vid.game_filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, vid.game_filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	// RGBA8 rather than 565: cores can rely on destination alpha
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw.w, hw.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+	// GLES2 has no GL_DEPTH_STENCIL_ATTACHMENT: one packed D24S8 buffer goes
+	// to both attachment points. Depth alone gets 24 bits too, for the sake of
+	// 3D cores' z-fighting; every combination was checked complete here.
+	int packed = strstr(exts, "GL_OES_packed_depth_stencil") != NULL;
+	int depth24 = strstr(exts, "GL_OES_depth24") != NULL;
+	if (stencil && !packed) {
+		printf("hw: no packed depth/stencil, the core gets no stencil\n");
+		stencil = 0;
+		depth = 1;
+	}
+	GLenum depth_format = 0;
+	if (stencil) depth_format = GL_DEPTH24_STENCIL8_OES;
+	else if (depth) depth_format = depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16;
+	if (depth_format) {
+		glGenRenderbuffers(1, &hw.depth);
+		glBindRenderbuffer(GL_RENDERBUFFER, hw.depth);
+		glRenderbufferStorage(GL_RENDERBUFFER, depth_format, hw.w, hw.h);
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	}
+
+	glGenFramebuffers(1, &hw.fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, hw.fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hw.tex, 0);
+	if (hw.depth) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, hw.depth);
+	if (stencil)  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, hw.depth);
+
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status!=GL_FRAMEBUFFER_COMPLETE) {
+		printf("hw: %ix%i framebuffer incomplete (0x%x)\n", hw.w, hw.h, status);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glDeleteFramebuffers(1, &hw.fbo);
+		if (hw.depth) glDeleteRenderbuffers(1, &hw.depth);
+		glDeleteTextures(1, &hw.tex);
+		memset(&hw, 0, sizeof(hw));
+		return 0;
+	}
+
+	// so a repeat before the core's first frame shows black, not garbage
+	glViewport(0, 0, hw.w, hw.h);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &hw.max_attribs);
+	// eglGetProcAddress only resolves extensions on this driver, which is
+	// what this is; SDL's falls back to the library for core functions too
+	if (strstr(exts, "GL_OES_vertex_array_object"))
+		hw.bind_vao = (PFNGLBINDVERTEXARRAYOESPROC)SDL_GL_GetProcAddress("glBindVertexArrayOES");
+
+	hw.bottom_left = bottom_left;
+	hw.sw_tex = vid.game_tex;
+	PLAT_hwPresent(1);
+	PLAT_hwRestoreState();
+
+	printf("hw: fbo %u %ix%i RGBA8 + %s, %i vertex attribs, vao %s\n", hw.fbo, hw.w, hw.h,
+	       depth_format==GL_DEPTH24_STENCIL8_OES ? "D24S8" :
+	       depth_format==GL_DEPTH_COMPONENT24_OES ? "D24" :
+	       depth_format ? "D16" : "no depth",
+	       hw.max_attribs, hw.bind_vao ? "yes" : "no");
+	return hw.fbo;
+}
+
+void PLAT_hwQuit(void) {
+	if (!hw.fbo) return;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glDeleteFramebuffers(1, &hw.fbo);
+	if (hw.depth) glDeleteRenderbuffers(1, &hw.depth);
+	// The one that is the game layer stays it, so the fade out on quit still
+	// has the last frame; PLAT_quitVideo deletes it with the rest.
+	if (vid.game_tex==hw.tex) glDeleteTextures(1, &hw.sw_tex);
+	else glDeleteTextures(1, &hw.tex);
+	memset(&hw, 0, sizeof(hw));
+}
+
+// Everything the compositor relies on, from PLAT_initVideo and PLAT_flip.
+// The libretro contract lets the frontend change any of it between frames,
+// so cores have to cope with the reverse; glsm-based ones rebind it all.
+void PLAT_hwRestoreState(void) {
+	// first: with a core's VAO bound, the buffer and attrib calls below would
+	// rewrite that VAO rather than restore ours
+	if (hw.bind_vao) hw.bind_vao(0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
+	glUseProgram(vid.program);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vid.ibo);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	// an array left enabled would be read by our draws too, possibly from a
+	// client pointer that's long gone
+	for (int i=2; i<hw.max_attribs; i++) glDisableVertexAttribArray(i);
+	glActiveTexture(GL_TEXTURE0);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_POLYGON_OFFSET_FILL);
+	glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+	glDisable(GL_SAMPLE_COVERAGE);
+	glEnable(GL_DITHER);
+	glDisable(GL_BLEND);
+	glBlendEquation(GL_FUNC_ADD);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+}
+
+// Which texture is the game layer: the FBO's, or the software one a HW core
+// can still fall back to for a frame. The caller re-selects the scaler.
+void PLAT_hwPresent(int hw_frame) {
+	if (hw_frame==hw.presenting) return;
+	hw.presenting = hw_frame;
+	vid.game_tex = hw_frame ? hw.tex : hw.sw_tex;
+	// the filter may have been changed while the other one was in place
+	set_filter(vid.game_tex, vid.game_filter);
+	gles_blit.dirty = 1;         // the VBO holds the other texture's rect
+	gles_blit.last_stride_w = 0; // and the software texture may never have held this size
+}
+
+// The last hardware frame (true_w x true_h of the FBO) as an RGB565 surface
+// of that same size, for the menu backdrop and the save state thumbnail -
+// both are written against a software frame's pixels.
+//
+// glReadPixels is the slow part on this driver, ~0.55us a pixel whatever
+// the format (RGBA8 is the only one it doesn't make worse), so the frame is
+// shrunk on the GPU first to at most 320x240 by an integer factor, which the
+// linear filter turns into a box average, then read and scaled back up. A
+// 640x480 frame costs ~40ms, once, when the menu opens or a state is saved.
+#define CAPTURE_MAX_PIXELS (320 * 240)
+
+SDL_Surface* PLAT_hwCapture(int w, int h) {
+	if (!hw.fbo || w<=0 || h<=0) return NULL;
+	PLAT_hwRestoreState(); // our program, buffers and attribs, whoever drew last
+	w = MIN(w, hw.w);
+	h = MIN(h, hw.h);
+
+	int d = 1;
+	while ((w / d) * (h / d) > CAPTURE_MAX_PIXELS) d++;
+	int cw = MAX(w / d, 1);
+	int ch = MAX(h / d, 1);
+
+	SDL_Surface* out = SDL_CreateRGBSurface(SDL_SWSURFACE, w, h, 16, MASK_RGB565);
+	uint8_t* px = malloc((size_t)cw * ch * 4);
+	GLuint tex = 0, fbo = 0, vbo = 0;
+	if (!out || !px) goto done;
+
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) {
+		SDL_FreeSurface(out);
+		out = NULL;
+		goto done;
+	}
+
+	// The whole frame over the whole viewport, drawn upside down: glReadPixels
+	// returns the bottom row first, so this way the image comes back top first.
+	float tw = hw.w, th = hw.h;
+	float v_image_top    = hw.bottom_left ? h / th : 0.0f;
+	float v_image_bottom = hw.bottom_left ? 0.0f : h / th;
+	glGenBuffers(1, &vbo);
+	upload_quad_vbo_rect(vbo, 0, 0, FIXED_WIDTH, FIXED_HEIGHT,
+	                     0.0f, v_image_bottom, w / tw, v_image_top);
+	glViewport(0, 0, cw, ch);
+	glDisable(GL_BLEND);
+	set_filter(hw.tex, d>1 ? GL_LINEAR : GL_NEAREST);
+	draw_cached_quad(vbo, hw.tex);
+	set_filter(hw.tex, vid.game_filter);
+
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	glReadPixels(0, 0, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+	// back up to the frame's own size, nearest neighbour
+	for (int y=0; y<h; y++) {
+		const uint8_t* src = px + (size_t)(y * ch / h) * cw * 4;
+		uint16_t* dst = (uint16_t*)((uint8_t*)out->pixels + (size_t)y * out->pitch);
+		for (int x=0; x<w; x++) {
+			const uint8_t* p = src + (x * cw / w) * 4;
+			dst[x] = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
+		}
+	}
+
+done:
+	if (vbo) glDeleteBuffers(1, &vbo);
+	if (fbo) glDeleteFramebuffers(1, &fbo);
+	if (tex) glDeleteTextures(1, &tex);
+	free(px);
+	PLAT_hwRestoreState();
+	return out;
 }
 
 // -------------------------------------------------------------------------
