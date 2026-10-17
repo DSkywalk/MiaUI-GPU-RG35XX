@@ -2762,11 +2762,14 @@ static void (*set_audio_sample_batch_callback)(retro_audio_sample_batch_t);
 static void (*set_input_poll_callback)(retro_input_poll_t);
 static void (*set_input_state_callback)(retro_input_state_t);
 
-void Core_open(const char* core_path, const char* tag_name) {
+int Core_open(const char* core_path, const char* tag_name) {
     LOG_info("Core_open\n");
     core.handle = dlopen(core_path, RTLD_LAZY);
     
-    if (!core.handle) LOG_error("%s\n", dlerror());
+    if (!core.handle) {
+        LOG_error("Core_open: can't load %s: %s\n", core_path, dlerror());
+        return 0;
+    }
     
     core.init = dlsym(core.handle, "retro_init");
     core.deinit = dlsym(core.handle, "retro_deinit");
@@ -2792,6 +2795,17 @@ void Core_open(const char* core_path, const char* tag_name) {
     set_audio_sample_batch_callback = dlsym(core.handle, "retro_set_audio_sample_batch");
     set_input_poll_callback = dlsym(core.handle, "retro_set_input_poll");
     set_input_state_callback = dlsym(core.handle, "retro_set_input_state");
+
+    if (!core.init || !core.deinit || !core.get_system_info || !core.get_system_av_info ||
+        !core.set_controller_port_device || !core.reset || !core.run || !core.load_game ||
+        !core.unload_game || !set_environment_callback || !set_video_refresh_callback ||
+        !set_audio_sample_callback || !set_audio_sample_batch_callback ||
+        !set_input_poll_callback || !set_input_state_callback) {
+        LOG_error("Core_open: %s is not a libretro core (missing entry points)\n", core_path);
+        dlclose(core.handle);
+        core.handle = NULL;
+        return 0;
+    }
     
     struct retro_system_info info = {};
     core.get_system_info(&info);
@@ -2822,6 +2836,7 @@ void Core_open(const char* core_path, const char* tag_name) {
     // the only one that has to happen before retro_init(); the rest wait for
     // Core_init(), see the note above
     set_environment_callback(environment_callback);
+    return 1;
 }
 void Core_init(void) {
     LOG_info("Core_init\n");
@@ -5497,7 +5512,7 @@ int main(int argc , char* argv[]) {
         GFX_initGameOverlay((const char*) ovlpath);
     }
 
-    Core_open(core_path, tag_name);
+    if (!Core_open(core_path, tag_name)) goto finish;
     Game_open(rom_path);
     if (!game.is_open) goto finish;
 
