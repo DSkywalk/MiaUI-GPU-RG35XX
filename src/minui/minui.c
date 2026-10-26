@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <math.h>
 
 #include "defines.h"
 #include "api.h"
@@ -21,268 +22,335 @@ static SDL_Surface *screen = NULL; // Must be assigned externally
 static int show_game_art = 1;
 static int thumbnail_radius = 8;
 
-// Threading globals
+///////////////////////////////////////
+// Game art: folder backgrounds and thumbnails
+//
+// A worker thread decodes the PNGs into RGBA surfaces; the main thread turns
+// them into textures (GL is main thread only) and keeps the most recent ones
+// in art_cache, so going back to something already seen doesn't decode it
+// again. When art is asked for is unchanged: only after the selection has
+// rested for 1.5s (200ms at the root), so scrolling stays plain text.
+
 static pthread_t thumb_thread;
 static pthread_mutex_t thumb_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t thumb_cond = PTHREAD_COND_INITIALIZER;
 
-static char request_thumb_path[1024] = {0};
-static char request_bg_path[1024] = {0};
-static char old_thumb_path[1024] = {0};
-static char old_bg_path[1024] = {0};
+// main -> worker ("" = nothing of that kind to load)
+static char request_thumb_path[MAX_PATH] = {0};
+static char request_bg_path[MAX_PATH] = {0};
 static int request_pending = 0;
 static int thread_running = 1;
 
+// worker -> main: each result comes with the path it was loaded from, NULL
+// surface = no such image
 static SDL_Surface *result_thumb = NULL;
 static SDL_Surface *result_bg = NULL;
-static int result_ready = 0;
-static int result_bg_updated = 0;
+static char result_thumb_path[MAX_PATH] = {0};
+static char result_bg_path[MAX_PATH] = {0};
+static int result_thumb_ready = 0;
+static int result_bg_ready = 0;
 
-static uint32_t selection_start_time = 0;
-
-static void GFX_ApplyRoundedCorners_ABGR4444(SDL_Surface *surface, SDL_Rect *rect, int radius)
+// Antialiased rounded corners: alpha scaled by how much of each corner
+// pixel lies inside the circle (sampled at its centre, +-0.5px ramp).
+static void GFX_applyRoundedCorners(SDL_Surface *surface, int radius)
 {
-    if (!surface || surface->format->format != SDL_PIXELFORMAT_ABGR4444)
+    if (!surface || surface->format->BytesPerPixel != 4 || radius <= 0)
         return;
+    if (radius * 2 > surface->w) radius = surface->w / 2;
+    if (radius * 2 > surface->h) radius = surface->h / 2;
 
-    Uint16 *pixels = (Uint16 *)surface->pixels;
-    int pitch = surface->pitch / 2;
-    SDL_Rect target = {0, 0, surface->w, surface->h};
-    if (rect)
-        target = *rect;
+    uint32_t ashift = surface->format->Ashift;
+    uint32_t amask = surface->format->Amask;
+    for (int y = 0; y < radius; y++)
+    {
+        for (int x = 0; x < radius; x++)
+        {
+            float dx = radius - (x + 0.5f);
+            float dy = radius - (y + 0.5f);
+            float coverage = radius + 0.5f - sqrtf(dx * dx + dy * dy);
+            if (coverage >= 1.0f)
+                continue;
+            if (coverage < 0.0f)
+                coverage = 0.0f;
 
-    Uint16 transparent_black = 0x0000;
-    int r2 = radius * radius;
-
-    const int xBeg = target.x;
-    const int xEnd = target.x + target.w;
-    const int yBeg = target.y;
-    const int yEnd = target.y + target.h;
-
-    // Top-Left
-    for (int y = yBeg; y < yBeg + radius; ++y)
-    {
-        for (int x = xBeg; x < xBeg + radius; ++x)
-        {
-            int dx = xBeg + radius - x;
-            int dy = yBeg + radius - y;
-            if (dx * dx + dy * dy > r2)
-                pixels[y * pitch + x] = transparent_black;
-        }
-    }
-    // Top-Right
-    for (int y = yBeg; y < yBeg + radius; ++y)
-    {
-        for (int x = xEnd - radius; x < xEnd; ++x)
-        {
-            int dx = x - (xEnd - radius - 1);
-            int dy = yBeg + radius - y;
-            if (dx * dx + dy * dy > r2)
-                pixels[y * pitch + x] = transparent_black;
-        }
-    }
-    // Bottom-Left
-    for (int y = yEnd - radius; y < yEnd; ++y)
-    {
-        for (int x = xBeg; x < xBeg + radius; ++x)
-        {
-            int dx = xBeg + radius - x;
-            int dy = y - (yEnd - radius - 1);
-            if (dx * dx + dy * dy > r2)
-                pixels[y * pitch + x] = transparent_black;
-        }
-    }
-    // Bottom-Right
-    for (int y = yEnd - radius; y < yEnd; ++y)
-    {
-        for (int x = xEnd - radius; x < xEnd; ++x)
-        {
-            int dx = x - (xEnd - radius - 1);
-            int dy = y - (yEnd - radius - 1);
-            if (dx * dx + dy * dy > r2)
-                pixels[y * pitch + x] = transparent_black;
+            // the same offset into each of the four corners
+            int xs[2] = {x, surface->w - 1 - x};
+            int ys[2] = {y, surface->h - 1 - y};
+            for (int i = 0; i < 4; i++)
+            {
+                uint32_t *p = (uint32_t *)((uint8_t *)surface->pixels + ys[i >> 1] * surface->pitch) + xs[i & 1];
+                uint32_t a = (uint32_t)(((*p & amask) >> ashift) * coverage);
+                *p = (*p & ~amask) | (a << ashift);
+            }
         }
     }
 }
 
-static inline SDL_Rect GFX_scaledRectAspectFill(SDL_Rect src, SDL_Rect dst)
+// The visible part of src when it is scaled to cover dst, cropping whichever
+// way the aspect ratios disagree.
+static SDL_Rect GFX_aspectFillRect(int src_w, int src_h, int dst_w, int dst_h)
 {
-    SDL_Rect scaled_rect;
-
-    // Calculate the aspect ratios
-    float image_aspect = (float)src.w / (float)src.h;
-    float preview_aspect = (float)dst.w / (float)dst.h;
-
-    // Determine scaling factor
+    float image_aspect = (float)src_w / (float)src_h;
+    float preview_aspect = (float)dst_w / (float)dst_h;
+    SDL_Rect r;
     if (preview_aspect > image_aspect)
     {
-        scaled_rect.w = src.w;
-        scaled_rect.h = (int)(src.w / preview_aspect + 0.5f);
+        r.w = src_w;
+        r.h = (int)(src_w / preview_aspect + 0.5f);
     }
     else
     {
-        scaled_rect.w = (int)(src.h * preview_aspect + 0.5f);
-        scaled_rect.h = src.h;
+        r.w = (int)(src_h * preview_aspect + 0.5f);
+        r.h = src_h;
     }
-
-    // Calculate the coordinates of the visible part of the input image
-    int offsetX = abs(scaled_rect.w - src.w) / 2;
-    int offsetY = abs(scaled_rect.h - src.h) / 2;
-
-    scaled_rect.x = offsetX;
-    scaled_rect.y = offsetY;
-
-    return scaled_rect;
+    r.x = abs(r.w - src_w) / 2;
+    r.y = abs(r.h - src_h) / 2;
+    return r;
 }
 
-static SDL_Rect GFX_blitScaleToFill(SDL_Surface *src, SDL_Surface *dst)
+// Same-format 32-bit stretch, bilinear (much better than SDL_BlitScaled's
+// nearest for downscaled box art), nearest if SDL won't do it.
+static void GFX_stretch32(SDL_Surface *src, SDL_Rect *src_rect, SDL_Surface *dst)
 {
-    if (!src || !dst)
+    if (SDL_SoftStretchLinear(src, src_rect, dst, NULL) < 0)
     {
-        SDL_Rect none = {0, 0};
-        return none;
+        SDL_SetSurfaceBlendMode(src, SDL_BLENDMODE_NONE);
+        SDL_BlitScaled(src, src_rect, dst, NULL);
+    }
+}
+
+static SDL_Surface *loadBackground(const char *path)
+{
+    SDL_Surface *raw = IMG_Load(path);
+    if (!raw)
+        return NULL;
+    SDL_Surface *rgba = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_ABGR8888, 0);
+    SDL_FreeSurface(raw);
+    if (!rgba)
+        return NULL;
+
+    SDL_Surface *bg = rgba;
+    if (rgba->w != FIXED_WIDTH || rgba->h != FIXED_HEIGHT)
+    {
+        bg = SDL_CreateRGBSurfaceWithFormat(0, FIXED_WIDTH, FIXED_HEIGHT, 32, SDL_PIXELFORMAT_ABGR8888);
+        if (bg)
+        {
+            SDL_Rect crop = GFX_aspectFillRect(rgba->w, rgba->h, FIXED_WIDTH, FIXED_HEIGHT);
+            GFX_stretch32(rgba, &crop, bg);
+        }
+        SDL_FreeSurface(rgba);
+        if (!bg)
+            return NULL;
     }
 
-    SDL_Rect src_rect = {0, 0, src->w, src->h};
-    SDL_Rect dst_rect = {0, 0, dst->w, dst->h};
-    SDL_Rect scaled_rect = GFX_scaledRectAspectFill(src_rect, dst_rect);
-    SDL_BlitScaled(src, &scaled_rect, dst, NULL);
+    // a background is opaque, as it was when it was converted to RGB565
+    uint32_t amask = bg->format->Amask;
+    for (int y = 0; y < bg->h; y++)
+    {
+        uint32_t *row = (uint32_t *)((uint8_t *)bg->pixels + y * bg->pitch);
+        for (int x = 0; x < bg->w; x++)
+            row[x] |= amask;
+    }
+    return bg;
+}
 
-    return dst_rect;
+static SDL_Surface *loadThumbnail(const char *path)
+{
+    SDL_Surface *raw = IMG_Load(path);
+    if (!raw)
+        return NULL;
+    SDL_Surface *rgba = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_ABGR8888, 0);
+    SDL_FreeSurface(raw);
+    if (!rgba)
+        return NULL;
+
+    double aspect_ratio = (double)rgba->h / rgba->w;
+    int max_w = (int)(screen->w * 0.45);
+    int max_h = (int)(screen->h * 0.6);
+    int new_w = max_w;
+    int new_h = (int)(new_w * aspect_ratio);
+    if (new_h > max_h)
+    {
+        new_h = max_h;
+        new_w = (int)(new_h / aspect_ratio);
+    }
+
+    SDL_Surface *thumb = NULL;
+    if (new_w > 0 && new_h > 0)
+        thumb = SDL_CreateRGBSurfaceWithFormat(0, new_w, new_h, 32, SDL_PIXELFORMAT_ABGR8888);
+    if (thumb)
+    {
+        GFX_stretch32(rgba, NULL, thumb);
+        GFX_applyRoundedCorners(thumb, SCALE1(thumbnail_radius));
+    }
+    SDL_FreeSurface(rgba);
+    return thumb;
 }
 
 static void *ThumbnailLoaderThread(void *arg)
 {
-    char current_thumb_path[1024];
-    char current_bg_path[1024];
-    char last_bg_path[1024] = "";
+    char current_thumb_path[MAX_PATH];
+    char current_bg_path[MAX_PATH];
 
-    while (thread_running)
+    while (1)
     {
         pthread_mutex_lock(&thumb_mutex);
         while (!request_pending && thread_running)
-        {
             pthread_cond_wait(&thumb_cond, &thumb_mutex);
-        }
-
         if (!thread_running)
         {
             pthread_mutex_unlock(&thumb_mutex);
             break;
         }
-
-        strncpy(current_thumb_path, request_thumb_path, sizeof(current_thumb_path) - 1);
-        current_thumb_path[sizeof(current_thumb_path) - 1] = '\0';
-
-        strncpy(current_bg_path, request_bg_path, sizeof(current_bg_path) - 1);
-        current_bg_path[sizeof(current_bg_path) - 1] = '\0';
-
+        strcpy(current_thumb_path, request_thumb_path);
+        strcpy(current_bg_path, request_bg_path);
         request_pending = 0;
-
         pthread_mutex_unlock(&thumb_mutex);
 
-        // --- Load BG ---
-        SDL_Surface *next_bg = NULL;
-        // Only try to load if path is not empty
-        if (strlen(current_bg_path) > 0)
+        // each finished image is handed over at once, even if a newer
+        // request has come in meanwhile: the main thread caches it either way
+        if (current_bg_path[0])
         {
-            SDL_Surface *raw_bg = IMG_Load(current_bg_path);
-            if (raw_bg)
-            {
-                SDL_Surface *optimized = SDL_ConvertSurfaceFormat(raw_bg, SDL_PIXELFORMAT_RGB565, 0);
-                SDL_FreeSurface(raw_bg);
-
-                if (optimized)
-                {
-                    if (optimized->w == FIXED_WIDTH && optimized->h == FIXED_HEIGHT)
-                    {
-                        next_bg = optimized;
-                    }
-                    else
-                    {
-                        next_bg = SDL_CreateRGBSurfaceWithFormat(0, FIXED_WIDTH, FIXED_HEIGHT, 32, SDL_PIXELFORMAT_RGB565);
-                        GFX_blitScaleToFill(optimized, next_bg);
-                        SDL_FreeSurface(optimized);
-                    }
-                }
-            }
-        }
-
-        // Check pending before heavy thumbnail load
-        pthread_mutex_lock(&thumb_mutex);
-        int pending = request_pending;
-        pthread_mutex_unlock(&thumb_mutex);
-
-        if (pending)
-        {
-            if (next_bg)
-                SDL_FreeSurface(next_bg);
-            continue; // Loop back to handle new request
-        }
-
-        // --- Load Thumb ---
-        SDL_Surface *next_thumb = NULL;
-        if (strlen(current_thumb_path) > 0)
-        {
-            SDL_Surface *raw = IMG_Load(current_thumb_path);
-            if (raw)
-            {
-                SDL_Surface *optimized = (raw->format->format == SDL_PIXELFORMAT_ABGR4444) ? raw : SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_ABGR4444, 0);
-                if (raw != optimized)
-                    SDL_FreeSurface(raw);
-
-                if (optimized)
-                {
-                    int img_w = optimized->w;
-                    int img_h = optimized->h;
-                    double aspect_ratio = (double)img_h / img_w;
-
-                    int max_w = (int)(screen->w * 0.45);
-                    int max_h = (int)(screen->h * 0.6);
-
-                    int new_w = max_w;
-                    int new_h = (int)(new_w * aspect_ratio);
-
-                    if (new_h > max_h)
-                    {
-                        new_h = max_h;
-                        new_w = (int)(new_h / aspect_ratio);
-                    }
-
-                    SDL_Rect scale_rect = {0, 0, new_w, new_h};
-                    next_thumb = SDL_CreateRGBSurfaceWithFormat(0, scale_rect.w, scale_rect.h, 16, SDL_PIXELFORMAT_ABGR4444);
-                    SDL_BlitScaled(optimized, NULL, next_thumb, &scale_rect);
-                    GFX_ApplyRoundedCorners_ABGR4444(next_thumb, &(SDL_Rect){0, 0, next_thumb->w, next_thumb->h}, SCALE1(thumbnail_radius));
-                    SDL_FreeSurface(optimized);
-                }
-            }
-        }
-
-        pthread_mutex_lock(&thumb_mutex);
-        if (request_pending)
-        {
-            // Abort, new request came in
-            if (next_thumb)
-                SDL_FreeSurface(next_thumb);
-            if (next_bg)
-                SDL_FreeSurface(next_bg);
-        }
-        else
-        {
-            // Update results
-            if (result_thumb)
-                SDL_FreeSurface(result_thumb);
-            result_thumb = next_thumb;
-
+            SDL_Surface *bg = loadBackground(current_bg_path);
+            pthread_mutex_lock(&thumb_mutex);
             if (result_bg)
                 SDL_FreeSurface(result_bg);
-            result_bg = next_bg;
-
-            result_ready = 1;
+            result_bg = bg;
+            strcpy(result_bg_path, current_bg_path);
+            result_bg_ready = 1;
+            int superseded = request_pending;
+            pthread_mutex_unlock(&thumb_mutex);
+            if (superseded)
+                continue;
         }
-        pthread_mutex_unlock(&thumb_mutex);
+
+        if (current_thumb_path[0])
+        {
+            SDL_Surface *thumb = loadThumbnail(current_thumb_path);
+            pthread_mutex_lock(&thumb_mutex);
+            if (result_thumb)
+                SDL_FreeSurface(result_thumb);
+            result_thumb = thumb;
+            strcpy(result_thumb_path, current_thumb_path);
+            result_thumb_ready = 1;
+            pthread_mutex_unlock(&thumb_mutex);
+        }
     }
     return NULL;
+}
+
+// Main thread side: textures, most recently used kept within ART_CACHE_BYTES.
+// A path that has no image is remembered too (tex 0), so it isn't asked for
+// again. Slots never move, so a shown entry can be pointed at; shown ones
+// are never evicted.
+#define ART_CACHE_SLOTS 32
+#define ART_CACHE_BYTES (6 * 1024 * 1024) // a thumbnail is ~0.24MB, a background 1.2MB
+
+typedef struct Art
+{
+    char path[MAX_PATH]; // "" = free slot
+    GFX_Image image;     // tex 0 = there is no such image
+    uint32_t used;
+} Art;
+
+static Art art_cache[ART_CACHE_SLOTS];
+static size_t art_bytes = 0;
+static uint32_t art_clock = 0;
+static Art *shown_bg = NULL;
+static Art *shown_thumb = NULL;
+
+static Art *Art_find(const char *path)
+{
+    for (int i = 0; i < ART_CACHE_SLOTS; i++)
+    {
+        if (art_cache[i].path[0] && !strcmp(art_cache[i].path, path))
+        {
+            art_cache[i].used = ++art_clock;
+            return &art_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void Art_evict(Art *art)
+{
+    art_bytes -= (size_t)art->image.w * art->image.h * 4;
+    GFX_freeImage(&art->image);
+    memset(art, 0, sizeof(*art));
+}
+
+// takes ownership of surface (which may be NULL)
+static Art *Art_add(const char *path, SDL_Surface *surface)
+{
+    Art *art = Art_find(path);
+    if (art) // already there (asked for twice before the first arrived)
+    {
+        if (surface)
+            SDL_FreeSurface(surface);
+        return art;
+    }
+
+    size_t bytes = surface ? (size_t)surface->w * surface->h * 4 : 0;
+    for (;;)
+    {
+        Art *lru = NULL;
+        Art *free_slot = NULL;
+        for (int i = 0; i < ART_CACHE_SLOTS; i++)
+        {
+            Art *a = &art_cache[i];
+            if (!a->path[0])
+            {
+                if (!free_slot)
+                    free_slot = a;
+                continue;
+            }
+            if (a == shown_bg || a == shown_thumb)
+                continue;
+            if (!lru || a->used < lru->used)
+                lru = a;
+        }
+        if (free_slot && art_bytes + bytes <= ART_CACHE_BYTES)
+        {
+            art = free_slot;
+            break;
+        }
+        if (!lru) // everything left is on screen: go over budget rather than fail
+        {
+            art = free_slot;
+            break;
+        }
+        Art_evict(lru);
+    }
+    if (!art)
+    {
+        if (surface)
+            SDL_FreeSurface(surface);
+        return NULL;
+    }
+
+    snprintf(art->path, sizeof(art->path), "%s", path);
+    art->image = GFX_loadImage(surface);
+    art->used = ++art_clock;
+    art_bytes += (size_t)art->image.w * art->image.h * 4;
+    if (surface)
+        SDL_FreeSurface(surface);
+    return art;
+}
+
+static void Art_quit(void)
+{
+    shown_bg = shown_thumb = NULL;
+    for (int i = 0; i < ART_CACHE_SLOTS; i++)
+    {
+        if (art_cache[i].path[0])
+            Art_evict(&art_cache[i]);
+    }
+}
+
+static void Art_draw(Art *art, int x, int y)
+{
+    if (art)
+        GFX_blitImage(&art->image, NULL, screen, &(SDL_Rect){x, y});
 }
 
 ///////////////////////////////////////
@@ -405,6 +473,40 @@ enum EntryType
     ENTRY_PAK,
     ENTRY_ROM,
 };
+// A string as GFX_truncateText last fitted it to a width, so a redraw
+// doesn't measure it again (it measures once per character it cuts).
+typedef struct Fit
+{
+    char *src;  // what was fitted (a copy: names can be rebuilt, see Directory_index)
+    char *text; // the result
+    int max;    // the width it was fitted to
+    int width;  // GFX_truncateText's return
+} Fit;
+
+static void Fit_free(Fit *fit)
+{
+    free(fit->src);
+    free(fit->text);
+    fit->src = fit->text = NULL;
+}
+
+static const char *fitText(Fit *fit, const char *src, int max_width, int *width)
+{
+    if (!fit->text || fit->max != max_width || strcmp(fit->src, src))
+    {
+        char out[256];
+        int w = GFX_truncateText(font.large, src, out, max_width, SCALE1(BUTTON_PADDING * 2));
+        Fit_free(fit);
+        fit->src = strdup(src);
+        fit->text = strdup(out);
+        fit->max = max_width;
+        fit->width = w;
+    }
+    if (width)
+        *width = fit->width;
+    return fit->text;
+}
+
 typedef struct Entry
 {
     char *path;
@@ -415,6 +517,9 @@ typedef struct Entry
     int needs_swap;  // if need swap
     int is_darker; // user darker
     int mame_index; // mame romname index
+    Fit fit_main;   // unique, or else name: the row as drawn when selected
+    Fit fit_unique; // unique, sorting prefix trimmed (unselected rows)
+    Fit fit_name;   // name, drawn over the unique one (unselected rows)
 } Entry;
 
 /**
@@ -430,7 +535,7 @@ static Entry *Entry_new(char *path, int type)
     char display_name[256];
     int mame_index = getDisplayName(path, display_name);
     
-    Entry *self = malloc(sizeof(Entry));
+    Entry *self = calloc(1, sizeof(Entry));
     self->path = strdup(path);
     self->name = strdup(display_name);
     self->unique = NULL;
@@ -450,6 +555,9 @@ static void Entry_free(Entry *self)
     free(self->name);
     if (self->unique)
         free(self->unique);
+    Fit_free(&self->fit_main);
+    Fit_free(&self->fit_unique);
+    Fit_free(&self->fit_name);
     free(self);
 }
 
@@ -711,10 +819,7 @@ static int deleteCurrentEntry(Directory *dir, int index)
     snprintf(msg, sizeof(msg), "Deleted: %s", entry->name);
 
     // 2. Free the memory allocated for this specific entry
-    if (entry->path) free(entry->path);
-    if (entry->name) free(entry->name);
-    if (entry->unique) free(entry->unique);
-    free(entry);
+    Entry_free(entry);
 
     // 3. Shift the remaining entries in the array to fill the gap
     for (int i = index; i < dir->entries->count - 1; i++) {
@@ -726,11 +831,11 @@ static int deleteCurrentEntry(Directory *dir, int index)
     dir->alphas->count = 0;
     Directory_index(dir);
 
-    // Render the message directly to the screen
-    SDL_Surface *notif_txt = TTF_RenderUTF8_Blended(font.large, msg, COLOR_LIGHT_RED);
+    // Render the message over what is on screen
+    GFX_Text notif_txt = GFX_renderText(font.large, msg, COLOR_LIGHT_RED);
 
     // Use MinUI's exact scaling constants so the pill edges render without clipping
-    int pill_width = notif_txt->w + SCALE1(BUTTON_PADDING * 2);
+    int pill_width = notif_txt.w + SCALE1(BUTTON_PADDING * 2);
     int pill_height = SCALE1(PILL_SIZE);
     
     // Center the notification box on the screen
@@ -745,14 +850,10 @@ static int deleteCurrentEntry(Directory *dir, int index)
     GFX_blitPill(ASSET_DARK_GRAY_PILL, screen, &bg_rect);
     
     // Position the text accurately inside the pill
-    SDL_Rect txt_rect = { 
-        bg_rect.x + SCALE1(BUTTON_PADDING), 
-        bg_rect.y + SCALE1(4), // Standard MinUI vertical offset for pills
-        notif_txt->w, 
-        notif_txt->h 
-    };
-    SDL_BlitSurface(notif_txt, NULL, screen, &txt_rect);
-    SDL_FreeSurface(notif_txt);
+    GFX_blitRenderedText(&notif_txt, NULL, screen,
+                         bg_rect.x + SCALE1(BUTTON_PADDING),
+                         bg_rect.y + SCALE1(4)); // Standard MinUI vertical offset for pills
+    
     
     // Force the hardware to draw this frame immediately, then block the thread
     GFX_flip(screen);
@@ -1830,12 +1931,13 @@ int main(int argc, char *argv[])
     LOG_info("MinUI - MiaUI\n");
     InitSettings();
 
+    // the whole ui is drawn by the GPU: screen is only the handle the GFX_*
+    // helpers are given, nothing is drawn into its pixels
+    PLAT_setVideoFlags(PLAT_VIDEO_RGB888);
     screen = GFX_init(MODE_MAIN);
     PWR_init();
     if (!HAS_POWER_BUTTON && !simple_mode)
         PWR_disableSleep();
-
-    SDL_Surface *version = NULL;
 
     Menu_init();
 
@@ -1846,7 +1948,6 @@ int main(int argc, char *argv[])
     int lastScreen = SCREEN_OFF;
 
     PAD_reset();
-    GFX_clearLayers(LAYER_ALL);
     GFX_clear(screen);
 
     int dirty = 1;
@@ -1855,11 +1956,14 @@ int main(int argc, char *argv[])
     int show_setting = 0; // 1=brightness,2=volume
     int was_online = PLAT_isOnline();
 
-    // Added for thumbnail support
+    // game art for the selected entry: what it should show, and what has
+    // been asked for (from the cache or the loader) since it last changed
     int had_thumb = 0;
-    SDL_Surface *thumbbmp = NULL;
-    SDL_Surface *folderbgbmp = NULL;
     int ox = 0;
+    char wanted_bg_path[MAX_PATH] = {0};
+    char wanted_thumb_path[MAX_PATH] = {0};
+    char asked_bg_path[MAX_PATH] = {0};
+    char asked_thumb_path[MAX_PATH] = {0};
 
     uint32_t update_timer = SDL_GetTicks();
 
@@ -2100,56 +2204,88 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Check for ready thumbnail
-        pthread_mutex_lock(&thumb_mutex);
+        // Ask for the selected entry's art once the selection has rested:
+        // what is cached shows straight away, the rest goes to the loader
         int wait = stack->count == 1 ? 200 : 1500;
         if (now - update_timer >= wait)
         {
             update_timer = now;
-            if (strncmp(request_bg_path, old_bg_path, sizeof(request_bg_path)) != 0)
+            char load_bg[MAX_PATH] = {0};
+            char load_thumb[MAX_PATH] = {0};
+            if (strcmp(asked_bg_path, wanted_bg_path))
             {
-                strncpy(request_bg_path, old_bg_path, sizeof(request_bg_path) - 1);
-                request_bg_path[sizeof(request_bg_path) - 1] = '\0';
-
-                request_pending = 1;
-                pthread_cond_signal(&thumb_cond);
+                strcpy(asked_bg_path, wanted_bg_path);
+                if (wanted_bg_path[0])
+                {
+                    Art *art = Art_find(wanted_bg_path);
+                    if (art)
+                    {
+                        shown_bg = art;
+                        dirty |= art->image.tex != 0;
+                    }
+                    else
+                        strcpy(load_bg, wanted_bg_path);
+                }
             }
-
-            if (strncmp(request_thumb_path, old_thumb_path, sizeof(request_thumb_path)) != 0)
+            if (strcmp(asked_thumb_path, wanted_thumb_path))
             {
-                strncpy(request_thumb_path, old_thumb_path, sizeof(request_thumb_path) - 1);
-                request_thumb_path[sizeof(request_thumb_path) - 1] = '\0';
-
+                strcpy(asked_thumb_path, wanted_thumb_path);
+                if (wanted_thumb_path[0])
+                {
+                    Art *art = Art_find(wanted_thumb_path);
+                    if (art)
+                    {
+                        shown_thumb = art;
+                        dirty |= art->image.tex != 0;
+                    }
+                    else
+                        strcpy(load_thumb, wanted_thumb_path);
+                }
+            }
+            if (load_bg[0] || load_thumb[0])
+            {
+                pthread_mutex_lock(&thumb_mutex);
+                strcpy(request_bg_path, load_bg);
+                strcpy(request_thumb_path, load_thumb);
                 request_pending = 1;
                 pthread_cond_signal(&thumb_cond);
+                pthread_mutex_unlock(&thumb_mutex);
             }
         }
 
-        if (result_ready)
+        // Whatever the loader finished goes into the cache, and on screen if
+        // it is still what the selection asked for
+        if (result_bg_ready || result_thumb_ready)
         {
-            if (thumbbmp || result_thumb || folderbgbmp || result_bg)
-                dirty = 1; // Redraw on thumb/bg changes
-
-            // Update thumbnail
-            if (thumbbmp)
-                SDL_FreeSurface(thumbbmp);
-            thumbbmp = result_thumb;
-            result_thumb = NULL; // We took ownership
-
-            // Update bg
-            if (folderbgbmp)
-                SDL_FreeSurface(folderbgbmp);
-            folderbgbmp = result_bg;
-            result_bg = NULL; // We took ownership
-
-            result_ready = 0;
-            had_thumb = (thumbbmp != NULL);
+            pthread_mutex_lock(&thumb_mutex);
+            if (result_bg_ready)
+            {
+                Art *art = Art_add(result_bg_path, result_bg);
+                if (art && !strcmp(result_bg_path, asked_bg_path) && !strcmp(asked_bg_path, wanted_bg_path))
+                {
+                    shown_bg = art;
+                    dirty |= art->image.tex != 0;
+                }
+                result_bg = NULL; // the cache took it
+                result_bg_ready = 0;
+            }
+            if (result_thumb_ready)
+            {
+                Art *art = Art_add(result_thumb_path, result_thumb);
+                if (art && !strcmp(result_thumb_path, asked_thumb_path) && !strcmp(asked_thumb_path, wanted_thumb_path))
+                {
+                    shown_thumb = art;
+                    dirty |= art->image.tex != 0;
+                }
+                result_thumb = NULL;
+                result_thumb_ready = 0;
+            }
+            pthread_mutex_unlock(&thumb_mutex);
         }
-        pthread_mutex_unlock(&thumb_mutex);
+        had_thumb = shown_thumb && shown_thumb->image.tex;
 
         if (dirty)
         {
-            GFX_clearLayers(LAYER_ALL);
             GFX_clear(screen);
 
             if (total > 0)
@@ -2163,25 +2299,25 @@ int main(int argc, char *argv[])
                 if (res_name)
                     res_name++;
 
-                char path_copy[1024];
+                char path_copy[MAX_PATH];
                 strncpy(path_copy, entry->path, sizeof(path_copy) - 1);
                 path_copy[sizeof(path_copy) - 1] = '\0';
 
                 char *rompath = dirname(path_copy);
 
-                char bg_path[1024] = {0};
-                char thumbpath[1024] = {0};
+                char bg_path[MAX_PATH] = {0};
+                char thumbpath[MAX_PATH] = {0};
 
                 // folder-specific background
                 if (entry->type == ENTRY_DIR)
                 {
-                    snprintf(bg_path, sizeof(bg_path), "%s/.media/bg.png", (entry->type == ENTRY_DIR) ? tmp_path : rompath);
+                    snprintf(bg_path, sizeof(bg_path), "%s/.media/bg.png", tmp_path);
                 }
 
                 // Thumbnail logic
                 if ((entry->type == ENTRY_ROM)||(entry->type == ENTRY_DIR))
                 {
-                    char res_copy[1024];
+                    char res_copy[MAX_PATH];
                     if (res_name)
                     {
                         strncpy(res_copy, res_name, sizeof(res_copy) - 1);
@@ -2196,103 +2332,75 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                // check bg
-                if (strncmp(request_bg_path, bg_path, sizeof(request_bg_path)) != 0)
+                // A new selection hides the old art at once; its own is asked
+                // for when the selection has rested (see above), cached or not
+                if (strcmp(wanted_bg_path, bg_path))
                 {
-                    // unload!
-                    if (folderbgbmp)
-                    {
-                        SDL_FreeSurface(folderbgbmp);
-                        folderbgbmp = NULL;
-                    }
-
-                    strncpy(old_bg_path, bg_path, sizeof(old_bg_path) - 1);
-                    old_bg_path[sizeof(old_bg_path) - 1] = '\0';
+                    strcpy(wanted_bg_path, bg_path);
+                    asked_bg_path[0] = '\0';
+                    shown_bg = NULL;
                 }
-
-                // check thumb
-                if (strncmp(request_thumb_path, thumbpath, sizeof(request_thumb_path)) != 0)
+                if (strcmp(wanted_thumb_path, thumbpath))
                 {
-                    if (thumbbmp)
-                    {
-                        SDL_FreeSurface(thumbbmp);
-                        thumbbmp = NULL;
-                    }
+                    strcpy(wanted_thumb_path, thumbpath);
+                    asked_thumb_path[0] = '\0';
+                    shown_thumb = NULL;
                     had_thumb = 0;
-
-                    strncpy(old_thumb_path, thumbpath, sizeof(old_thumb_path) - 1);
-                    old_thumb_path[sizeof(old_thumb_path) - 1] = '\0';
                 }
             }
 
-            // int ox; // handled above or redefined? I initialized it at main scope.
-            // int oy; // --
+            // the folder background goes under everything, the battery and
+            // brightness pill included (it used to be drawn over them)
+            if (!show_version)
+                Art_draw(shown_bg, 0, 0);
+
             int ow = GFX_blitHardwareGroup(screen, show_setting);
 
             if (show_version)
             {
-                if (!version)
+                static char release[256];
+                static char *commit = NULL;
+                if (!commit)
                 {
-                    char release[256];
                     getFile(ROOT_SYSTEM_PATH "/version.txt", release, 256);
 
-                    char *tmp, *commit;
+                    char *tmp;
                     commit = strrchr(release, '\n');
                     commit[0] = '\0';
                     commit = strrchr(release, '\n') + 1;
                     tmp = strchr(release, '\n');
                     tmp[0] = '\0';
-
-                    // TODO: not sure if I want bare PLAT_* calls here
-                    char *extra_key = "Model";
-                    char *extra_val = PLAT_getModel();
-
-                    SDL_Surface *release_txt = TTF_RenderUTF8_Blended(font.large, "Release", COLOR_DARK_TEXT);
-                    SDL_Surface *version_txt = TTF_RenderUTF8_Blended(font.large, release, COLOR_WHITE);
-                    SDL_Surface *commit_txt = TTF_RenderUTF8_Blended(font.large, "Version", COLOR_DARK_TEXT);
-                    SDL_Surface *hash_txt = TTF_RenderUTF8_Blended(font.large, commit, COLOR_WHITE);
-
-                    SDL_Surface *key_txt = TTF_RenderUTF8_Blended(font.large, extra_key, COLOR_DARK_TEXT);
-                    SDL_Surface *val_txt = TTF_RenderUTF8_Blended(font.large, extra_val, COLOR_WHITE);
-
-                    int l_width = 0;
-                    int r_width = 0;
-
-                    if (release_txt->w > l_width)
-                        l_width = release_txt->w;
-                    if (commit_txt->w > l_width)
-                        l_width = commit_txt->w;
-                    if (key_txt->w > l_width)
-                        l_width = commit_txt->w;
-
-                    if (version_txt->w > r_width)
-                        r_width = version_txt->w;
-                    if (hash_txt->w > r_width)
-                        r_width = hash_txt->w;
-                    if (val_txt->w > r_width)
-                        r_width = val_txt->w;
-
-                    int x = l_width + SCALE1(8);
-                    int w = x + r_width;
-                    int h = SCALE1(VERSION_LINE_HEIGHT * 4);
-                    version = SDL_CreateRGBSurface(0, w, h, 16, 0, 0, 0, 0);
-
-                    SDL_BlitSurface(release_txt, NULL, version, &(SDL_Rect){0, 0});
-                    SDL_BlitSurface(version_txt, NULL, version, &(SDL_Rect){x, 0});
-                    SDL_BlitSurface(commit_txt, NULL, version, &(SDL_Rect){0, SCALE1(VERSION_LINE_HEIGHT)});
-                    SDL_BlitSurface(hash_txt, NULL, version, &(SDL_Rect){x, SCALE1(VERSION_LINE_HEIGHT)});
-
-                    SDL_BlitSurface(key_txt, NULL, version, &(SDL_Rect){0, SCALE1(VERSION_LINE_HEIGHT * 3)});
-                    SDL_BlitSurface(val_txt, NULL, version, &(SDL_Rect){x, SCALE1(VERSION_LINE_HEIGHT * 3)});
-
-                    SDL_FreeSurface(release_txt);
-                    SDL_FreeSurface(version_txt);
-                    SDL_FreeSurface(commit_txt);
-                    SDL_FreeSurface(hash_txt);
-                    SDL_FreeSurface(key_txt);
-                    SDL_FreeSurface(val_txt);
                 }
-                SDL_BlitSurface(version, NULL, screen, &(SDL_Rect){(screen->w - version->w) / 2, (screen->h - version->h) / 2});
+
+                // TODO: not sure if I want bare PLAT_* calls here
+                char *extra_key = "Model";
+                char *extra_val = PLAT_getModel();
+
+                GFX_Text release_txt = GFX_renderText(font.large, "Release", COLOR_DARK_TEXT);
+                GFX_Text version_txt = GFX_renderText(font.large, release, COLOR_WHITE);
+                GFX_Text commit_txt = GFX_renderText(font.large, "Version", COLOR_DARK_TEXT);
+                GFX_Text hash_txt = GFX_renderText(font.large, commit, COLOR_WHITE);
+
+                GFX_Text key_txt = GFX_renderText(font.large, extra_key, COLOR_DARK_TEXT);
+                GFX_Text val_txt = GFX_renderText(font.large, extra_val, COLOR_WHITE);
+
+                int l_width = MAX(release_txt.w, MAX(commit_txt.w, key_txt.w));
+                int r_width = MAX(version_txt.w, MAX(hash_txt.w, val_txt.w));
+
+                int x = l_width + SCALE1(8);
+                int w = x + r_width;
+                int h = SCALE1(VERSION_LINE_HEIGHT * 4);
+                int vx = (screen->w - w) / 2;
+                int vy = (screen->h - h) / 2;
+
+                GFX_blitRenderedText(&release_txt, NULL, screen, vx, vy);
+                GFX_blitRenderedText(&version_txt, NULL, screen, vx + x, vy);
+                GFX_blitRenderedText(&commit_txt, NULL, screen, vx, vy + SCALE1(VERSION_LINE_HEIGHT));
+                GFX_blitRenderedText(&hash_txt, NULL, screen, vx + x, vy + SCALE1(VERSION_LINE_HEIGHT));
+
+                GFX_blitRenderedText(&key_txt, NULL, screen, vx, vy + SCALE1(VERSION_LINE_HEIGHT * 3));
+                GFX_blitRenderedText(&val_txt, NULL, screen, vx + x, vy + SCALE1(VERSION_LINE_HEIGHT * 3));
+
 
                 // buttons (duped and trimmed from below)
                 if (show_setting && !GetHDMI())
@@ -2304,23 +2412,12 @@ int main(int argc, char *argv[])
             }
             else
             {
-                if (folderbgbmp)
-                {
-                    SDL_Rect image_rect = {0, 0, screen->w, screen->h};
-                    SDL_BlitSurface(folderbgbmp, NULL, screen, &image_rect);
-                }
-
-                if (had_thumb && thumbbmp)
+                if (had_thumb)
                 {
                     int target_y = (int)(screen->h * 0.48);
-                    int center_y = target_y - (thumbbmp->h / 2);
-                    ox = (int)(screen->w - thumbbmp->w) - SCALE1(BUTTON_MARGIN);
-                    SDL_Rect dest_rect = {
-                        screen->w - (thumbbmp->w + SCALE1(BUTTON_MARGIN * 3)),
-                        center_y,
-                        thumbbmp->w,
-                        thumbbmp->h};
-                    SDL_BlitSurface(thumbbmp, NULL, screen, &dest_rect);
+                    int center_y = target_y - (shown_thumb->image.h / 2);
+                    ox = (int)(screen->w - shown_thumb->image.w) - SCALE1(BUTTON_MARGIN);
+                    Art_draw(shown_thumb, screen->w - (shown_thumb->image.w + SCALE1(BUTTON_MARGIN * 3)), center_y);
                 }
 
                 // list
@@ -2343,9 +2440,12 @@ int main(int argc, char *argv[])
                         SDL_Color text_color = COLOR_WHITE;
                         trimSortingMeta(&entry_name);
 
-                        char display_name[256];
-                        int text_width = GFX_truncateText(font.large, entry_unique ? entry_unique : entry_name, display_name, available_width, SCALE1(BUTTON_PADDING * 2));
+                        int text_width;
+                        const char *display_name = fitText(&entry->fit_main, entry_unique ? entry_unique : entry_name, available_width, &text_width);
                         int max_width = MIN(available_width, text_width);
+                        int text_x = SCALE1(PADDING + BUTTON_PADDING);
+                        int text_y = SCALE1(PADDING + (j * PILL_SIZE) + 4);
+                        SDL_Rect text_clip = {0, 0, max_width - SCALE1(BUTTON_PADDING * 2), 0};
                         if (j == selected_row)
                         {
                             text_color = COLOR_BLACK;
@@ -2365,13 +2465,13 @@ int main(int argc, char *argv[])
                         else if (entry->unique)
                         {
                             trimSortingMeta(&entry_unique);
-                            char unique_name[256];
-                            GFX_truncateText(font.large, entry_unique, unique_name, available_width, SCALE1(BUTTON_PADDING * 2));
+                            const char *unique_name = fitText(&entry->fit_unique, entry_unique, available_width, NULL);
 
-                            SDL_Surface *text = TTF_RenderUTF8_Blended(font.large, unique_name, COLOR_DARK_TEXT);
-                            SDL_BlitSurface(text, &(SDL_Rect){0, 0, max_width - SCALE1(BUTTON_PADDING * 2), text->h}, screen, &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + (j * PILL_SIZE) + 4)});
+                            GFX_Text text = GFX_renderText(font.large, unique_name, COLOR_DARK_TEXT);
+                            text_clip.h = text.h;
+                            GFX_blitRenderedText(&text, &text_clip, screen, text_x, text_y);
 
-                            GFX_truncateText(font.large, entry_name, display_name, available_width, SCALE1(BUTTON_PADDING * 2));
+                            display_name = fitText(&entry->fit_name, entry_name, available_width, NULL);
                         }
                         else if (entry->is_darker)
                         {
@@ -2380,9 +2480,9 @@ int main(int argc, char *argv[])
                         else if (entry->needs_swap) {
                             GFX_blitAsset(ASSET_SWAP_GRAY, NULL, screen, &(SDL_Rect){SCALE1(PADDING + 2), SCALE1(PADDING + 11 + (j * PILL_SIZE))});
                         }
-                        SDL_Surface *text = TTF_RenderUTF8_Blended(font.large, display_name, text_color);
-                        SDL_BlitSurface(text, &(SDL_Rect){0, 0, max_width - SCALE1(BUTTON_PADDING * 2), text->h}, screen, &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + (j * PILL_SIZE) + 4)});
-                        SDL_FreeSurface(text);
+                        GFX_Text text = GFX_renderText(font.large, display_name, text_color);
+                        text_clip.h = text.h;
+                        GFX_blitRenderedText(&text, &text_clip, screen, text_x, text_y);
                     }
                 }
                 else
@@ -2427,7 +2527,7 @@ int main(int argc, char *argv[])
             dirty = 0;
         }
         else
-            GFX_sync();
+            GFX_sync(); // sleeps until input or the next frame (key repeat, the art delay)
     }
 
     // Thread cleanup
@@ -2437,18 +2537,11 @@ int main(int argc, char *argv[])
     pthread_mutex_unlock(&thumb_mutex);
     pthread_join(thumb_thread, NULL);
 
-    if (thumbbmp)
-        SDL_FreeSurface(thumbbmp);
     if (result_thumb)
         SDL_FreeSurface(result_thumb);
-
-    if (folderbgbmp)
-        SDL_FreeSurface(folderbgbmp);
     if (result_bg)
         SDL_FreeSurface(result_bg);
-
-    if (version)
-        SDL_FreeSurface(version);
+    Art_quit(); // while there is still a GL context
 
     Menu_quit();
     PWR_quit();
