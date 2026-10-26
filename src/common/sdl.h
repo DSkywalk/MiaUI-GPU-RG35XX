@@ -16,21 +16,6 @@
 
 ///////////////////////////////
 
-#define SDL_SRCALPHA 0x00010000
-#define SDLX_SetAlpha(surface,flags_,value) do { \
-    if (flags_ & SDL_SRCALPHA) { \
-        if (!surface->format->Amask) SDL_SetSurfaceAlphaMod(surface, value); \
-        surface->flags |= SDL_SRCALPHA; \
-        SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_BLEND); \
-    } else { \
-        if (!surface->format->Amask) SDL_SetSurfaceAlphaMod(surface, 255); \
-        surface->flags &= ~SDL_SRCALPHA; \
-        SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_NONE); \
-    } \
-} while(0);
-
-///////////////////////////////
-
 #else
 
 ///////////////////////////////
@@ -42,7 +27,6 @@
 ///////////////////////////////
 
 #define WHICH_SDL "SDL"
-#define SDLX_SetAlpha SDL_SetAlpha
 
 ///////////////////////////////
 

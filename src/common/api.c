@@ -57,15 +57,9 @@ void LOG_note(int level, const char* fmt, ...) {
 // GFX - High Level Graphics
 // -------------------------------------------------------------------------
 
-uint32_t RGB_WHITE;
-uint32_t RGB_BLACK;
-uint32_t RGB_LIGHT_GRAY;
-uint32_t RGB_GRAY;
-uint32_t RGB_DARK_GRAY;
-
 static struct GFX_Context {
     SDL_Surface* screen;
-    SDL_Surface* assets;
+    GFX_Image assets; // the sprite sheet
 
     int mode;
     int vsync;
@@ -104,7 +98,22 @@ static SDL_Rect asset_rects[] = {
     [ASSET_SWAP_DARK_GRAY]   = (SDL_Rect){SCALE4(114,51,10,10)},
     [ASSET_TROPHY]           = (SDL_Rect){SCALE4(114,39,10,10)},
 };
-static uint32_t asset_rgbs[ASSET_COLORS];
+// the flat colour of each asset that is stretched with a fill
+static const SDL_Color asset_colors[ASSET_COLORS] = {
+    [ASSET_WHITE_PILL]      = {TRIAD_WHITE},
+    [ASSET_BLACK_PILL]      = {TRIAD_BLACK},
+    [ASSET_DARK_GRAY_PILL]  = {TRIAD_DARK_GRAY},
+    [ASSET_OPTION]          = {TRIAD_DARK_GRAY},
+    [ASSET_BUTTON]          = {TRIAD_WHITE},
+    [ASSET_PAGE_BG]         = {TRIAD_WHITE},
+    [ASSET_STATE_BG]        = {TRIAD_WHITE},
+    [ASSET_PAGE]            = {TRIAD_BLACK},
+    [ASSET_BAR]             = {TRIAD_WHITE},
+    [ASSET_BAR_BG]          = {TRIAD_BLACK},
+    [ASSET_BAR_BG_MENU]     = {TRIAD_DARK_GRAY},
+    [ASSET_UNDERLINE]       = {TRIAD_GRAY},
+    [ASSET_DOT]             = {TRIAD_LIGHT_GRAY},
+};
 GFX_Fonts font;
 
 static struct PWR_Context {
@@ -130,36 +139,21 @@ static int _;
  */
 SDL_Surface* GFX_init(int mode) {
     gfx.screen = PLAT_initVideo();
+    if (!gfx.screen) {
+        LOG_error("GFX_init: no video\n");
+        exit(1);
+    }
     PLAT_initInput();
 
     gfx.vsync = VSYNC_STRICT;
     gfx.mode = mode;
     
-    // Map standard colors to the screen format
-    RGB_WHITE        = SDL_MapRGB(gfx.screen->format, TRIAD_WHITE);
-    RGB_BLACK        = SDL_MapRGB(gfx.screen->format, TRIAD_BLACK);
-    RGB_LIGHT_GRAY    = SDL_MapRGB(gfx.screen->format, TRIAD_LIGHT_GRAY);
-    RGB_GRAY        = SDL_MapRGB(gfx.screen->format, TRIAD_GRAY);
-    RGB_DARK_GRAY    = SDL_MapRGB(gfx.screen->format, TRIAD_DARK_GRAY);
-    
-    asset_rgbs[ASSET_WHITE_PILL]    = RGB_WHITE;
-    asset_rgbs[ASSET_BLACK_PILL]    = RGB_BLACK;
-    asset_rgbs[ASSET_DARK_GRAY_PILL]= RGB_DARK_GRAY;
-    asset_rgbs[ASSET_OPTION]        = RGB_DARK_GRAY;
-    asset_rgbs[ASSET_BUTTON]        = RGB_WHITE;
-    asset_rgbs[ASSET_PAGE_BG]        = RGB_WHITE;
-    asset_rgbs[ASSET_STATE_BG]        = RGB_WHITE;
-    asset_rgbs[ASSET_PAGE]            = RGB_BLACK;
-    asset_rgbs[ASSET_BAR]            = RGB_WHITE;
-    asset_rgbs[ASSET_BAR_BG]        = RGB_BLACK;
-    asset_rgbs[ASSET_BAR_BG_MENU]    = RGB_DARK_GRAY;
-    asset_rgbs[ASSET_UNDERLINE]        = RGB_GRAY;
-    asset_rgbs[ASSET_DOT]            = RGB_LIGHT_GRAY;
-    
     // Load UI assets spritesheet
     char asset_path[MAX_PATH];
     sprintf(asset_path, RES_PATH "/assets@%ix.png", FIXED_SCALE);
-    gfx.assets = IMG_Load(asset_path);
+    SDL_Surface* assets = IMG_Load(asset_path);
+    gfx.assets = GFX_loadImage(assets);
+    SDL_FreeSurface(assets);
     
     // Initialize Fonts
     TTF_Init();
@@ -174,16 +168,18 @@ SDL_Surface* GFX_init(int mode) {
 /**
  * Shuts down the graphics subsystem and releases resources.
  */
+static void GFX_freeTextCache(void);
 void GFX_quit(void) {
+    GFX_freeTextCache();
+    GFX_freeImage(&gfx.assets);
+
     TTF_CloseFont(font.large);
     TTF_CloseFont(font.medium);
     TTF_CloseFont(font.small);
     TTF_CloseFont(font.tiny);
-    
-    SDL_FreeSurface(gfx.assets);
-        
-    GFX_clearAll();
 
+    // not GFX_clearAll(): the fade out in PLAT_quitVideo redraws what is on
+    // screen, the ui layer included
     PLAT_quitInput();
     PLAT_quitVideo();
 }
@@ -236,7 +232,9 @@ double GFX_getRefreshRate(void) {
  * Flips the video buffer.
  * Handles VSync logic if strict vsync is enabled.
  */
+static uint32_t text_frame; // bumped every flip, for the text cache's LRU
 void GFX_flip(SDL_Surface* screen) {
+    text_frame += 1;
     uint64_t now = GFX_nowMicros();
     int should_vsync = gfx.vsync!=VSYNC_OFF;
 
@@ -263,19 +261,167 @@ void GFX_flip(SDL_Surface* screen) {
 }
 
 /**
- * Manual synchronization to maintain 60fps if GFX_flip wasn't called.
+ * For a loop iteration that had nothing to draw: sleeps until there is
+ * input, or for what is left of the frame (timers: key repeat, sleep, the
+ * settings pill). Vsync only ever happens inside a flip here, so without
+ * this a menu waiting for input spun at ~38k iterations a second, 100% of a
+ * core. Only menus call it, never the game loop.
  */
 void GFX_sync(void) {
-    uint32_t frame_duration = SDL_GetTicks() - frame_start;
-    if (gfx.vsync!=VSYNC_OFF) {
-        // this limiting condition helps SuperFX chip games
-        if (gfx.vsync==VSYNC_STRICT || frame_start==0 || frame_duration<FRAME_BUDGET) { // only wait if we're under frame budget
-            PLAT_vsync(FRAME_BUDGET-frame_duration);
+    // a frame that is already over (or a loop that never called
+    // GFX_startFrame) waits a whole one: input still ends the wait at once
+    int remaining = FRAME_BUDGET - (int)(SDL_GetTicks() - frame_start);
+    if (remaining<1 || remaining>FRAME_BUDGET) remaining = FRAME_BUDGET;
+    SDL_WaitEventTimeout(NULL, remaining);
+}
+
+// -------------------------------------------------------------------------
+// Text
+// -------------------------------------------------------------------------
+//
+// A string is rendered once, in white, into an 8-bit alpha texture and drawn
+// tinted from then on. A list redraw is the same few dozen strings again and
+// again (rows, button hints, the battery pill), so after the first frame
+// almost nothing is rendered at all.
+
+#define TEXT_CACHE_MAX   192
+#define TEXT_CACHE_BYTES (3 * 1024 * 1024) // alpha texels; a list row is ~23KB
+
+typedef struct {
+    TTF_Font* font;
+    char* str;
+    uint32_t hash;
+    unsigned tex;
+    int w, h;
+    uint32_t used; // text_frame when last asked for
+} TextEntry;
+
+static struct {
+    TextEntry entries[TEXT_CACHE_MAX];
+    int count;
+    size_t bytes;
+    TextEntry spare; // the latest string that didn't fit, never looked up
+} text_cache;
+
+static uint32_t GFX_textHash(TTF_Font* font, const char* str) {
+    uint32_t h = 2166136261u ^ (uint32_t)(uintptr_t)font; // FNV-1a
+    for (const unsigned char* c = (const unsigned char*)str; *c; c++) h = (h ^ *c) * 16777619u;
+    return h;
+}
+
+static void GFX_evictText(int i) {
+    TextEntry* e = &text_cache.entries[i];
+    PLAT_uiFreeTexture(e->tex);
+    free(e->str);
+    text_cache.bytes -= (size_t)e->w * e->h;
+    *e = text_cache.entries[--text_cache.count];
+}
+
+static void GFX_freeTextCache(void) {
+    while (text_cache.count) GFX_evictText(text_cache.count - 1);
+    PLAT_uiFreeTexture(text_cache.spare.tex);
+    text_cache.spare.tex = 0;
+}
+
+static TextEntry* GFX_cachedText(TTF_Font* font, const char* str) {
+    uint32_t hash = GFX_textHash(font, str);
+    for (int i=0; i<text_cache.count; i++) {
+        TextEntry* e = &text_cache.entries[i];
+        if (e->hash==hash && e->font==font && !strcmp(e->str, str)) {
+            e->used = text_frame;
+            return e;
         }
     }
-    else {
-        if (frame_duration<FRAME_BUDGET) SDL_Delay(FRAME_BUDGET-frame_duration);
+
+    SDL_Surface* text = TTF_RenderUTF8_Blended(font, str, (SDL_Color){0xff,0xff,0xff,0xff});
+    if (!text) return NULL; // e.g. an empty string
+    int w = text->w;
+    int h = text->h;
+    uint8_t* alpha = malloc((size_t)w * h);
+    if (!alpha) {
+        SDL_FreeSurface(text);
+        return NULL;
     }
+    int shift = text->format->Ashift;
+    for (int y=0; y<h; y++) {
+        const uint32_t* src = (const uint32_t*)((const uint8_t*)text->pixels + y * text->pitch);
+        uint8_t* dst = alpha + y * w;
+        for (int x=0; x<w; x++) dst[x] = src[x] >> shift;
+    }
+    unsigned tex = PLAT_uiAlphaTexture(alpha, w, h);
+    free(alpha);
+    SDL_FreeSurface(text);
+    if (!tex) return NULL;
+
+    // make room: least recently used first. One screen needs a few dozen
+    // strings, so whatever goes was not drawn in this frame. What was asked
+    // for in this frame stays, even past the budget: a GFX_Text the caller
+    // still holds must not lose its texture.
+    size_t bytes = (size_t)w * h;
+    while (text_cache.count && (text_cache.count>=TEXT_CACHE_MAX || text_cache.bytes+bytes>TEXT_CACHE_BYTES)) {
+        int lru = 0;
+        for (int i=1; i<text_cache.count; i++) {
+            if (text_cache.entries[i].used < text_cache.entries[lru].used) lru = i;
+        }
+        if (text_cache.entries[lru].used==text_frame) break;
+        GFX_evictText(lru);
+    }
+    if (text_cache.count>=TEXT_CACHE_MAX) { // all from this frame: draw it, don't keep it
+        PLAT_uiFreeTexture(text_cache.spare.tex);
+        text_cache.spare = (TextEntry){ .font=font, .hash=hash, .tex=tex, .w=w, .h=h, .used=text_frame };
+        return &text_cache.spare;
+    }
+
+    TextEntry* e = &text_cache.entries[text_cache.count++];
+    e->font = font;
+    e->str = strdup(str);
+    e->hash = hash;
+    e->tex = tex;
+    e->w = w;
+    e->h = h;
+    e->used = text_frame;
+    text_cache.bytes += bytes;
+    return e;
+}
+
+GFX_Text GFX_renderText(TTF_Font* font, const char* str, SDL_Color color) {
+    GFX_Text text = {0};
+    text.color = color;
+    TextEntry* e = (font && str && *str) ? GFX_cachedText(font, str) : NULL;
+    if (e) {
+        text.tex = e->tex;
+        text.w = e->w;
+        text.h = e->h;
+    }
+    return text;
+}
+void GFX_blitRenderedText(GFX_Text* text, SDL_Rect* src_rect, SDL_Surface* dst, int x, int y) {
+    PLAT_uiDraw(dst, text->tex, text->w, text->h, 1, src_rect, &(SDL_Rect){x,y}, text->color, 255);
+}
+
+// -------------------------------------------------------------------------
+// Images and fills
+// -------------------------------------------------------------------------
+
+GFX_Image GFX_loadImage(SDL_Surface* surface) {
+    GFX_Image image = {0};
+    if (!surface) return image;
+    image.tex = PLAT_uiTexture(surface);
+    if (image.tex) {
+        image.w = surface->w;
+        image.h = surface->h;
+    }
+    return image;
+}
+void GFX_freeImage(GFX_Image* image) {
+    PLAT_uiFreeTexture(image->tex);
+    *image = (GFX_Image){0};
+}
+void GFX_blitImage(GFX_Image* image, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
+    PLAT_uiDraw(dst, image->tex, image->w, image->h, 0, src_rect, dst_rect, COLOR_WHITE, 255);
+}
+void GFX_fillRect(SDL_Surface* dst, SDL_Rect* rect, SDL_Color color, int opacity) {
+    PLAT_uiFill(dst, rect, color, opacity);
 }
 
 int GFX_truncateText(TTF_Font* font, const char* in_name, char* out_name, int max_width, int padding) {
@@ -354,184 +500,10 @@ int GFX_wrapText(TTF_Font* font, char* str, int max_width, int max_lines) {
 }
 
 // -------------------------------------------------------------------------
-// Anti-Aliased Scaling Logic (Software)
-// -------------------------------------------------------------------------
-
-// scale_blend (and supporting logic) from picoarch
-
-struct blend_args {
-    int w_ratio_in;
-    int w_ratio_out;
-    uint16_t w_bp[2];
-    int h_ratio_in;
-    int h_ratio_out;
-    uint16_t h_bp[2];
-    uint16_t *blend_line;
-} blend_args;
-
-#if __ARM_ARCH >= 5
-static inline uint32_t average16(uint32_t c1, uint32_t c2) {
-    uint32_t ret, lowbits = 0x0821;
-    asm ("eor %0, %2, %3\r\n"
-         "and %0, %0, %1\r\n"
-         "add %0, %3, %0\r\n"
-         "add %0, %0, %2\r\n"
-         "lsr %0, %0, #1\r\n"
-         : "=&r" (ret) : "r" (lowbits), "r" (c1), "r" (c2) : );
-    return ret;
-}
-static inline uint32_t average32(uint32_t c1, uint32_t c2) {
-    uint32_t ret, lowbits = 0x08210821;
-
-    asm ("eor %0, %3, %1\r\n"
-         "and %0, %0, %2\r\n"
-         "adds %0, %1, %0\r\n"
-         "and %1, %1, #0\r\n"
-         "movcs %1, #0x80000000\r\n"
-         "adds %0, %0, %3\r\n"
-         "rrx %0, %0\r\n"
-         "orr %0, %0, %1\r\n"
-         : "=&r" (ret), "+r" (c2) : "r" (lowbits), "r" (c1) : "cc" );
-
-    return ret;
-}
-
-#define AVERAGE16_NOCHK(c1, c2) (average16((c1), (c2)))
-#define AVERAGE32_NOCHK(c1, c2) (average32((c1), (c2)))
-
-#else
-
-static inline uint32_t average16(uint32_t c1, uint32_t c2) {
-    return (c1 + c2 + ((c1 ^ c2) & 0x0821))>>1;
-}
-static inline uint32_t average32(uint32_t c1, uint32_t c2) {
-    uint32_t sum = c1 + c2;
-    uint32_t ret = sum + ((c1 ^ c2) & 0x08210821);
-    uint32_t of = ((sum < c1) | (ret < sum)) << 31;
-
-    return (ret >> 1) | of;
-}
-
-#define AVERAGE16_NOCHK(c1, c2) (average16((c1), (c2)))
-#define AVERAGE32_NOCHK(c1, c2) (average32((c1), (c2)))
-
-#endif
-
-#define AVERAGE16(c1, c2) ((c1) == (c2) ? (c1) : AVERAGE16_NOCHK((c1), (c2)))
-#define AVERAGE16_1_3(c1, c2) ((c1) == (c2) ? (c1) : (AVERAGE16_NOCHK(AVERAGE16_NOCHK((c1), (c2)), (c2))))
-
-#define AVERAGE32(c1, c2) ((c1) == (c2) ? (c1) : AVERAGE32_NOCHK((c1), (c2)))
-#define AVERAGE32_1_3(c1, c2) ((c1) == (c2) ? (c1) : (AVERAGE32_NOCHK(AVERAGE32_NOCHK((c1), (c2)), (c2))))
-
-static inline int gcd(int a, int b) {
-    return b ? gcd(b, a % b) : a;
-}
-
-/**
- * Performs anti-aliased scaling of an image.
- * Uses a weighted average approach to blend pixels when downscaling or upscaling.
- */
-static void scaleAA(void* __restrict src, void* __restrict dst, uint32_t w, uint32_t h, uint32_t pitch, uint32_t dst_w, uint32_t dst_h, uint32_t dst_p) {
-    int dy = 0;
-    int lines = h;
-
-    int rat_w = blend_args.w_ratio_in;
-    int rat_dst_w = blend_args.w_ratio_out;
-    uint16_t *bw = blend_args.w_bp;
-
-    int rat_h = blend_args.h_ratio_in;
-    int rat_dst_h = blend_args.h_ratio_out;
-    uint16_t *bh = blend_args.h_bp;
-
-    while (lines--) {
-        while (dy < rat_dst_h) {
-            uint16_t *dst16 = (uint16_t *)dst;
-            uint16_t *pblend = (uint16_t *)blend_args.blend_line;
-            int col = w;
-            int dx = 0;
-
-            uint16_t *pnext = (uint16_t *)(src + pitch);
-            if (!lines)
-                pnext -= (pitch / sizeof(uint16_t));
-
-            // Vertical Blending Logic
-            if (dy > rat_dst_h - bh[0]) {
-                pblend = pnext;
-            } else if (dy <= bh[0]) {
-                /* Drops const, won't get touched later though */
-                pblend = (uint16_t *)src;
-            } else {
-                const uint32_t *src32 = (const uint32_t *)src;
-                const uint32_t *pnext32 = (const uint32_t *)pnext;
-                uint32_t *pblend32 = (uint32_t *)pblend;
-                int count = w / 2;
-
-                if (dy <= bh[1]) {
-                    const uint32_t *tmp = pnext32;
-                    pnext32 = src32;
-                    src32 = tmp;
-                }
-
-                if (dy > rat_dst_h - bh[1] || dy <= bh[1]) {
-                    while(count--) {
-                        *pblend32++ = AVERAGE32_1_3(*src32, *pnext32);
-                        src32++;
-                        pnext32++;
-                    }
-                } else {
-                    while(count--) {
-                        *pblend32++ = AVERAGE32(*src32, *pnext32);
-                        src32++;
-                        pnext32++;
-                    }
-                }
-            }
-
-            // Horizontal Blending Logic
-            while (col--) {
-                uint16_t a, b, out;
-
-                a = *pblend;
-                b = *(pblend+1);
-
-                while (dx < rat_dst_w) {
-                    if (a == b) {
-                        out = a;
-                    } else if (dx > rat_dst_w - bw[0]) { // top quintile, bbbb
-                        out = b;
-                    } else if (dx <= bw[0]) { // last quintile, aaaa
-                        out = a;
-                    } else {
-                        if (dx > rat_dst_w - bw[1]) { // 2nd quintile, abbb
-                            a = AVERAGE16_NOCHK(a,b);
-                        } else if (dx <= bw[1]) { // 4th quintile, aaab
-                            b = AVERAGE16_NOCHK(a,b);
-                        }
-
-                        out = AVERAGE16_NOCHK(a, b); // also 3rd quintile, aabb
-                    }
-                    *dst16++ = out;
-                    dx += rat_w;
-                }
-
-                dx -= rat_dst_w;
-                pblend++;
-            }
-
-            dy += rat_h;
-            dst += dst_p;
-        }
-
-        dy -= rat_dst_h;
-        src += pitch;
-    }
-}
-
-// -------------------------------------------------------------------------
 // UI Assets Blitting
 // -------------------------------------------------------------------------
 
-void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
+static void GFX_blitAssetAlpha(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity) {
     SDL_Rect* rect = &asset_rects[asset];
     SDL_Rect adj_rect = {
         .x = rect->x,
@@ -545,9 +517,19 @@ void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* ds
         adj_rect.w  = src_rect->w;
         adj_rect.h  = src_rect->h;
     }
-    SDL_BlitSurface(gfx.assets, &adj_rect, dst, dst_rect);
+    // 1:1, like SDL_BlitSurface: only the position of dst_rect counts
+    SDL_Rect at = { dst_rect ? dst_rect->x : 0, dst_rect ? dst_rect->y : 0 };
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &adj_rect, &at, COLOR_WHITE, opacity);
 }
-void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
+void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
+    GFX_blitAssetAlpha(asset, src_rect, dst, dst_rect, 255);
+}
+static void GFX_fillAsset(int asset, SDL_Surface* dst, SDL_Rect rect, int opacity) {
+    PLAT_uiFill(dst, &rect, asset_colors[asset], opacity);
+}
+// The caps and the fill don't overlap, so a translucent pill is just its
+// pieces drawn translucent.
+void GFX_blitPillAlpha(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity) {
     int x = dst_rect->x;
     int y = dst_rect->y;
     int w = dst_rect->w;
@@ -559,31 +541,32 @@ void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     if (w < h) w = h;
     w -= h;
     
-    GFX_blitAsset(asset, &(SDL_Rect){0,0,r,h}, dst, &(SDL_Rect){x,y});
+    GFX_blitAssetAlpha(asset, &(SDL_Rect){0,0,r,h}, dst, &(SDL_Rect){x,y}, opacity);
     x += r;
     if (w>0) {
-        SDL_FillRect(dst, &(SDL_Rect){x,y,w,h}, asset_rgbs[asset]);
+        GFX_fillAsset(asset, dst, (SDL_Rect){x,y,w,h}, opacity);
         x += w;
     }
-    GFX_blitAsset(asset, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y});
+    GFX_blitAssetAlpha(asset, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y}, opacity);
+}
+void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
+    GFX_blitPillAlpha(asset, dst, dst_rect, 255);
 }
 void GFX_blitRect(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     int x = dst_rect->x;
     int y = dst_rect->y;
     int w = dst_rect->w;
     int h = dst_rect->h;
-    int c = asset_rgbs[asset];
-    
     SDL_Rect* rect = &asset_rects[asset];
     int d = rect->w;
     int r = d / 2;
 
     GFX_blitAsset(asset, &(SDL_Rect){0,0,r,r}, dst, &(SDL_Rect){x,y});
-    SDL_FillRect(dst, &(SDL_Rect){x+r,y,w-d,r}, c);
+    GFX_fillAsset(asset, dst, (SDL_Rect){x+r,y,w-d,r}, 255);
     GFX_blitAsset(asset, &(SDL_Rect){r,0,r,r}, dst, &(SDL_Rect){x+w-r,y});
-    SDL_FillRect(dst, &(SDL_Rect){x,y+r,w,h-d}, c);
+    GFX_fillAsset(asset, dst, (SDL_Rect){x,y+r,w,h-d}, 255);
     GFX_blitAsset(asset, &(SDL_Rect){0,r,r,r}, dst, &(SDL_Rect){x,y+h-r});
-    SDL_FillRect(dst, &(SDL_Rect){x+r,y+h-r,w-d,r}, c);
+    GFX_fillAsset(asset, dst, (SDL_Rect){x+r,y+h-r,w-d,r}, 255);
     GFX_blitAsset(asset, &(SDL_Rect){r,r,r,r}, dst, &(SDL_Rect){x+w-r,y+h-r});
 }
 void GFX_blitBattery(SDL_Surface* dst, SDL_Rect* dst_rect) {
@@ -637,7 +620,7 @@ int GFX_getButtonWidth(char* hint, char* button) {
     return button_width;
 }
 void GFX_blitButton(char* hint, char*button, SDL_Surface* dst, SDL_Rect* dst_rect) {
-    SDL_Surface* text;
+    GFX_Text text;
     int ox = 0;
     
     int special_case = !strcmp(button,BRIGHTNESS_BUTTON_LABEL); // TODO: oof
@@ -647,36 +630,32 @@ void GFX_blitButton(char* hint, char*button, SDL_Surface* dst, SDL_Rect* dst_rec
         GFX_blitAsset(ASSET_BUTTON, NULL, dst, dst_rect);
 
         // label
-        text = TTF_RenderUTF8_Blended(font.medium, button, COLOR_BUTTON_TEXT);
-        SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){dst_rect->x+(SCALE1(BUTTON_SIZE)-text->w)/2,dst_rect->y+(SCALE1(BUTTON_SIZE)-text->h)/2});
+        text = GFX_renderText(font.medium, button, COLOR_BUTTON_TEXT);
+        GFX_blitRenderedText(&text, NULL, dst, dst_rect->x+(SCALE1(BUTTON_SIZE)-text.w)/2,dst_rect->y+(SCALE1(BUTTON_SIZE)-text.h)/2);
         ox += SCALE1(BUTTON_SIZE);
-        SDL_FreeSurface(text);
     }
     else {
-        text = TTF_RenderUTF8_Blended(special_case ? font.large : font.tiny, button, COLOR_BUTTON_TEXT);
-        GFX_blitPill(ASSET_BUTTON, dst, &(SDL_Rect){dst_rect->x,dst_rect->y,SCALE1(BUTTON_SIZE)/2+text->w,SCALE1(BUTTON_SIZE)});
+        text = GFX_renderText(special_case ? font.large : font.tiny, button, COLOR_BUTTON_TEXT);
+        GFX_blitPill(ASSET_BUTTON, dst, &(SDL_Rect){dst_rect->x,dst_rect->y,SCALE1(BUTTON_SIZE)/2+text.w,SCALE1(BUTTON_SIZE)});
         ox += SCALE1(BUTTON_SIZE)/4;
         
         int oy = special_case ? SCALE1(-2) : 0;
-        SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){ox+dst_rect->x,oy+dst_rect->y+(SCALE1(BUTTON_SIZE)-text->h)/2,text->w,text->h});
-        ox += text->w;
+        GFX_blitRenderedText(&text, NULL, dst, ox+dst_rect->x,oy+dst_rect->y+(SCALE1(BUTTON_SIZE)-text.h)/2);
+        ox += text.w;
         ox += SCALE1(BUTTON_SIZE)/4;
-        SDL_FreeSurface(text);
     }
     
     ox += SCALE1(BUTTON_MARGIN);
 
     // hint text
-    text = TTF_RenderUTF8_Blended(font.small, hint, COLOR_WHITE);
-    SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){ox+dst_rect->x,dst_rect->y+(SCALE1(BUTTON_SIZE)-text->h)/2,text->w,text->h});
-    SDL_FreeSurface(text);
+    text = GFX_renderText(font.small, hint, COLOR_WHITE);
+    GFX_blitRenderedText(&text, NULL, dst, ox+dst_rect->x,dst_rect->y+(SCALE1(BUTTON_SIZE)-text.h)/2);
 }
 void GFX_blitMessage(TTF_Font* font, char* msg, SDL_Surface* dst, SDL_Rect* dst_rect) {
     if (!dst_rect) dst_rect = &(SDL_Rect){0,0,dst->w,dst->h};
     
     // LOG_info("GFX_blitMessage: %p (%ix%i)", dst, dst_rect->w,dst_rect->h);
     
-    SDL_Surface* text;
 #define TEXT_BOX_MAX_ROWS 16
 #define LINE_HEIGHT 24
     char* rows[TEXT_BOX_MAX_ROWS];
@@ -708,11 +687,10 @@ void GFX_blitMessage(TTF_Font* font, char* msg, SDL_Surface* dst, SDL_Rect* dst_
         
         
         if (len) {
-            text = TTF_RenderUTF8_Blended(font, line, COLOR_WHITE);
+            GFX_Text text = GFX_renderText(font, line, COLOR_WHITE);
             int x = dst_rect->x;
-            x += (dst_rect->w - text->w) / 2;
-            SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){x,y});
-            SDL_FreeSurface(text);
+            x += (dst_rect->w - text.w) / 2;
+            GFX_blitRenderedText(&text, NULL, dst, x, y);
         }
         y += SCALE1(LINE_HEIGHT);
     }
@@ -920,7 +898,6 @@ void GFX_blitText(TTF_Font* font, char* str, int leading, SDL_Color color, SDL_S
     int x = dst_rect->x;
     int y = dst_rect->y;
     
-    SDL_Surface* text;
     char line[256];
     for (int i=0; i<count; i++) {
         int len;
@@ -935,9 +912,8 @@ void GFX_blitText(TTF_Font* font, char* str, int leading, SDL_Color color, SDL_S
         }
         
         if (len) {
-            text = TTF_RenderUTF8_Blended(font, line, color);
-            SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){x+((dst_rect->w-text->w)/2),y+(i*leading)});
-            SDL_FreeSurface(text);
+            GFX_Text text = GFX_renderText(font, line, color);
+            GFX_blitRenderedText(&text, NULL, dst, x+((dst_rect->w-text.w)/2), y+(i*leading));
         }
     }
 }
@@ -1899,11 +1875,10 @@ void IO_quit(void) {
 static void PWR_initOverlay(void) {
     // setup surface
     pwr.overlay = PLAT_initOverlay();
+    if (!pwr.overlay) return;
 
     // draw battery
-    SDLX_SetAlpha(gfx.assets, 0,0);
     GFX_blitAsset(ASSET_BLACK_PILL, NULL, pwr.overlay, NULL);
-    SDLX_SetAlpha(gfx.assets, SDL_SRCALPHA,0);
     GFX_blitBattery(pwr.overlay, NULL);
 }
 
@@ -2062,24 +2037,11 @@ void PWR_disablePowerOff(void) {
 }
 void PWR_powerOff(void) {
     if (pwr.can_poweroff) {
-        
-        int w = FIXED_WIDTH;
-        int h = FIXED_HEIGHT;
-        int p = FIXED_PITCH;
-        if (GetHDMI()) {
-            w = HDMI_WIDTH;
-            h = HDMI_HEIGHT;
-            p = HDMI_PITCH;
-        }
-        gfx.screen = GFX_resize(w,h,p);
-        
         char* msg;
         if (HAS_POWER_BUTTON || HAS_POWEROFF_BUTTON) msg = exists(AUTO_RESUME_PATH) ? "Quicksave created,\npowering off" : "Powering off";
         else msg = exists(AUTO_RESUME_PATH) ? "Quicksave created,\npower off now" : "Power off now";
         
-        // LOG_info("PWR_powerOff %s (%ix%i)\n", gfx.screen, gfx.screen->w, gfx.screen->h);
-        
-        // TODO: for some reason screen's dimensions end up being 0x0 in GFX_blitMessage...
+        PLAT_setUILayer(1); // a game may have it switched off
         PLAT_clearVideo(gfx.screen);
         GFX_blitMessage(font.large, msg, gfx.screen,&(SDL_Rect){0,0,gfx.screen->w,gfx.screen->h}); //, NULL);
         GFX_flip(gfx.screen);
