@@ -2307,8 +2307,9 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 
 ///////////////////////////////
 
-// TODO: this is a dumb API
-SDL_Surface* digits;
+// The debug HUD: each digit or sign in a black cell of its own, DIGIT_WIDTH
+// apart less the tracking, so the numbers don't jitter as they change. The
+// glyphs come from the text cache, so this draws, it doesn't render.
 #define DIGIT_WIDTH 9
 #define DIGIT_HEIGHT 8
 #define DIGIT_TRACKING -2
@@ -2322,23 +2323,23 @@ enum {
     DIGIT_COUNT,
 };
 #define DIGIT_SPACE DIGIT_COUNT
-static void MSG_init(void) {
-    digits = SDL_CreateRGBSurface(SDL_SWSURFACE,SCALE2(DIGIT_WIDTH*DIGIT_COUNT,DIGIT_HEIGHT),FIXED_DEPTH, 0,0,0,0);
-    SDL_FillRect(digits, NULL, RGB_BLACK);
-    
-    SDL_Surface* digit;
-    char* chars[] = { "0","1","2","3","4","5","6","7","8","9","/",".","%","x","(",")", NULL };
-    char* c;
-    int i = 0;
-    while ((c = chars[i])) {
-        digit = TTF_RenderUTF8_Blended(font.tiny, c, COLOR_WHITE);
-        SDL_BlitSurface(digit, NULL, digits, &(SDL_Rect){ (i * SCALE1(DIGIT_WIDTH)) + (SCALE1(DIGIT_WIDTH) - digit->w)/2, (SCALE1(DIGIT_HEIGHT) - digit->h)/2});
-        SDL_FreeSurface(digit);
-        i += 1;
-    }
+static const char* digit_chars[DIGIT_COUNT] = { "0","1","2","3","4","5","6","7","8","9","/",".","%","x","(",")" };
+
+// a line of text vertically centred in a black DIGIT_HEIGHT strip, and
+// cropped to it
+static void MSG_blitCell(GFX_Text* text, int x, int y, int w) {
+    int cell_h = SCALE1(DIGIT_HEIGHT);
+    GFX_fillRect(screen, &(SDL_Rect){x,y,w,cell_h}, COLOR_BLACK, 255);
+    if (!text->tex) return;
+    int oy = (cell_h - text->h) / 2;
+    if (oy<0) GFX_blitRenderedText(text, &(SDL_Rect){0,-oy,text->w,cell_h}, screen, x + (w - text->w)/2, y);
+    else GFX_blitRenderedText(text, NULL, screen, x + (w - text->w)/2, y + oy);
 }
 static int MSG_blitChar(int n, int x, int y) {
-    if (n!=DIGIT_SPACE) SDL_BlitSurface(digits, &(SDL_Rect){n*SCALE1(DIGIT_WIDTH),0,SCALE2(DIGIT_WIDTH,DIGIT_HEIGHT)}, screen, &(SDL_Rect){x,y});
+    if (n!=DIGIT_SPACE) {
+        GFX_Text text = GFX_renderText(font.tiny, digit_chars[n], COLOR_WHITE);
+        MSG_blitCell(&text, x, y, SCALE1(DIGIT_WIDTH));
+    }
     return x + SCALE1(DIGIT_WIDTH + DIGIT_TRACKING);
 }
 static int MSG_blitInt(int num, int x, int y) {
@@ -2386,9 +2387,6 @@ static int MSG_blitDouble(double num, int x, int y) {
     x = MSG_blitChar(n,x,y);
     return x;
 }
-static void MSG_quit(void) {
-    SDL_FreeSurface(digits);
-}
 
 ///////////////////////////////
 
@@ -2400,7 +2398,7 @@ static double cpu_double = 0;
 static double use_double = 0;
 static uint32_t sec_start = 0;
 
-static SDL_Surface* scaler_surface;
+static char scaler_name[16]; // for the debug HUD
 
 #ifdef USES_SWSCALER
     static int fit = 1;
@@ -2424,8 +2422,6 @@ static void selectScaler(int src_w, int src_h, int src_p) {
         aspect_w += aspect_w % 2;
     }
 
-    char scaler_name[16];
-    
     src_x = 0;
     src_y = 0;
     dst_x = 0;
@@ -2584,18 +2580,6 @@ static void selectScaler(int src_w, int src_h, int src_p) {
          aspect_w,aspect_h
      );
 
-    if (fit) {
-        dst_w = DEVICE_WIDTH;
-        dst_h = DEVICE_HEIGHT;
-    }
-    
-    if (screen->w!=dst_w || screen->h!=dst_h || screen->pitch!=dst_p) {
-        screen = GFX_resize(dst_w,dst_h,dst_p);
-    }
-    
-    // DEBUG HUD
-    if (scaler_surface) SDL_FreeSurface(scaler_surface);
-    scaler_surface = TTF_RenderUTF8_Blended(font.tiny, scaler_name, COLOR_WHITE);
 }
 static void video_refresh_callback(const void *data, unsigned width, unsigned height, size_t pitch) {
     // return;
@@ -2639,28 +2623,25 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         GFX_clearAll();
     }
     
-    // debug
+    // debug: the widest the HUD has been, so a shorter line leaves nothing behind
     static int top_width = 0;
     static int bottom_width = 0;
-    if (top_width) SDL_FillRect(screen, &(SDL_Rect){0,0,top_width,DIGIT_HEIGHT}, RGB_BLACK);
-    if (bottom_width) SDL_FillRect(screen, &(SDL_Rect){0,screen->h-DIGIT_HEIGHT,bottom_width,DIGIT_HEIGHT}, RGB_BLACK);
+    if (show_debug) {
+        if (top_width) GFX_fillRect(screen, &(SDL_Rect){0,0,top_width,SCALE1(DIGIT_HEIGHT)}, COLOR_BLACK, 255);
+        if (bottom_width) GFX_fillRect(screen, &(SDL_Rect){0,screen->h-SCALE1(DIGIT_HEIGHT),bottom_width,SCALE1(DIGIT_HEIGHT)}, COLOR_BLACK, 255);
+    }
     
     if (repeat) {
         GFX_repeatFrame(); // renderer.src keeps the last real frame for the menu's snapshot
     }
     else {
         renderer.src = (void*)data;
-        renderer.dst = screen->pixels;
-        // LOG_info("video_refresh_callback: %ix%i@%i %ix%i@%i\n",width,height,pitch,screen->w,screen->h,screen->pitch);
         GFX_blitRenderer(&renderer);
     }
     
     if (show_debug) {
         int x = 0;
         int y = screen->h - SCALE1(DIGIT_HEIGHT);
-#if defined(USE_SDL2)
-        y = height - SCALE1(DIGIT_HEIGHT); // TODO: tmp?
-#endif
         
         if (fps_double) x = MSG_blitDouble(fps_double, x,y);
         
@@ -2675,7 +2656,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
             x = MSG_blitChar(DIGIT_PERCENT,x,y);
         }
         
-        if (x>bottom_width) bottom_width = x; // keep the largest width because triple buffer
+        if (x>bottom_width) bottom_width = x;
         
         x = 0;
         y = 0;
@@ -2695,23 +2676,20 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         x = MSG_blitChar(DIGIT_CP,x,y);
         x = MSG_blitChar(DIGIT_SPACE,x,y);
         
-        if (scaler_surface) {
-            SDL_FillRect(screen, &(SDL_Rect){x,y,scaler_surface->w,SCALE1(DIGIT_HEIGHT)}, RGB_BLACK);
-            SDL_BlitSurface(scaler_surface, NULL, screen, &(SDL_Rect){x,y+((SCALE1(DIGIT_HEIGHT) - scaler_surface->h)/2)});
-            x += SCALE1(DIGIT_WIDTH) * 3;
+        GFX_Text scaler = GFX_renderText(font.tiny, scaler_name, COLOR_WHITE);
+        if (scaler.tex) {
+            MSG_blitCell(&scaler, x, y, scaler.w);
+            x += scaler.w;
         }
         
-        if (x>top_width) top_width = x; // keep the largest width because triple buffer
+        if (x>top_width) top_width = x;
     }
     
     // achievement popup
     //
-    // A texture of its own (GFX_loadToast), composed and uploaded once per
-    // message and slid in by moving its quad. It used to be drawn into the ui
-    // layer, which then had to be uploaded whole - 5.1ms a frame measured, for
-    // an 80px strip - and erased by hand, page by page. It's also drawn 1:1 in
-    // screen pixels now; the ui layer is sized to the game's output and
-    // stretched, which stretched the toast with it.
+    // A render target of its own (GFX_loadToast), drawn once per message and
+    // slid in by moving its quad, so the full-screen ui layer can stay off in
+    // game while it shows.
     {
         static uint32_t ra_toast_id = 0;
         static int ra_toast_w = 0;
@@ -2737,37 +2715,28 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
             GFX_truncateText(font.tiny, ra_msg, ra_text,
                              DEVICE_WIDTH - SCALE1(PADDING*2 + BUTTON_PADDING*2
                                                    + RA_ICON_SIZE + RA_ICON_GAP), 0);
-            SDL_Surface* text = TTF_RenderUTF8_Blended(font.tiny, ra_text, COLOR_WHITE);
+            GFX_Text text = GFX_renderText(font.tiny, ra_text, COLOR_WHITE);
 
-            if (text) {
+            if (text.tex) {
                 // trophy, gap, text -- the icon says "achievement" so the message
                 // itself is just the title or the tally. Insets match the title
                 // pill's, so the content clears the rounded caps.
                 int icon_x = SCALE1(BUTTON_PADDING);
                 int text_x = icon_x + SCALE1(RA_ICON_SIZE);
-                int pill_w = MIN(text_x + text->w + SCALE1(BUTTON_PADDING),
+                int pill_w = MIN(text_x + text.w + SCALE1(BUTTON_PADDING),
                                  DEVICE_WIDTH - SCALE1(PADDING*2));
 
-                // The ui layer's own format, starting transparent, so these
-                // blits blend exactly as they did when they went into the layer.
-                // Its corners stay transparent and the platform blends it.
-                SDL_PixelFormat* fmt = screen->format;
-                SDL_Surface* pill = SDL_CreateRGBSurface(0, pill_w, ra_pill_h, fmt->BitsPerPixel,
-                                                         fmt->Rmask, fmt->Gmask, fmt->Bmask, fmt->Amask);
+                // starts transparent, so the rounded corners stay that way
+                SDL_Surface* pill = GFX_createSurface(pill_w, ra_pill_h);
                 if (pill) {
-                    SDL_FillRect(pill, NULL, 0);
                     GFX_blitPill(ASSET_DARK_GRAY_PILL, pill, &(SDL_Rect){0, 0, pill_w, ra_pill_h});
                     GFX_blitAsset(ASSET_TROPHY, NULL, pill, &(SDL_Rect){
                         icon_x, (ra_pill_h - SCALE1(RA_ICON_SIZE)) / 2
                     });
-                    SDL_BlitSurface(text, NULL, pill, &(SDL_Rect){
-                        text_x, (ra_pill_h - text->h) / 2
-                    });
-                    GFX_loadToast(pill); // the platform keeps a copy on the gpu
-                    SDL_FreeSurface(pill);
+                    GFX_blitRenderedText(&text, NULL, pill, text_x, (ra_pill_h - text.h) / 2);
+                    GFX_loadToast(pill); // the platform owns it from here
                     ra_toast_w = pill_w;
                 }
-                SDL_FreeSurface(text);
             }
         }
 
@@ -2785,24 +2754,18 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         }
     }
     
-    // The ui layer costs ~5ms a frame to upload (the driver swizzles the whole
-    // 640x480 RGBA texture) and in game it is empty unless the debug overlay is
-    // up. Tell the platform so it can skip both the upload and the composite.
+    // In game the ui layer is empty unless the debug overlay is up, so tell
+    // the platform and it skips compositing a full-screen texture every frame.
     {
         static int ui_was_wanted = 1;
         int ui_wanted = show_debug;
-        int ui_visible = ui_wanted;
 
         // Clear on the way *down*, not on the way back up: clearing when it
         // reappears would wipe whatever was just drawn into it this frame.
-        // One extra upload of a blank layer leaves both pages genuinely empty,
-        // so nothing stale can resurface the next time it is needed.
-        if (!ui_wanted && ui_was_wanted) {
-            GFX_clearAll();
-            ui_visible = 1;
-        }
+        // Then nothing stale can resurface the next time it is needed.
+        if (!ui_wanted && ui_was_wanted) GFX_clearAll();
 
-        GFX_setUILayer(ui_visible);
+        GFX_setUILayer(ui_wanted);
         ui_was_wanted = ui_wanted; // intent, so the clear happens exactly once
     }
 
@@ -3085,10 +3048,17 @@ enum {
     STATUS_RESET= 31,
 };
 
+// A game frame on the GPU, with where it goes: placed the way the game
+// itself is on screen (see Menu_scaleRect)
+typedef struct MenuShot {
+    GFX_Image image;
+    SDL_Rect src; // the part of the frame that shows
+    SDL_Rect dst; // and where, in the w x h it was placed for
+} MenuShot;
+
 // TODO: I don't love how overloaded this has become
 static struct {
     SDL_Surface* bitmap;
-    SDL_Surface* overlay;
     char* items[ITEM_ID_COUNT];
     int rows[ITEM_ID_COUNT]; // visible row -> ITEM_*
     int row_count;
@@ -3144,10 +3114,6 @@ static void Menu_buildRows(void) {
 }
 
 void Menu_init(void) {
-    menu.overlay = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH,DEVICE_HEIGHT,FIXED_DEPTH,RGBA_MASK_AUTO);
-    SDLX_SetAlpha(menu.overlay, SDL_SRCALPHA, 0x80);
-    SDL_FillRect(menu.overlay, NULL, 0);
-    
     char emu_name[256];
     getEmuName(game.path, emu_name);
     sprintf(menu.minui_dir, SHARED_USERDATA_PATH "/.minui/%s", emu_name);
@@ -3192,7 +3158,6 @@ void Menu_init(void) {
     }
 }
 void Menu_quit(void) {
-    SDL_FreeSurface(menu.overlay);
 }
 void Menu_beforeSleep(void) {
     // sleep comes from the input poll, mid-frame for a HW core, and the
@@ -3261,8 +3226,8 @@ typedef struct MenuList {
     MenuPosition* keep; // optional, restored on entry and updated on exit
     // optional frozen game frame to sit behind the list. PLAT_flip only draws
     // the game texture on frames the core produced one, so with the core
-    // paused a menu has to blit the still itself or it composites over black.
-    SDL_Surface* backing;
+    // paused a menu has to draw the still itself or it composites over black.
+    MenuShot* backing;
     char* desc;
     MenuItem* items;
     MenuList_callback_t on_confirm;
@@ -3939,24 +3904,76 @@ static void OptionSaveChanges_updateDesc(void) {
     }
 }
 
-// The frozen game frame and the dim overlay don't change while a menu is open,
-// but compositing them is two full-screen blits that both convert pixel format
-// and one of which alpha-blends - by far the most expensive part of a repaint.
-// Flatten them once into a surface that already matches `screen`, so each
-// repaint is a straight copy: no clear, no conversion, no blending.
-static SDL_Surface* Menu_composeBackdrop(SDL_Surface* backing) {
-    if (!backing) return NULL;
+// Where a sw x sh game frame goes in a dw x dh picture of the screen (the
+// screen itself, or the half size slot preview), and which part of it shows.
+// A frame the size the game is running at gets the very rects the renderer
+// draws it with (selectScaler), scaled down with the picture, so the still
+// sits exactly where the game was. Anything else (a slot's thumbnail saved
+// at another size) is fitted whole, keeping the core's aspect ratio.
+static void Menu_scaleRect(int sw, int sh, int dw, int dh, SDL_Rect* src_rect, SDL_Rect* dst_rect) {
+    if (sw==renderer.true_w && sh==renderer.true_h && renderer.dst_w>0 && renderer.dst_h>0) {
+        int sx = renderer.src_x;
+        int sy = renderer.src_y;
+        // the forced crop draws src_w from src_x, which can run past the
+        // frame: keep to the pixels that exist
+        *src_rect = (SDL_Rect){ sx, sy, MIN(renderer.src_w, sw - sx), MIN(renderer.src_h, sh - sy) };
+        *dst_rect = (SDL_Rect){
+            renderer.dst_x * dw / DEVICE_WIDTH,
+            renderer.dst_y * dh / DEVICE_HEIGHT,
+            renderer.dst_w * dw / DEVICE_WIDTH,
+            renderer.dst_h * dh / DEVICE_HEIGHT,
+        };
+        return;
+    }
 
-    SDL_Surface* backdrop = SDL_CreateRGBSurface(SDL_SWSURFACE, screen->w, screen->h,
-                                                 screen->format->BitsPerPixel,
-                                                 screen->format->Rmask, screen->format->Gmask,
-                                                 screen->format->Bmask, screen->format->Amask);
-    if (!backdrop) return NULL; // callers fall back to compositing every frame
+    int rw, rh;
+    double fixed_aspect_ratio = ((double)DEVICE_WIDTH) / DEVICE_HEIGHT;
+    int core_aspect = core.aspect_ratio * 1000;
+    int fixed_aspect = fixed_aspect_ratio * 1000;
+    if (core_aspect>fixed_aspect) { // letterbox
+        rw = dw;
+        rh = rw / core.aspect_ratio;
+        rh += rh%2;
+    }
+    else if (core_aspect<fixed_aspect) { // pillarbox
+        rh = dh;
+        rw = rh * core.aspect_ratio;
+        rw += rw%2;
+    }
+    else {
+        rw = dw;
+        rh = dh;
+    }
+    *src_rect = (SDL_Rect){ 0, 0, sw, sh };
+    *dst_rect = (SDL_Rect){ (dw - rw) / 2, (dh - rh) / 2, rw, rh };
+}
 
-    SDL_BlitSurface(backing, NULL, backdrop, NULL);
-    SDL_BlitSurface(menu.overlay, NULL, backdrop, NULL);
-    SDL_SetSurfaceBlendMode(backdrop, SDL_BLENDMODE_NONE); // plain copy on the way out
-    return backdrop;
+static void Menu_loadShot(MenuShot* shot, SDL_Surface* frame, int w, int h) {
+    *shot = (MenuShot){0};
+    if (!frame) return;
+    Menu_scaleRect(frame->w, frame->h, w, h, &shot->src, &shot->dst);
+    shot->image = GFX_loadImage(frame);
+}
+static void Menu_freeShot(MenuShot* shot) {
+    GFX_freeImage(&shot->image);
+}
+static void Menu_blitShot(MenuShot* shot, int x, int y) {
+    if (!shot || !shot->image.tex || shot->dst.w<=0 || shot->dst.h<=0) return;
+    GFX_blitImage(&shot->image, &shot->src, screen, &(SDL_Rect){
+        x + shot->dst.x, y + shot->dst.y, shot->dst.w, shot->dst.h
+    });
+}
+
+// What every menu sits on: the frozen game frame with the pak's overlay
+// (bezel) on it, as it looked in game, dimmed; or black. Covers the whole
+// screen, so there is nothing to clear first. The bezel is only drawn here:
+// menu.bitmap, which the save state thumbnails come from, is the raw frame.
+static void Menu_blitBackdrop(MenuShot* backing) {
+    GFX_fillRect(screen, NULL, COLOR_BLACK, 255);
+    if (!backing || !backing->image.tex) return;
+    Menu_blitShot(backing, 0, 0);
+    GFX_blitGameOverlay(screen);
+    GFX_fillRect(screen, NULL, COLOR_BLACK, 0x80);
 }
 
 #define SCROLL_WIDTH 24
@@ -3970,11 +3987,11 @@ static void Menu_blitScrollArrow(SDL_Surface* dst, int x, int y, int up) {
     int h = SCALE1(SCROLL_HEIGHT);
     for (int i=0; i<h; i++) {
         int rw = (w * (i+1)) / h;
-        SDL_FillRect(dst, &(SDL_Rect){
+        GFX_fillRect(dst, &(SDL_Rect){
             x + (w - rw) / 2,
             y + (up ? i : h-1-i),
             rw, 1
-        }, RGB_GRAY);
+        }, COLOR_GRAY, 255);
     }
 }
 
@@ -3988,27 +4005,8 @@ static int Menu_options(MenuList* list) {
     int await_input = 0;
     int exit_to_game = 0;
 
-    // A translucent copy of the selection pill, so the frozen game shows
-    // through it. GFX_blitPill writes opaque pixels and the atlas supplies the
-    // rounded ends, so build it into a surface that matches `screen` (alpha
-    // channel included, or the rounded corners would come out solid) and let
-    // SDL_SetSurfaceAlphaMod scale the whole thing on the way out.
-    SDL_Surface* backdrop = Menu_composeBackdrop(list->backing);
-
-    SDL_Surface* row_pill = NULL;
-    if (list->pill_alpha>0 && list->pill_alpha<255) {
-        int pill_w = screen->w - SCALE1(PADDING*2);
-        row_pill = SDL_CreateRGBSurface(SDL_SWSURFACE, pill_w, SCALE1(BUTTON_SIZE),
-                                        screen->format->BitsPerPixel,
-                                        screen->format->Rmask, screen->format->Gmask,
-                                        screen->format->Bmask, screen->format->Amask);
-        if (row_pill) {
-            SDL_FillRect(row_pill, NULL, 0); // transparent, so the ends stay rounded
-            GFX_blitPill(ASSET_OPTION, row_pill, &(SDL_Rect){0,0,pill_w,SCALE1(BUTTON_SIZE)});
-            SDL_SetSurfaceBlendMode(row_pill, SDL_BLENDMODE_BLEND);
-            SDL_SetSurfaceAlphaMod(row_pill, list->pill_alpha);
-        }
-    }
+    // a translucent selection pill lets the frozen game show through it
+    int row_pill_alpha = (list->pill_alpha>0 && list->pill_alpha<255) ? list->pill_alpha : 255;
     
     int count;
     for (count=0; items[count].name; count++);
@@ -4208,22 +4206,12 @@ static int Menu_options(MenuList* list) {
         if (defer_menu && PAD_justReleased(BTN_MENU)) defer_menu = false;
         
         if (dirty) {
-            if (backdrop) {
-                // covers every pixel, so there is nothing to clear first
-                SDL_BlitSurface(backdrop, NULL, screen, NULL);
-            }
-            else {
-                GFX_clear(screen);
-                if (list->backing) { // compositing failed to allocate, do it the slow way
-                    SDL_BlitSurface(list->backing, NULL, screen, NULL);
-                    SDL_BlitSurface(menu.overlay, NULL, screen, NULL);
-                }
-            }
+            Menu_blitBackdrop(list->backing);
 
             int hardware_width = GFX_blitHardwareGroup(screen, show_settings);
 
             char* desc = NULL;
-            SDL_Surface* text;
+            GFX_Text text;
 
             if (list->title) {
                 char truncated[256];
@@ -4238,14 +4226,10 @@ static int Menu_options(MenuList* list) {
                     max_width,
                     SCALE1(PILL_SIZE)
                 });
-                text = TTF_RenderUTF8_Blended(font.large, truncated, COLOR_WHITE);
-                SDL_BlitSurface(text, &(SDL_Rect){
-                    0, 0, max_width - SCALE1(BUTTON_PADDING*2), text->h
-                }, screen, &(SDL_Rect){
-                    SCALE1(PADDING + BUTTON_PADDING),
-                    SCALE1(PADDING + 4)
-                });
-                SDL_FreeSurface(text);
+                text = GFX_renderText(font.large, truncated, COLOR_WHITE);
+                GFX_blitRenderedText(&text, &(SDL_Rect){
+                    0, 0, max_width - SCALE1(BUTTON_PADDING*2), text.h
+                }, screen, SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + 4));
             }
 
             // where the rows begin: under the title pill, and under the
@@ -4253,13 +4237,12 @@ static int Menu_options(MenuList* list) {
             int list_top = SCALE1(PADDING + PILL_SIZE);
 
             if (list->subtitle) {
-                text = TTF_RenderUTF8_Blended(font.small, list->subtitle, COLOR_WHITE);
-                int sub_x = (screen->w - text->w) / 2;
-                int sub_right = sub_x + text->w;
-                int sub_h = text->h;
+                text = GFX_renderText(font.small, list->subtitle, COLOR_WHITE);
+                int sub_x = (screen->w - text.w) / 2;
+                int sub_right = sub_x + text.w;
+                int sub_h = text.h;
 
-                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ sub_x, list_top });
-                SDL_FreeSurface(text);
+                GFX_blitRenderedText(&text, NULL, screen, sub_x, list_top);
 
                 // the icon badges the page from the left margin, lined up with
                 // the row pills below it, and anything that follows reads as
@@ -4273,24 +4256,22 @@ static int Menu_options(MenuList* list) {
                     left_x += SCALE1(RA_ICON_SIZE + 1);
                 }
                 if (list->subtitle_left) {
-                    text = TTF_RenderUTF8_Blended(font.small, list->subtitle_left, COLOR_WHITE);
+                    text = GFX_renderText(font.small, list->subtitle_left, COLOR_WHITE);
                     // as on the right, the centered title wins the row
-                    if (left_x + text->w < sub_x - SCALE1(RA_ICON_GAP)) {
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ left_x, list_top });
+                    if (left_x + text.w < sub_x - SCALE1(RA_ICON_GAP)) {
+                        GFX_blitRenderedText(&text, NULL, screen, left_x, list_top);
                     }
-                    SDL_FreeSurface(text);
                 }
 
                 if (list->subtitle_right) {
-                    text = TTF_RenderUTF8_Blended(font.small, list->subtitle_right, COLOR_WHITE);
+                    text = GFX_renderText(font.small, list->subtitle_right, COLOR_WHITE);
                     // right edge of the value column, so it reads as a header
                     // over the points rather than floating off on its own
-                    int x = screen->w - SCALE1(PADDING + OPTION_PADDING) - list->value_nudge - text->w;
+                    int x = screen->w - SCALE1(PADDING + OPTION_PADDING) - list->value_nudge - text.w;
                     // a long subtitle wins the row; drop this rather than overlap
                     if (x > sub_right + SCALE1(RA_ICON_GAP)) {
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){ x, list_top });
+                        GFX_blitRenderedText(&text, NULL, screen, x, list_top);
                     }
-                    SDL_FreeSurface(text);
                 }
 
                 list_top += sub_h;
@@ -4335,12 +4316,8 @@ static int Menu_options(MenuList* list) {
                         
                         if (item->desc) desc = item->desc;
                     }
-                    text = TTF_RenderUTF8_Blended(font.small, item->name, text_color);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        ox+SCALE1(OPTION_PADDING),
-                        oy+SCALE1((j*BUTTON_SIZE)+1)
-                    });
-                    SDL_FreeSurface(text);
+                    text = GFX_renderText(font.small, item->name, text_color);
+                    GFX_blitRenderedText(&text, NULL, screen, ox+SCALE1(OPTION_PADDING), oy+SCALE1((j*BUTTON_SIZE)+1));
                 }
             }
             else if (type==MENU_FIXED) {
@@ -4358,33 +4335,23 @@ static int Menu_options(MenuList* list) {
 
                     if (j==selected_row) {
                         // gray pill
-                        if (row_pill) {
-                            SDL_BlitSurface(row_pill, NULL, screen, &(SDL_Rect){
-                                ox,
-                                oy+SCALE1(j*BUTTON_SIZE)
-                            });
-                        }
-                        else {
-                            GFX_blitPill(ASSET_OPTION, screen, &(SDL_Rect){
-                                ox,
-                                oy+SCALE1(j*BUTTON_SIZE),
-                                mw,
-                                SCALE1(BUTTON_SIZE)
-                            });
-                        }
+                        GFX_blitPillAlpha(ASSET_OPTION, screen, &(SDL_Rect){
+                            ox,
+                            oy+SCALE1(j*BUTTON_SIZE),
+                            mw,
+                            SCALE1(BUTTON_SIZE)
+                        }, row_pill_alpha);
                     }
                     
                     if (item->value>=0 && item->values && item->values[item->value]) {
-                        text = TTF_RenderUTF8_Blended(font.tiny, item->values[item->value],
-                                                      item->dim ? COLOR_GRAY : COLOR_WHITE);
+                        text = GFX_renderText(font.tiny, item->values[item->value],
+                                              item->dim ? COLOR_GRAY : COLOR_WHITE);
                         // value_nudge pulls this column toward the name. Only
                         // the value moves, so headings (which have no value)
                         // keep their position exactly.
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            ox + mw - text->w - SCALE1(OPTION_PADDING) - list->value_nudge,
-                            oy+SCALE1((j*BUTTON_SIZE)+3)
-                        });
-                        SDL_FreeSurface(text);
+                        GFX_blitRenderedText(&text, NULL, screen,
+                            ox + mw - text.w - SCALE1(OPTION_PADDING) - list->value_nudge,
+                            oy+SCALE1((j*BUTTON_SIZE)+3));
                     }
                     
                     // TODO: blit a black pill on unselected rows (to cover longer item->values?) or truncate longer item->values?
@@ -4403,12 +4370,8 @@ static int Menu_options(MenuList* list) {
                         
                         if (item->desc) desc = item->desc;
                     }
-                    text = TTF_RenderUTF8_Blended(font.small, item->name, text_color);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        ox+SCALE1(OPTION_PADDING),
-                        oy+SCALE1((j*BUTTON_SIZE)+1)
-                    });
-                    SDL_FreeSurface(text);
+                    text = GFX_renderText(font.small, item->name, text_color);
+                    GFX_blitRenderedText(&text, NULL, screen, ox+SCALE1(OPTION_PADDING), oy+SCALE1((j*BUTTON_SIZE)+1));
                 }
             }
             else if (type==MENU_VAR || type==MENU_INPUT) {
@@ -4478,23 +4441,17 @@ static int Menu_options(MenuList* list) {
                         
                         if (item->desc) desc = item->desc;
                     }
-                    text = TTF_RenderUTF8_Blended(font.small, item->name, text_color);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        ox+SCALE1(OPTION_PADDING),
-                        oy+SCALE1((j*BUTTON_SIZE)+1)
-                    });
-                    SDL_FreeSurface(text);
+                    text = GFX_renderText(font.small, item->name, text_color);
+                    GFX_blitRenderedText(&text, NULL, screen, ox+SCALE1(OPTION_PADDING), oy+SCALE1((j*BUTTON_SIZE)+1));
                     
                     if (await_input && j==selected_row) {
                         // buh
                     }
                     else if (item->value>=0 && item->values && item->values[item->value]) {
-                        text = TTF_RenderUTF8_Blended(font.tiny, item->values[item->value], COLOR_WHITE); // always white
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            ox + mw - text->w - SCALE1(OPTION_PADDING),
-                            oy+SCALE1((j*BUTTON_SIZE)+3)
-                        });
-                        SDL_FreeSurface(text);
+                        text = GFX_renderText(font.tiny, item->values[item->value], COLOR_WHITE); // always white
+                        GFX_blitRenderedText(&text, NULL, screen,
+                            ox + mw - text.w - SCALE1(OPTION_PADDING),
+                            oy+SCALE1((j*BUTTON_SIZE)+3));
                     }
                 }
             }
@@ -4524,12 +4481,6 @@ static int Menu_options(MenuList* list) {
         else GFX_sync();
     }
     
-    // GFX_clearAll();
-    // GFX_flip(screen);
-
-    if (backdrop) SDL_FreeSurface(backdrop);
-    if (row_pill) SDL_FreeSurface(row_pill);
-
     if (list->keep) {
         list->keep->row = selected;
         list->keep->top = start;
@@ -4574,7 +4525,7 @@ static void Menu_achievementSummary(char* out, size_t size) {
 // Returns MENU_CALLBACK_EXIT if the user asked to go straight back to the game.
 // `backing` is the pause menu's frozen game frame, shown behind the list the
 // same way the Save / Load submenu does it.
-static int Menu_achievements(SDL_Surface* backing) {
+static int Menu_achievements(MenuShot* backing) {
     int count = RA_getAchievementCount();
     if (count<=0) return 0;
 
@@ -4707,145 +4658,9 @@ static int Menu_achievements(SDL_Surface* backing) {
 
 // Opens the list and records how it was left. Returns 1 if the player asked to
 // go back to the game (MENU), 0 if they just backed out of the list (B).
-static int Menu_achievementsVisit(SDL_Surface* backing) {
+static int Menu_achievementsVisit(MenuShot* backing) {
     ra_list_resume = (Menu_achievements(backing)==MENU_CALLBACK_EXIT);
     return ra_list_resume;
-}
-
-static void Menu_scale(SDL_Surface* src, SDL_Surface* dst) {
-    // LOG_info("Menu_scale src: %ix%i dst: %ix%i\n", src->w,src->h,dst->w,dst->h);
-    
-    uint16_t* s = src->pixels;
-    uint16_t* d = dst->pixels;
-
-    int sw = src->w;
-    int sh = src->h;
-    int sp = src->pitch / FIXED_BPP;
-    
-    int dw = dst->w;
-    int dh = dst->h;
-    int dp = dst->pitch / FIXED_BPP;
-    
-    int rx = 0;
-    int ry = 0;
-    int rw = dw;
-    int rh = dh;
-    
-    int scaling = screen_scaling;
-    if (scaling==SCALE_CROPPED && DEVICE_WIDTH==HDMI_WIDTH) {
-        scaling = SCALE_NATIVE;
-    }
-    if (scaling==SCALE_NATIVE) {
-        // LOG_info("native\n");
-        
-        rx = renderer.dst_x;
-        ry = renderer.dst_y;
-        rw = renderer.src_w;
-        rh = renderer.src_h;
-        if (renderer.scale) {
-            // LOG_info("scale: %i\n", renderer.scale);
-            rw *= renderer.scale;
-            rh *= renderer.scale;
-        }
-        else {
-            // LOG_info("forced crop\n"); // eg. fc on nano, vb on smart
-            rw -= renderer.src_x * 2;
-            rh -= renderer.src_y * 2;
-            sw = rw;
-            sh = rh;
-        }
-        
-        if (dw==DEVICE_WIDTH/2) {
-            // LOG_info("halve\n");
-            rx /= 2;
-            ry /= 2;
-            rw /= 2;
-            rh /= 2;
-        }
-    }
-    else if (scaling==SCALE_CROPPED) {
-        // LOG_info("cropped\n");
-        sw -= renderer.src_x * 2;
-        sh -= renderer.src_y * 2;
-
-        rx = renderer.dst_x;
-        ry = renderer.dst_y;
-        rw = sw * renderer.scale;
-        rh = sh * renderer.scale;
-        
-        if (dw==DEVICE_WIDTH/2) {
-            // LOG_info("halve\n");
-            rx /= 2;
-            ry /= 2;
-            rw /= 2;
-            rh /= 2;
-        }
-    }
-    
-    if (scaling==SCALE_ASPECT || rw>dw || rh>dh) {
-        // LOG_info("aspect\n");
-        double fixed_aspect_ratio = ((double)DEVICE_WIDTH) / DEVICE_HEIGHT;
-        int core_aspect = core.aspect_ratio * 1000;
-        int fixed_aspect = fixed_aspect_ratio * 1000;
-        
-        if (core_aspect>fixed_aspect) {
-            // LOG_info("letterbox\n");
-            rw = dw;
-            rh = rw / core.aspect_ratio;
-            rh += rh%2;
-        }
-        else if (core_aspect<fixed_aspect) {
-            // LOG_info("pillarbox\n");
-            rh = dh;
-            rw = rh * core.aspect_ratio;
-            rw += rw%2;
-            rw = (rw/8)*8; // probably necessary here since we're not scaling by an integer
-        }
-        else {
-            // LOG_info("perfect match\n");
-            rw = dw;
-            rh = dh;
-        }
-        
-        rx = (dw - rw) / 2;
-        ry = (dh - rh) / 2;
-    }
-    
-    // LOG_info("Menu_scale (r): %i,%i %ix%i\n",rx,ry,rw,rh);
-    // LOG_info("offset: %i,%i\n", renderer.src_x, renderer.src_y);
-
-    // dumb nearest neighbor scaling
-    int mx = (sw << 16) / rw;
-    int my = (sh << 16) / rh;
-    int ox = (renderer.src_x << 16);
-    int sx = ox;
-    int sy = (renderer.src_y << 16);
-    int lr = -1;
-    int sr = 0;
-    int dr = ry * dp;
-    int cp = dp * FIXED_BPP;
-    
-    // LOG_info("Menu_scale (s): %i,%i %ix%i\n",sx,sy,sw,sh);
-    // LOG_info("mx:%i my:%i sx>>16:%i sy>>16:%i\n",mx,my,((sx+mx) >> 16),((sy+my) >> 16));
-
-        for (int dy=0; dy<rh; dy++) {
-            sx = ox;
-            sr = (sy >> 16) * sp;
-            if (sr==lr) {
-                memcpy(d+dr,d+dr-dp,cp);
-            }
-            else {
-                for (int dx=0; dx<rw; dx++) {
-                    d[dr + rx + dx] = s[sr + (sx >> 16)];
-                    sx += mx;
-                }
-            }
-            lr = sr;
-            sy += my;
-            dr += dp;
-        }
-    
-    // LOG_info("successful\n");
 }
 
 // Hashing the rom and parsing the set; also used when achievements are turned
@@ -4890,10 +4705,10 @@ static void Menu_updateState(void) {
     // LOG_info("save_path: %s (%i)\n", save_path, menu.save_exists);
     // LOG_info("bmp_path: %s txt_path: %s (%i)\n", menu.bmp_path, menu.txt_path, menu.preview_exists);
 }
-// The core's framebuffer as an RGB565 surface. Menu_scale() and the slot
-// thumbnails are both written against 16-bit pixels, so a 32-bit core gets
-// converted once here rather than teaching every consumer two formats -- it
-// only ever runs on pause or on a save, never per frame.
+// The core's framebuffer as an RGB565 surface, for the menu's backdrop and
+// the slot thumbnails. A 32-bit core gets converted once here rather than
+// teaching every consumer two formats -- it only ever runs on pause or on a
+// save, never per frame.
 static SDL_Surface* Menu_gameFrame(void) {
     // a hardware frame only exists on the GPU: read back a copy (~40ms)
     if (hwr.active && !hwr.sw_frame) return PLAT_hwCapture(renderer.true_w, renderer.true_h);
@@ -4986,31 +4801,24 @@ static void Menu_loadState(void) {
 ///////////////////////////////////////
 // save / load submenu
 
-// Decode the active slot's thumbnail into `preview`. IMG_Load is a full PNG
-// decode plus a format conversion and a rescale, so this belongs on slot
-// changes only - it used to run on every repaint, which is what made the
-// submenu feel heavy to navigate.
-static void Menu_loadSlotPreview(SDL_Surface* preview) {
-    if (!preview) return;
-
-    SDL_FillRect(preview, NULL, 0);
-    SDL_SetSurfaceBlendMode(preview, SDL_BLENDMODE_NONE);
+// Decode the active slot's thumbnail into `preview`, a half size picture of
+// the screen. IMG_Load is a full decode plus an upload, so this belongs on
+// slot changes only - it used to run on every repaint, which is what made
+// the submenu feel heavy to navigate.
+static void Menu_loadSlotPreview(MenuShot* preview) {
+    Menu_freeShot(preview);
     if (!menu.preview_exists) return;
 
     SDL_Surface* bmp = IMG_Load(menu.bmp_path);
     if (!bmp) return; // leave the slot blank rather than show the last one's shot
 
-    SDL_Surface* raw_preview = SDL_ConvertSurfaceFormat(bmp, SDL_PIXELFORMAT_RGB565, 0);
-    if (raw_preview) {
-        Menu_scale(raw_preview, preview);
-        SDL_FreeSurface(raw_preview);
-    }
+    Menu_loadShot(preview, bmp, DEVICE_WIDTH/2, DEVICE_HEIGHT/2);
     SDL_FreeSurface(bmp);
 }
 
 // The slot thumbnail, pagination dots and all. Lifted out of the pause menu
 // unchanged - the Save / Load submenu owns it now.
-static void Menu_blitSlotPreview(SDL_Surface* preview) {
+static void Menu_blitSlotPreview(MenuShot* preview) {
     #define WINDOW_RADIUS 4 // TODO: this logic belongs in blitRect?
     #define PAGINATION_HEIGHT 6
     // unscaled
@@ -5026,13 +4834,13 @@ static void Menu_blitSlotPreview(SDL_Surface* preview) {
     ox += SCALE1(WINDOW_RADIUS);
     oy += SCALE1(WINDOW_RADIUS);
 
-    if (menu.preview_exists && preview) { // has save, has preview
-        // already decoded by Menu_loadSlotPreview, so this is just a copy
-        SDL_BlitSurface(preview, NULL, screen, &(SDL_Rect){ox,oy});
+    SDL_Rect preview_rect = {ox,oy,hw,hh};
+    GFX_fillRect(screen, &preview_rect, COLOR_BLACK, 255);
+    if (menu.preview_exists && preview && preview->image.tex) { // has save, has preview
+        // already decoded by Menu_loadSlotPreview, so this is just a draw
+        Menu_blitShot(preview, ox, oy);
     }
     else {
-        SDL_Rect preview_rect = {ox,oy,hw,hh};
-        SDL_FillRect(screen, &preview_rect, 0);
         if (menu.save_exists) GFX_blitMessage(font.large, "No Preview", screen, &preview_rect);
         else GFX_blitMessage(font.large, "Empty Slot", screen, &preview_rect);
     }
@@ -5062,7 +4870,7 @@ static void Menu_saveLoadLabels(char labels[SAVELOAD_COUNT][24]) {
 
 // Everything that depends on which slot is active. Called on entry and when
 // LEFT/RIGHT moves the slot - never per frame.
-static void Menu_slotChanged(SDL_Surface* preview, char labels[SAVELOAD_COUNT][24]) {
+static void Menu_slotChanged(MenuShot* preview, char labels[SAVELOAD_COUNT][24]) {
     Menu_updateState();        // save_exists / preview_exists / paths
     Menu_loadSlotPreview(preview);
     Menu_saveLoadLabels(labels);
@@ -5071,10 +4879,10 @@ static void Menu_slotChanged(SDL_Surface* preview, char labels[SAVELOAD_COUNT][2
 // Returns the STATUS_* the pause menu should adopt and close on, or -1 to stay
 // open. `backing` is the pause menu's dimmed game shot, reused so the two
 // screens look like one.
-static int Menu_saveLoad(SDL_Surface* backing) {
+static int Menu_saveLoad(MenuShot* backing) {
     char labels[SAVELOAD_COUNT][24];
-    SDL_Surface* preview = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH/2,DEVICE_HEIGHT/2,FIXED_DEPTH,RGBA_MASK_565);
-    SDL_Surface* backdrop = Menu_composeBackdrop(backing);
+    MenuShot preview_shot = {0};
+    MenuShot* preview = &preview_shot;
 
     int selected = 0;
     int dirty = 1;
@@ -5135,16 +4943,9 @@ static int Menu_saveLoad(SDL_Surface* backing) {
         PWR_update(&dirty, &show_setting, Menu_beforeSleep, Menu_afterSleep);
 
         if (dirty) {
-            if (backdrop) {
-                SDL_BlitSurface(backdrop, NULL, screen, NULL); // covers everything
-            }
-            else {
-                GFX_clear(screen);
-                SDL_BlitSurface(backing, NULL, screen, NULL);
-                SDL_BlitSurface(menu.overlay, NULL, screen, NULL);
-            }
+            Menu_blitBackdrop(backing);
 
-            SDL_Surface* text;
+            GFX_Text text;
 
             if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
             else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU","SLEEP", NULL }, 0, screen, 0);
@@ -5171,20 +4972,16 @@ static int Menu_saveLoad(SDL_Surface* backing) {
                 }
                 else {
                     // shadow
-                    text = TTF_RenderUTF8_Blended(font.large, item, COLOR_BLACK);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                    text = GFX_renderText(font.large, item, COLOR_BLACK);
+                    GFX_blitRenderedText(&text, NULL, screen,
                         SCALE1(2 + PADDING + BUTTON_PADDING),
-                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4)
-                    });
-                    SDL_FreeSurface(text);
+                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4));
                 }
 
-                text = TTF_RenderUTF8_Blended(font.large, item, text_color);
-                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                text = GFX_renderText(font.large, item, text_color);
+                GFX_blitRenderedText(&text, NULL, screen,
                     SCALE1(PADDING + BUTTON_PADDING),
-                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4)
-                });
-                SDL_FreeSurface(text);
+                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4));
             }
 
             Menu_blitSlotPreview(preview);
@@ -5195,8 +4992,7 @@ static int Menu_saveLoad(SDL_Surface* backing) {
         else GFX_sync();
     }
 
-    if (backdrop) SDL_FreeSurface(backdrop);
-    SDL_FreeSurface(preview);
+    Menu_freeShot(preview);
     PAD_reset(); // don't let the A/B that left this screen leak upstream
     return result;
 }
@@ -5208,21 +5004,13 @@ static void Menu_loop(void) {
     menu.bitmap = Menu_gameFrame();
     //LOG_info("Menu_loop:menu.bitmap %ix%i\n", menu.bitmap->w,menu.bitmap->h);
     
-    SDL_Surface* backing = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH,DEVICE_HEIGHT,FIXED_DEPTH,RGBA_MASK_565); 
-    if (menu.bitmap) Menu_scale(menu.bitmap, backing);
-    
-    int restore_w = screen->w;
-    int restore_h = screen->h;
-    int restore_p = screen->pitch;
-    if (restore_w!=DEVICE_WIDTH || restore_h!=DEVICE_HEIGHT) {
-        screen = GFX_resize(DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
-    }
+    // the frozen frame every menu screen sits on, on the GPU
+    MenuShot backing_shot;
+    MenuShot* backing = &backing_shot;
+    Menu_loadShot(backing, menu.bitmap, DEVICE_WIDTH, DEVICE_HEIGHT);
 
     GFX_setUILayer(1); // the menu *is* the ui layer
     GFX_showToast(0, 0, 0); // and it would be drawn over the menu
-
-    // after the resize, so it matches the screen we'll actually draw into
-    SDL_Surface* backdrop = Menu_composeBackdrop(backing);
     // sky: removed
     //SRAM_write();
     RTC_write();
@@ -5358,18 +5146,10 @@ static void Menu_loop(void) {
                         Menu_options(&options_menu);
                         if (screen_scaling!=old_scaling) {
                             selectScaler(renderer.true_w,renderer.true_h,renderer.src_p);
-                        
-                            restore_w = screen->w;
-                            restore_h = screen->h;
-                            restore_p = screen->pitch;
-                            screen = GFX_resize(DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
-                        
-                            SDL_FillRect(backing, NULL, 0);
-                            if (menu.bitmap) Menu_scale(menu.bitmap, backing);
 
-                            // both the screen and the still just changed
-                            if (backdrop) SDL_FreeSurface(backdrop);
-                            backdrop = Menu_composeBackdrop(backing);
+                            // the still sits where the game will now
+                            Menu_scaleRect(backing->image.w, backing->image.h, DEVICE_WIDTH, DEVICE_HEIGHT,
+                                           &backing->src, &backing->dst);
                         }
                         dirty = 1;
                     }
@@ -5401,15 +5181,7 @@ static void Menu_loop(void) {
         PWR_update(&dirty, &show_setting, Menu_beforeSleep, Menu_afterSleep);
         
         if (dirty) {
-            if (backdrop) {
-                // covers every pixel, so there is nothing to clear first
-                SDL_BlitSurface(backdrop, NULL, screen, NULL);
-            }
-            else {
-                GFX_clear(screen);
-                SDL_BlitSurface(backing, NULL, screen, NULL);
-                SDL_BlitSurface(menu.overlay, NULL, screen, NULL);
-            }
+            Menu_blitBackdrop(backing);
 
             int ox, oy;
             int ow = GFX_blitHardwareGroup(screen, show_setting);
@@ -5419,24 +5191,20 @@ static void Menu_loop(void) {
             int text_width = GFX_truncateText(font.large, rom_name, display_name, max_width, SCALE1(BUTTON_PADDING*2));
             max_width = MIN(max_width, text_width);
 
-            SDL_Surface* text;
-            text = TTF_RenderUTF8_Blended(font.large, display_name, COLOR_WHITE);
+            GFX_Text text;
+            text = GFX_renderText(font.large, display_name, COLOR_WHITE);
             GFX_blitPill(ASSET_BLACK_PILL, screen, &(SDL_Rect){
                 SCALE1(PADDING),
                 SCALE1(PADDING),
                 max_width,
                 SCALE1(PILL_SIZE)
             });
-            SDL_BlitSurface(text, &(SDL_Rect){
+            GFX_blitRenderedText(&text, &(SDL_Rect){
                 0,
                 0,
                 max_width-SCALE1(BUTTON_PADDING*2),
-                text->h
-            }, screen, &(SDL_Rect){
-                SCALE1(PADDING+BUTTON_PADDING),
-                SCALE1(PADDING+4)
-            });
-            SDL_FreeSurface(text);
+                text.h
+            }, screen, SCALE1(PADDING+BUTTON_PADDING), SCALE1(PADDING+4));
             
             if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
             else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU","SLEEP", NULL }, 0, screen, 0);
@@ -5454,9 +5222,9 @@ static void Menu_loop(void) {
                     char progress[RA_SUMMARY_SIZE];
                     Menu_achievementSummary(progress, sizeof(progress));
 
-                    text = TTF_RenderUTF8_Blended(font.tiny, progress, COLOR_WHITE);
+                    text = GFX_renderText(font.tiny, progress, COLOR_WHITE);
                     int row_y = SCALE1(oy + PADDING + (i * PILL_SIZE));
-                    int text_x = screen->w - SCALE1(PADDING + BUTTON_PADDING) - text->w;
+                    int text_x = screen->w - SCALE1(PADDING + BUTTON_PADDING) - text.w;
 
                     // left of the tally rather than left of the row name: the
                     // name sits inside a pill sized to fit it exactly, and an
@@ -5465,11 +5233,7 @@ static void Menu_loop(void) {
                         text_x - SCALE1(RA_ICON_SIZE),
                         row_y + (SCALE1(PILL_SIZE) - SCALE1(RA_ICON_SIZE)) / 2
                     });
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        text_x,
-                        row_y + (SCALE1(PILL_SIZE) - text->h) / 2
-                    });
-                    SDL_FreeSurface(text);
+                    GFX_blitRenderedText(&text, NULL, screen, text_x, row_y + (SCALE1(PILL_SIZE) - text.h) / 2);
                 }
 
                 if (i==selected) {
@@ -5481,12 +5245,10 @@ static void Menu_loop(void) {
                             screen->w - SCALE1(PADDING * 2),
                             SCALE1(PILL_SIZE)
                         });
-                        text = TTF_RenderUTF8_Blended(font.large, disc_name, COLOR_WHITE);
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            screen->w - SCALE1(PADDING + BUTTON_PADDING) - text->w,
-                            SCALE1(oy + PADDING + 4)
-                        });
-                        SDL_FreeSurface(text);
+                        text = GFX_renderText(font.large, disc_name, COLOR_WHITE);
+                        GFX_blitRenderedText(&text, NULL, screen,
+                            screen->w - SCALE1(PADDING + BUTTON_PADDING) - text.w,
+                            SCALE1(oy + PADDING + 4));
                     }
                     
                     TTF_SizeUTF8(font.large, item, &ow, NULL);
@@ -5503,21 +5265,17 @@ static void Menu_loop(void) {
                 }
                 else {
                     // shadow
-                    text = TTF_RenderUTF8_Blended(font.large, item, COLOR_BLACK);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                    text = GFX_renderText(font.large, item, COLOR_BLACK);
+                    GFX_blitRenderedText(&text, NULL, screen,
                         SCALE1(2 + PADDING + BUTTON_PADDING),
-                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4)
-                    });
-                    SDL_FreeSurface(text);
+                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4));
                 }
                 
                 // text
-                text = TTF_RenderUTF8_Blended(font.large, item, text_color);
-                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                text = GFX_renderText(font.large, item, text_color);
+                GFX_blitRenderedText(&text, NULL, screen,
                     SCALE1(PADDING + BUTTON_PADDING),
-                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4)
-                });
-                SDL_FreeSurface(text);
+                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4));
             }
             
             GFX_flip(screen);
@@ -5528,14 +5286,11 @@ static void Menu_loop(void) {
     
     PAD_reset();
 
-    GFX_clearAll();
+    // On quit the menu stays up: the fade out on exit starts from it
+    if (!quit) GFX_clearAll();
     PWR_warn(1);
     
     if (!quit) {
-        if (restore_w!=DEVICE_WIDTH || restore_h!=DEVICE_HEIGHT) {
-            screen = GFX_resize(restore_w,restore_h,restore_p);
-        }
-        GFX_clear(screen);
         // the FBO still holds the core's last frame: nothing has drawn into it since
         // (renderer.src is RETRO_HW_FRAME_BUFFER_VALID then)
         if (hwr.active) video_refresh_callback_hw(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
@@ -5548,10 +5303,9 @@ static void Menu_loop(void) {
         if (!HAS_POWER_BUTTON) PWR_disableSleep();
     }
     
-    if (backdrop) SDL_FreeSurface(backdrop);
+    Menu_freeShot(backing);
     SDL_FreeSurface(menu.bitmap);
     menu.bitmap = NULL;
-    SDL_FreeSurface(backing);
     PWR_disableAutosleep();
 }
 
@@ -5692,13 +5446,11 @@ int main(int argc , char* argv[]) {
     screen = GFX_init(MODE_MENU);
     DEVICE_WIDTH = screen->w; // yea or nay?
     DEVICE_HEIGHT = screen->h; // yea or nay?
-    DEVICE_PITCH = screen->pitch; // yea or nay?
     LOG_info("DEVICE_SIZE: %ix%i (%i)\n", DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
     
     VIB_init();
     PWR_init();
     if (!HAS_POWER_BUTTON) PWR_disableSleep();
-    MSG_init();
     
     // Overrides_init();
     if (exists_core_overlay(ovlpath)) {
@@ -5800,7 +5552,6 @@ finish:
     
     Config_quit();
     
-    MSG_quit();
     PWR_quit();
     VIB_quit();
     SND_quit();
