@@ -38,3 +38,8 @@ clean:
 
 $(PREFIX)/include/msettings.h:
 	cd /root/workspace/$(PLATFORM)/libmsettings && make
+
+send: all
+	/root/workspace/tools/adb push $(PRODUCT) /opt/minui/bin/$(TARGET).elf
+	/root/workspace/tools/adb shell chmod +x /opt/minui/bin/$(TARGET).elf
+	/root/workspace/tools/adb kill-server

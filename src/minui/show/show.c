@@ -58,19 +58,22 @@ int main(int argc , char* argv[]) {
 
 	int delay = argc>2 ? atoi(argv[2]) : 2;
 	
+	PLAT_setVideoFlags(PLAT_VIDEO_RGB888);
 	SDL_Surface* screen = GFX_init(MODE_MAIN);
 	PWR_init();
 	InitSettings();
 
-	SDL_FillRect(screen, NULL, 0);
+	GFX_clear(screen);
 	 
 	SDL_Surface* img = IMG_Load(path); 
-	SDL_BlitSurface(img, NULL, screen, &(SDL_Rect){(screen->w-img->w)/2,(screen->h-img->h)/2});
+	GFX_Image image = GFX_loadImage(img);
+	SDL_FreeSurface(img);
+	GFX_blitImage(&image, NULL, screen, &(SDL_Rect){(screen->w-image.w)/2,(screen->h-image.h)/2});
 	GFX_flip(screen);
 
 	sleep(delay);
 
-	SDL_FreeSurface(img);
+	GFX_freeImage(&image);
 	
 
 	QuitSettings();

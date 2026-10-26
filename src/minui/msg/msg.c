@@ -49,12 +49,8 @@
 void render_text_centered(SDL_Surface *screen, TTF_Font *font, const char *text, SDL_Color color, int y) {
     if (!text || strlen(text) == 0) return;
     
-    SDL_Surface *surface = TTF_RenderUTF8_Blended(font, text, color);
-    if (surface) {
-        SDL_Rect dest = { (screen->w - surface->w) / 2, y, surface->w, surface->h };
-        SDL_BlitSurface(surface, NULL, screen, &dest);
-        SDL_FreeSurface(surface);
-    }
+    GFX_Text rendered = GFX_renderText(font, text, color);
+    GFX_blitRenderedText(&rendered, NULL, screen, (screen->w - rendered.w) / 2, y);
 }
 
 void replace_escaped_newlines(char *str) {
@@ -102,12 +98,8 @@ int main(int argc, char *argv[]) {
     replace_escaped_newlines(title);
     replace_escaped_newlines(text);
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) return 1;
-    if (TTF_Init() < 0) { GFX_quit(); return 1; }
-
-    SDL_Surface* screen = GFX_init(MODE_MAIN);
-
-    if (!screen) { TTF_Quit(); GFX_quit(); return 1; }
+    PLAT_setVideoFlags(PLAT_VIDEO_RGB888);
+    SDL_Surface* screen = GFX_init(MODE_MAIN); // which brings up SDL and TTF too
 
     TTF_Font *font_title = TTF_OpenFont(FONT_PATH, 32);
     TTF_Font *font_text = TTF_OpenFont(FONT_PATH, 22);
@@ -118,7 +110,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+    GFX_clear(screen);
 
     SDL_Color title_color = is_error ? (SDL_Color){255, 60, 60, 255} : (SDL_Color){60, 200, 255, 255}; // Red or Blue
     SDL_Color text_color = {220, 220, 220, 255}; // Gris claro
@@ -146,10 +138,10 @@ int main(int argc, char *argv[]) {
         SDL_Delay(50);
     }
 
+    GFX_quit(); // first: its text cache holds strings in these fonts
     TTF_CloseFont(font_title);
     TTF_CloseFont(font_text);
     TTF_Quit();
-    GFX_quit();
 
     return 0;
 }

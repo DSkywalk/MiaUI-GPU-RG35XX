@@ -22,33 +22,20 @@ enum {
 int main(int argc , char* argv[]) {
 	PWR_setCPUSpeed(CPU_SPEED_MENU);
 	
+	PLAT_setVideoFlags(PLAT_VIDEO_RGB888);
 	SDL_Surface* screen = GFX_init(MODE_MAIN);
 	//PAD_init();
 	PWR_init();
 	InitSettings();
 	
-	// TODO: make use of SCALE1()
-	SDL_Surface* digits = SDL_CreateRGBSurface(SDL_SWSURFACE, SCALE2(120,16), FIXED_DEPTH,RGBA_MASK_AUTO);
-	SDL_FillRect(digits, NULL, RGB_BLACK);
-	
-	SDL_Surface* digit;
+	// digits and separators, each centred in a cell of its own so the numbers
+	// don't jitter as they change; the glyphs come from the text cache
 	char* chars[] = { "0","1","2","3","4","5","6","7","8","9","/",":", NULL };
-	char* c;
-	int i = 0;
 #define DIGIT_WIDTH 10
 #define DIGIT_HEIGHT 16
 
 #define CHAR_SLASH 10
 #define CHAR_COLON 11
-	while (c = chars[i]) {
-		digit = TTF_RenderUTF8_Blended(font.large, c, COLOR_WHITE);
-		int y = i==CHAR_COLON ? SCALE1(-1.5) : 0; // : sits too low naturally
-		// TODO: y offset is wrong here
-		// printf("%s x:%i y:%i SCALE1(DIGIT_HEIGHT):%i SCALE1(DIGIT_HEIGHT) - digit->h:%i\n", c, (i * SCALE1(DIGIT_WIDTH)), y, SCALE1(DIGIT_HEIGHT), SCALE1(DIGIT_HEIGHT) - digit->h); fflush(stdout);
-		SDL_BlitSurface(digit, NULL, digits, &(SDL_Rect){ (i * SCALE1(DIGIT_WIDTH)) + (SCALE1(DIGIT_WIDTH) - digit->w)/2, y + (SCALE1(DIGIT_HEIGHT) - digit->h)/2 });
-		SDL_FreeSurface(digit);
-		i += 1;
-	}
 	
 	SDL_Event event;
 	int quit = 0;
@@ -69,8 +56,18 @@ int main(int argc , char* argv[]) {
 	
 	// x,y,w are pre-scaled
 	int blit(int i, int x, int y) {
-		SDL_BlitSurface(digits, &(SDL_Rect){i*SCALE1(10),0,SCALE2(10,16)}, screen, &(SDL_Rect){x,y});
-		return x + SCALE1(10);
+		GFX_Text digit = GFX_renderText(font.large, chars[i], COLOR_WHITE);
+		int cell_h = SCALE1(DIGIT_HEIGHT);
+		int dy = i==CHAR_COLON ? SCALE1(-1.5) : 0; // : sits too low naturally
+		int oy = dy + (cell_h - digit.h)/2;
+		// cropped to the cell, as it always was
+		int top = oy<0 ? -oy : 0;
+		int bottom = MIN(digit.h, cell_h - oy);
+		if (bottom>top) {
+			GFX_blitRenderedText(&digit, &(SDL_Rect){0,top,digit.w,bottom-top}, screen,
+			                     x + (SCALE1(DIGIT_WIDTH) - digit.w)/2, y + oy + top);
+		}
+		return x + SCALE1(DIGIT_WIDTH);
 	}
 	void blitBar(int x, int y, int w) {
 		GFX_blitPill(ASSET_UNDERLINE, screen, &(SDL_Rect){x,y,w});
@@ -143,7 +140,7 @@ int main(int argc , char* argv[]) {
 	int show_setting = 0;
 	int was_online = PLAT_isOnline();
 	while(!quit) {
-		uint32_t frame_start = SDL_GetTicks();
+		GFX_startFrame();
 		
 		PAD_poll();
 		
@@ -288,10 +285,9 @@ int main(int argc , char* argv[]) {
 			int ampm_w;
 			if (!show_24hour) {
 				x += SCALE1(10); // space
-				SDL_Surface* text = TTF_RenderUTF8_Blended(font.large, am_selected ? "AM" : "PM", COLOR_WHITE);
-				ampm_w = text->w + SCALE1(2);
-				SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){x,y-SCALE1(3)});
-				SDL_FreeSurface(text);
+				GFX_Text text = GFX_renderText(font.large, am_selected ? "AM" : "PM", COLOR_WHITE);
+				ampm_w = text.w + SCALE1(2);
+				GFX_blitRenderedText(&text, NULL, screen, x, y-SCALE1(3));
 			}
 		
 			// cursor
@@ -308,8 +304,6 @@ int main(int argc , char* argv[]) {
 		}
 		else GFX_sync();
 	}
-	
-	SDL_FreeSurface(digits);
 	
 	QuitSettings();
 	PWR_quit();
