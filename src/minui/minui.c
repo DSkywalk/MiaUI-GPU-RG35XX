@@ -13,6 +13,9 @@
 #include "defines.h"
 #include "api.h"
 #include "utils.h"
+#include "i18n.h"
+#include "nekobit.h"
+#include "nekobit_ui.h"
 
 #define VERSION_LINE_HEIGHT 24
 
@@ -1641,6 +1644,8 @@ static int autoResume(void)
 
     // putFile(LAST_PATH, FAUX_RECENT_PATH); // saveLast() will crash here because top is NULL
 
+    NB_beginSession(sd_path, sd_path, emu_name); // before the quotes get escaped
+
     char cmd[256];
     sprintf(cmd, "sh '%s' '%s'", escapeSingleQuotes(emu_path), escapeSingleQuotes(sd_path));
     putInt(RESUME_SLOT_PATH, AUTO_RESUME_SLOT);
@@ -1656,6 +1661,13 @@ static void openPak(char *path)
     //     addRecent(path);
     // }
     saveLast(path);
+
+    if (prefixMatch(SDCARD_PATH "/Ports/", path))
+    {
+        char tag[MAX_PATH];
+        getEmuName(path, tag);
+        NB_beginSession(path, path, tag);
+    }
 
     char cmd[256];
     sprintf(cmd, "sh '%s/launch.sh'", escapeSingleQuotes(path));
@@ -1719,6 +1731,8 @@ static void openRom(char *path, char *last)
 
     char emu_path[256];
     getEmuPath(emu_name, emu_path);
+
+    NB_beginSession(sd_path, recent_path, emu_name);
 
     // NOTE: escapeSingleQuotes() modifies the passed string
     // so we need to save the path before we call that
@@ -1834,6 +1848,8 @@ static void loadLast(void)
 
     char last_path[256];
     getFile(LAST_PATH, last_path, 256);
+    if (!prefixMatch(SDCARD_PATH "/", last_path))
+        return; // not ours (a test build's, a stale one): the walk below would never reach SDCARD_PATH
 
     char full_path[256];
     strcpy(full_path, last_path);
@@ -1920,6 +1936,99 @@ static void Menu_quit(void)
 }
 
 ///////////////////////////////////////
+// NekoBit: what it picks missions from, and taking the player to one
+
+#define NB_MAX_SYSTEMS 96
+static NB_System nb_systems[NB_MAX_SYSTEMS];
+static NB_Library nb_library;
+
+static void NekoBit_open(void)
+{
+    Directory *root = stack->items[0];
+    nb_library.systems = nb_systems;
+    nb_library.system_count = 0;
+    for (int i = 0; i < root->entries->count && nb_library.system_count < NB_MAX_SYSTEMS; i++)
+    {
+        Entry *entry = root->entries->items[i];
+        if (entry->type == ENTRY_DIR && prefixMatch(ROMS_PATH "/", entry->path))
+            nb_systems[nb_library.system_count++] = (NB_System){entry->path, entry->name};
+    }
+    NBUI_open(&nb_library);
+}
+
+static void Directory_scrollTo(Directory *self, int i)
+{
+    int count = self->entries->count;
+    self->selected = i;
+    if (i < self->start || i >= self->end)
+    {
+        self->start = i;
+        self->end = self->start + MAIN_ROW_COUNT;
+        if (self->end > count)
+        {
+            self->end = count;
+            self->start = self->end - MAIN_ROW_COUNT;
+            if (self->start < 0)
+                self->start = 0;
+        }
+    }
+}
+
+// Opens the system folder the way the player would from the root (a folder
+// collated with its "Name (" siblings counts as the same system) and selects
+// the mission's game in it.
+static void NekoBit_navigate(NB_Target *target)
+{
+    while (stack->count > 1)
+        closeDirectory();
+
+    int found = -1;
+    for (int i = 0; i < top->entries->count && found < 0; i++)
+    {
+        Entry *entry = top->entries->items[i];
+        if (entry->type != ENTRY_DIR || !prefixMatch(ROMS_PATH "/", entry->path))
+            continue;
+        if (target->system[0])
+        {
+            char collated[256];
+            strcpy(collated, entry->path);
+            char *paren = strrchr(collated, '(');
+            if (paren && paren > strrchr(collated, '/'))
+                paren[1] = '\0';
+            if (exactMatch(entry->path, target->system) || (paren && prefixMatch(collated, target->system)))
+                found = i;
+        }
+        else if (target->tag[0])
+        {
+            char tag[MAX_PATH];
+            getEmuName(entry->path, tag);
+            if (exactMatch(tag, target->tag))
+                found = i;
+        }
+    }
+    if (found < 0)
+        return;
+
+    Directory_scrollTo(top, found);
+    restore_depth = -1; // a fresh folder, not the one closed last
+    openDirectory(((Entry *)top->entries->items[found])->path, 0);
+
+    if (!target->select[0])
+        return;
+    for (int i = 0; i < top->entries->count; i++)
+    {
+        Entry *entry = top->entries->items[i];
+        int len = strlen(entry->path);
+        if (exactMatch(entry->path, target->select) ||
+            (!strncmp(entry->path, target->select, len) && target->select[len] == '/'))
+        {
+            Directory_scrollTo(top, i);
+            break;
+        }
+    }
+}
+
+///////////////////////////////////////
 
 int main(int argc, char *argv[])
 {
@@ -1930,11 +2039,14 @@ int main(int argc, char *argv[])
 
     LOG_info("MinUI - MiaUI\n");
     InitSettings();
+    I18N_init();
+    NB_init(); // settles the game that just ended, before anything is drawn
 
     // the whole ui is drawn by the GPU: screen is only the handle the GFX_*
     // helpers are given, nothing is drawn into its pixels
     PLAT_setVideoFlags(PLAT_VIDEO_RGB888);
     screen = GFX_init(MODE_MAIN);
+    NBUI_init();
     PWR_init();
     if (!HAS_POWER_BUTTON && !simple_mode)
         PWR_disableSleep();
@@ -1987,7 +2099,33 @@ int main(int argc, char *argv[])
             dirty = 1;
         was_online = is_online;
 
-        if (show_version)
+        int nb = NBUI_update(now, stack->count == 1 && !show_version && !NBUI_isOpen());
+        if (nb & NBUI_REDRAW)
+            dirty = 1;
+        if (nb & NBUI_SUMMONED) // NekoBit is fully out: now the overlay
+        {
+            NekoBit_open();
+            dirty = 1;
+        }
+
+        if (NBUI_busy())
+        {
+            // NekoBit is on its way up: the menu holds still
+        }
+        else if (NBUI_isOpen())
+        {
+            NBUI_Action action;
+            if (NBUI_input(&action))
+                dirty = 1;
+            if (action.kind == NBUI_GOTO)
+            {
+                NekoBit_navigate(&action.target);
+                update_timer = now;
+                if (top->entries->count > 0)
+                    readyResume(top->entries->items[top->selected]);
+            }
+        }
+        else if (show_version)
         {
             if (PAD_justPressed(BTN_B) || PAD_tappedMenu(now))
             {
@@ -1999,7 +2137,14 @@ int main(int argc, char *argv[])
         }
         else
         {
-            if (PAD_tappedMenu(now))
+            // SELECT calls NekoBit, on the root menu only, as soon as it goes
+            // down: held, a hiding NekoBit rises; let go early, it sinks back
+            if (PAD_justPressed(BTN_SELECT) && stack->count == 1)
+            {
+                NBUI_summon(now); // the overlay opens when it's all the way up
+                dirty = 1;
+            }
+            else if (PAD_tappedMenu(now))
             {
                 show_version = 1;
                 dirty = 1;
@@ -2008,7 +2153,9 @@ int main(int argc, char *argv[])
             }
             else if (total > 0)
             {
-                if (show_setting && PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_START))
+                // MENU+SELECT+START deletes the selected file, inside a system
+                // folder only: on the root SELECT is NekoBit's alone
+                if (stack->count > 1 && show_setting && PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_START))
                 {
                     Entry *target_entry = top->entries->items[selected];
                     
@@ -2351,12 +2498,16 @@ int main(int argc, char *argv[])
 
             // the folder background goes under everything, the battery and
             // brightness pill included (it used to be drawn over them)
-            if (!show_version)
+            if (!show_version && !NBUI_isOpen())
                 Art_draw(shown_bg, 0, 0);
 
             int ow = GFX_blitHardwareGroup(screen, show_setting);
 
-            if (show_version)
+            if (NBUI_isOpen())
+            {
+                NBUI_draw(screen, show_setting);
+            }
+            else if (show_version)
             {
                 static char release[256];
                 static char *commit = NULL;
@@ -2406,9 +2557,9 @@ int main(int argc, char *argv[])
                 if (show_setting && !GetHDMI())
                     GFX_blitHardwareHints(screen, show_setting);
                 else
-                    GFX_blitButtonGroup((char *[]){BTN_SLEEP == BTN_POWER ? "POWER" : "MENU", "SLEEP", NULL}, 0, screen, 0);
+                    GFX_blitButtonGroup((char *[]){BTN_SLEEP == BTN_POWER ? "POWER" : "MENU", (char *)T(STR_SLEEP), NULL}, 0, screen, 0);
 
-                GFX_blitButtonGroup((char *[]){"B", "BACK", NULL}, 0, screen, 1);
+                GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), NULL}, 0, screen, 1);
             }
             else
             {
@@ -2488,18 +2639,19 @@ int main(int argc, char *argv[])
                 else
                 {
                     // TODO: for some reason screen's dimensions end up being 0x0 in GFX_blitMessage...
-                    GFX_blitMessage(font.large, "Empty folder", screen, &(SDL_Rect){0, 0, screen->w, screen->h});
+                    GFX_blitMessage(font.large, (char *)T(STR_EMPTY_FOLDER), screen, &(SDL_Rect){0, 0, screen->w, screen->h});
                 }
 
                 // buttons
+                int lw = screen->w; // the left group's width: NekoBit's pill keeps clear of it
                 if (show_setting && !GetHDMI())
                     GFX_blitHardwareHints(screen, show_setting);
                 else if (can_resume)
-                    GFX_blitButtonGroup((char *[]){"X", "RESUME", NULL}, 0, screen, 0);
+                    lw = GFX_blitButtonGroup((char *[]){"X", (char *)T(STR_RESUME), NULL}, 0, screen, 0);
                 else
-                    GFX_blitButtonGroup((char *[]){
+                    lw = GFX_blitButtonGroup((char *[]){
                                             BTN_SLEEP == BTN_POWER ? "POWER" : "MENU",
-                                            BTN_SLEEP == BTN_POWER || simple_mode ? "SLEEP" : "INFO",
+                                            (char *)(BTN_SLEEP == BTN_POWER || simple_mode ? T(STR_SLEEP) : T(STR_INFO)),
                                             NULL},
                                         0, screen, 0);
 
@@ -2507,22 +2659,25 @@ int main(int argc, char *argv[])
                 {
                     if (stack->count > 1)
                     {
-                        GFX_blitButtonGroup((char *[]){"B", "BACK", NULL}, 0, screen, 1);
+                        GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), NULL}, 0, screen, 1);
                     }
                 }
                 else
                 {
                     if (stack->count > 1)
                     {
-                        GFX_blitButtonGroup((char *[]){"B", "BACK", "A", "OPEN", NULL}, 1, screen, 1);
+                        GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), "A", (char *)T(STR_OPEN), NULL}, 1, screen, 1);
                     }
                     else
                     {
-                        GFX_blitButtonGroup((char *[]){"A", "OPEN", NULL}, 0, screen, 1);
+                        int bw = GFX_blitButtonGroup((char *[]){"A", (char *)T(STR_OPEN), NULL}, 0, screen, 1);
+                        if (stack->count == 1) // NekoBit lives on the root menu, between the two groups
+                            NBUI_drawFace(screen, SCALE1(PADDING + BUTTON_MARGIN) + lw, screen->w - SCALE1(PADDING + BUTTON_MARGIN) - bw);
                     }
                 }
             }
 
+            NBUI_drawBanner(screen);
             GFX_flip(screen);
             dirty = 0;
         }
@@ -2544,6 +2699,7 @@ int main(int argc, char *argv[])
     Art_quit(); // while there is still a GL context
 
     Menu_quit();
+    NB_quit();
     PWR_quit();
     GFX_quit();
     QuitSettings();
