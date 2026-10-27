@@ -19,6 +19,7 @@
 
 #include "defines.h"
 #include "api.h"
+#include "nekobit_store.h"
 #include "utils.h"
 #include "profile.h"
 
@@ -503,7 +504,7 @@ int GFX_wrapText(TTF_Font* font, char* str, int max_width, int max_lines) {
 // UI Assets Blitting
 // -------------------------------------------------------------------------
 
-static void GFX_blitAssetAlpha(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity) {
+static void GFX_blitAssetTint(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color tint, int opacity) {
     SDL_Rect* rect = &asset_rects[asset];
     SDL_Rect adj_rect = {
         .x = rect->x,
@@ -519,7 +520,13 @@ static void GFX_blitAssetAlpha(int asset, SDL_Rect* src_rect, SDL_Surface* dst, 
     }
     // 1:1, like SDL_BlitSurface: only the position of dst_rect counts
     SDL_Rect at = { dst_rect ? dst_rect->x : 0, dst_rect ? dst_rect->y : 0 };
-    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &adj_rect, &at, COLOR_WHITE, opacity);
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &adj_rect, &at, tint, opacity);
+}
+static void GFX_blitAssetAlpha(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity) {
+    GFX_blitAssetTint(asset, src_rect, dst, dst_rect, COLOR_WHITE, opacity);
+}
+void GFX_blitAssetColor(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
+    GFX_blitAssetTint(asset, src_rect, dst, dst_rect, color, 255);
 }
 void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
     GFX_blitAssetAlpha(asset, src_rect, dst, dst_rect, 255);
@@ -551,6 +558,26 @@ void GFX_blitPillAlpha(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, int opac
 }
 void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     GFX_blitPillAlpha(asset, dst, dst_rect, 255);
+}
+// a pill in any colour: the white one's caps tinted, and a fill between
+void GFX_blitPillColor(SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
+    int x = dst_rect->x;
+    int y = dst_rect->y;
+    int w = dst_rect->w;
+    int h = dst_rect->h;
+    if (h==0) h = asset_rects[ASSET_WHITE_PILL].h;
+
+    int r = h / 2;
+    if (w < h) w = h;
+    w -= h;
+
+    GFX_blitAssetTint(ASSET_WHITE_PILL, &(SDL_Rect){0,0,r,h}, dst, &(SDL_Rect){x,y}, color, 255);
+    x += r;
+    if (w>0) {
+        PLAT_uiFill(dst, &(SDL_Rect){x,y,w,h}, color, 255);
+        x += w;
+    }
+    GFX_blitAssetTint(ASSET_WHITE_PILL, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y}, color, 255);
 }
 void GFX_blitRect(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     int x = dst_rect->x;
@@ -2046,6 +2073,7 @@ void PWR_powerOff(void) {
         GFX_blitMessage(font.large, msg, gfx.screen,&(SDL_Rect){0,0,gfx.screen->w,gfx.screen->h}); //, NULL);
         GFX_flip(gfx.screen);
         IO_flush(); // the quicksave before_sleep just queued has to be on the card first
+        NB_flushToCard(); // NekoBit's RAM (tmpfs) state, from minui or a game alike
         PLAT_powerOff();
     }
 }

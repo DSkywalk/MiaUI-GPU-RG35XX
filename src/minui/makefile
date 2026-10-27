@@ -23,7 +23,7 @@ DEBUG=0
 TARGET = minui
 INCDIR = -I. -I../common/ -I../platform/ -I/opt/rg35xx/arm-buildroot-linux-gnueabihf/sysroot/usr/include/SDL2/ -I/opt/rg35xx/include 
 LIBDIR = -L/opt/rg35xx/arm-buildroot-linux-gnueabihf/sysroot/usr/lib -L/opt/rg35xx/lib
-SOURCE = $(TARGET).c ../common/utils.c ../common/api.c ../platform/platform.c
+SOURCE = $(TARGET).c nekobit.c nekobit_ui.c ../common/utils.c ../common/api.c ../common/i18n.c ../platform/platform.c
 
 CC = $(CROSS_COMPILE)gcc
 CFLAGS   = $(ARCH) -fomit-frame-pointer
