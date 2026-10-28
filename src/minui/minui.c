@@ -16,8 +16,8 @@
 #include "i18n.h"
 #include "nekobit.h"
 #include "nekobit_ui.h"
+#include "quickmenu.h"
 
-#define VERSION_LINE_HEIGHT 24
 
 static SDL_Surface *screen = NULL; // Must be assigned externally
 
@@ -1240,11 +1240,11 @@ static Array *getRoot(void)
     Array_free(entries); // root now owns entries' entries
 
     char *tools_path = SDCARD_PATH "/Tools";
-    if (exists(tools_path) && !simple_mode)
+    if (exists(tools_path) && !simple_mode) // Kids Mode
         Array_push(root, Entry_new(tools_path, ENTRY_DIR));
 
     char *ports_path = SDCARD_PATH "/Ports";
-    if (exists(ports_path) && !simple_mode)
+    if (exists(ports_path)) // kids can play them: only Tools hides
         Array_push(root, Entry_new(ports_path, ENTRY_DIR));
 
     return root;
@@ -1644,7 +1644,7 @@ static int autoResume(void)
 
     // putFile(LAST_PATH, FAUX_RECENT_PATH); // saveLast() will crash here because top is NULL
 
-    NB_beginSession(sd_path, sd_path, emu_name); // before the quotes get escaped
+    NB_beginSession(sd_path, sd_path, emu_name, 0); // before the quotes get escaped
 
     char cmd[256];
     sprintf(cmd, "sh '%s' '%s'", escapeSingleQuotes(emu_path), escapeSingleQuotes(sd_path));
@@ -1666,13 +1666,51 @@ static void openPak(char *path)
     {
         char tag[MAX_PATH];
         getEmuName(path, tag);
-        NB_beginSession(path, path, tag);
+        NB_beginSession(path, path, tag, 0);
     }
 
     char cmd[256];
     sprintf(cmd, "sh '%s/launch.sh'", escapeSingleQuotes(path));
     queueNext(cmd);
 }
+// Where a NekoBit mission took the player: the system folder it opened and
+// the game it asked for. Launching that game is playing the mission: back
+// from it, NekoBit opens by itself to show what was earned. Forgotten once
+// the player is back on the root.
+static char nb_mission_dir[MAX_PATH];
+static NB_Target nb_mission_target;
+
+// path is base, or inside it (a mission names a multi-disc game's folder)
+static int NekoBit_pathUnder(const char *base, const char *path)
+{
+    int len = strlen(base);
+    return !strncmp(base, path, len) && (path[len] == '\0' || path[len] == '/');
+}
+
+// The mission's own game (any of its discs), or for a mission without one (a
+// system, an RA set never played) anything in the system it opened. Browsing
+// off and launching something else isn't the mission any more.
+static int NekoBit_sessionFlags(char *rom, char *game)
+{
+    if (!nb_mission_dir[0] || stack->count < 2)
+        return 0;
+    const char *want = nb_mission_target.select;
+    int hit;
+    if (want[0])
+    {
+        hit = NekoBit_pathUnder(want, rom) || NekoBit_pathUnder(want, game);
+        const char *slash = strrchr(game, '/');
+        if (!hit && slash && suffixMatch(".m3u", game)) // the mission names one of its discs
+            hit = !strncmp(want, game, slash - game) && want[slash - game] == '/';
+    }
+    else
+    {
+        Directory *system = stack->items[1];
+        hit = exactMatch(system->path, nb_mission_dir);
+    }
+    return hit ? NB_SESSION_VIA_NEKOBIT : 0;
+}
+
 static void openRom(char *path, char *last)
 {
     LOG_info("openRom(%s,%s)\n", path, last);
@@ -1732,7 +1770,7 @@ static void openRom(char *path, char *last)
     char emu_path[256];
     getEmuPath(emu_name, emu_path);
 
-    NB_beginSession(sd_path, recent_path, emu_name);
+    NB_beginSession(sd_path, recent_path, emu_name, NekoBit_sessionFlags(sd_path, recent_path));
 
     // NOTE: escapeSingleQuotes() modifies the passed string
     // so we need to save the path before we call that
@@ -2012,20 +2050,68 @@ static void NekoBit_navigate(NB_Target *target)
     Directory_scrollTo(top, found);
     restore_depth = -1; // a fresh folder, not the one closed last
     openDirectory(((Entry *)top->entries->items[found])->path, 0);
+    strcpy(nb_mission_dir, top->path);
+    nb_mission_target = *target;
 
-    if (!target->select[0])
-        return;
-    for (int i = 0; i < top->entries->count; i++)
+    // down the folders to the game, however deep: each level selects what
+    // holds it, and opens it unless it's the game (a multi-disc folder)
+    for (int depth = 0; target->select[0] && depth < 16; depth++)
     {
-        Entry *entry = top->entries->items[i];
-        int len = strlen(entry->path);
-        if (exactMatch(entry->path, target->select) ||
-            (!strncmp(entry->path, target->select, len) && target->select[len] == '/'))
+        Entry *hit = NULL;
+        for (int i = 0; i < top->entries->count && !hit; i++)
         {
-            Directory_scrollTo(top, i);
-            break;
+            Entry *entry = top->entries->items[i];
+            if (NekoBit_pathUnder(entry->path, target->select))
+            {
+                Directory_scrollTo(top, i);
+                hit = entry;
+            }
         }
+        if (!hit || hit->type != ENTRY_DIR || exactMatch(hit->path, target->select))
+            break;
+        char m3u[MAX_PATH];
+        snprintf(m3u, sizeof(m3u), "%s%s.m3u", hit->path, strrchr(hit->path, '/'));
+        if (exists(m3u))
+            break;
+        restore_depth = -1;
+        openDirectory(hit->path, 0);
     }
+}
+
+///////////////////////////////////////
+// Quick Menu
+
+#define SDTOOL_PAK_PATH SDCARD_PATH "/Tools/1) System [DRK]/SD Tool.pak"
+#define QM_REOPEN_PATH "/tmp/qm_reopen" // back from the SD tool: straight to the Quick Menu
+
+// where the list is, for loadLast() to come back to
+static void saveCurrent(void)
+{
+    if (top->entries->count > 0)
+        saveLast(((Entry *)top->entries->items[top->selected])->path);
+    else
+        saveLast(top->path);
+}
+
+// Kids Mode changed what the root shows: rebuild it, back where we were
+static void reloadMenu(void)
+{
+    saveCurrent();
+    Menu_quit();
+    Menu_init();
+}
+
+static void openSDTool(void)
+{
+    if (!exists(SDTOOL_PAK_PATH))
+        return;
+    saveCurrent(); // not the pak: back to the list as it was
+    putFile(QM_REOPEN_PATH, "");
+    char path[MAX_PATH];
+    strcpy(path, SDTOOL_PAK_PATH);
+    char cmd[MAX_PATH + 32];
+    sprintf(cmd, "sh '%s/launch.sh'", escapeSingleQuotes(path));
+    queueNext(cmd);
 }
 
 ///////////////////////////////////////
@@ -2047,11 +2133,20 @@ int main(int argc, char *argv[])
     PLAT_setVideoFlags(PLAT_VIDEO_RGB888);
     screen = GFX_init(MODE_MAIN);
     NBUI_init();
+    QM_init();
     PWR_init();
     if (!HAS_POWER_BUTTON && !simple_mode)
         PWR_disableSleep();
 
     Menu_init();
+    uint32_t xp_level, xp_from;
+    if (exists(QM_REOPEN_PATH))
+    {
+        unlink(QM_REOPEN_PATH);
+        QM_open();
+    }
+    else if (NB_cameFromMission() && NB_xpToShow(&xp_level, &xp_from))
+        NekoBit_open(); // back from a mission's game with XP earned: show it go up
 
     // now that (most of) the heavy lifting is done, take a load off
     PWR_setCPUSpeed(CPU_SPEED_MENU);
@@ -2063,7 +2158,6 @@ int main(int argc, char *argv[])
     GFX_clear(screen);
 
     int dirty = 1;
-    int show_version = 0;
 
     int show_setting = 0; // 1=brightness,2=volume
     int was_online = PLAT_isOnline();
@@ -2089,6 +2183,9 @@ int main(int argc, char *argv[])
 
         PAD_poll();
 
+        if (stack->count == 1)
+            nb_mission_dir[0] = '\0'; // back on the root: on their own again
+
         int selected = top->selected;
         int total = top->entries->count;
 
@@ -2099,7 +2196,10 @@ int main(int argc, char *argv[])
             dirty = 1;
         was_online = is_online;
 
-        int nb = NBUI_update(now, stack->count == 1 && !show_version && !NBUI_isOpen());
+        if (QM_update())
+            dirty = 1;
+
+        int nb = NBUI_update(now, stack->count == 1 && !QM_isOpen() && !NBUI_isOpen());
         if (nb & NBUI_REDRAW)
             dirty = 1;
         if (nb & NBUI_SUMMONED) // NekoBit is fully out: now the overlay
@@ -2125,14 +2225,24 @@ int main(int argc, char *argv[])
                     readyResume(top->entries->items[top->selected]);
             }
         }
-        else if (show_version)
+        else if (QM_isOpen())
         {
-            if (PAD_justPressed(BTN_B) || PAD_tappedMenu(now))
-            {
-                show_version = 0;
+            int action;
+            if (QM_input(&action))
                 dirty = 1;
+            if (action != QM_NONE)
+            {
+                if (QM_kidsMode() != simple_mode)
+                {
+                    simple_mode = QM_kidsMode();
+                    reloadMenu();
+                    total = top->entries->count;
+                    update_timer = now;
+                }
                 if (!HAS_POWER_BUTTON && !simple_mode)
                     PWR_disableSleep();
+                if (action == QM_SDTOOL)
+                    openSDTool();
             }
         }
         else
@@ -2146,7 +2256,7 @@ int main(int argc, char *argv[])
             }
             else if (PAD_tappedMenu(now))
             {
-                show_version = 1;
+                QM_open();
                 dirty = 1;
                 if (!HAS_POWER_BUTTON && !simple_mode)
                     PWR_enableSleep();
@@ -2498,7 +2608,7 @@ int main(int argc, char *argv[])
 
             // the folder background goes under everything, the battery and
             // brightness pill included (it used to be drawn over them)
-            if (!show_version && !NBUI_isOpen())
+            if (!QM_isOpen() && !NBUI_isOpen())
                 Art_draw(shown_bg, 0, 0);
 
             int ow = GFX_blitHardwareGroup(screen, show_setting);
@@ -2507,59 +2617,9 @@ int main(int argc, char *argv[])
             {
                 NBUI_draw(screen, show_setting);
             }
-            else if (show_version)
+            else if (QM_isOpen())
             {
-                static char release[256];
-                static char *commit = NULL;
-                if (!commit)
-                {
-                    getFile(ROOT_SYSTEM_PATH "/version.txt", release, 256);
-
-                    char *tmp;
-                    commit = strrchr(release, '\n');
-                    commit[0] = '\0';
-                    commit = strrchr(release, '\n') + 1;
-                    tmp = strchr(release, '\n');
-                    tmp[0] = '\0';
-                }
-
-                // TODO: not sure if I want bare PLAT_* calls here
-                char *extra_key = "Model";
-                char *extra_val = PLAT_getModel();
-
-                GFX_Text release_txt = GFX_renderText(font.large, "Release", COLOR_DARK_TEXT);
-                GFX_Text version_txt = GFX_renderText(font.large, release, COLOR_WHITE);
-                GFX_Text commit_txt = GFX_renderText(font.large, "Version", COLOR_DARK_TEXT);
-                GFX_Text hash_txt = GFX_renderText(font.large, commit, COLOR_WHITE);
-
-                GFX_Text key_txt = GFX_renderText(font.large, extra_key, COLOR_DARK_TEXT);
-                GFX_Text val_txt = GFX_renderText(font.large, extra_val, COLOR_WHITE);
-
-                int l_width = MAX(release_txt.w, MAX(commit_txt.w, key_txt.w));
-                int r_width = MAX(version_txt.w, MAX(hash_txt.w, val_txt.w));
-
-                int x = l_width + SCALE1(8);
-                int w = x + r_width;
-                int h = SCALE1(VERSION_LINE_HEIGHT * 4);
-                int vx = (screen->w - w) / 2;
-                int vy = (screen->h - h) / 2;
-
-                GFX_blitRenderedText(&release_txt, NULL, screen, vx, vy);
-                GFX_blitRenderedText(&version_txt, NULL, screen, vx + x, vy);
-                GFX_blitRenderedText(&commit_txt, NULL, screen, vx, vy + SCALE1(VERSION_LINE_HEIGHT));
-                GFX_blitRenderedText(&hash_txt, NULL, screen, vx + x, vy + SCALE1(VERSION_LINE_HEIGHT));
-
-                GFX_blitRenderedText(&key_txt, NULL, screen, vx, vy + SCALE1(VERSION_LINE_HEIGHT * 3));
-                GFX_blitRenderedText(&val_txt, NULL, screen, vx + x, vy + SCALE1(VERSION_LINE_HEIGHT * 3));
-
-
-                // buttons (duped and trimmed from below)
-                if (show_setting && !GetHDMI())
-                    GFX_blitHardwareHints(screen, show_setting);
-                else
-                    GFX_blitButtonGroup((char *[]){BTN_SLEEP == BTN_POWER ? "POWER" : "MENU", (char *)T(STR_SLEEP), NULL}, 0, screen, 0);
-
-                GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), NULL}, 0, screen, 1);
+                QM_draw(screen, show_setting);
             }
             else
             {
