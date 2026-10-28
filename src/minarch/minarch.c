@@ -16,13 +16,14 @@
 #include "defines.h"
 #include "api.h"
 #include "utils.h"
+#include "i18n.h"
 
 ///////////////////////////////////////
 
 static SDL_Surface* screen;
 static int quit;
 static int show_menu;
-static int simple_mode = 0;
+static int kids_mode = 0; // minui's Kids Mode: no Options in the pause menu
 
 enum {
     SCALE_NATIVE,
@@ -43,9 +44,11 @@ static int show_debug = 0;
 static int max_ff_speed = 3; // 4x
 static int fast_forward = 0;
 static int overclock = 1; // normal
-static int achievements_enabled = 1; // FE_OPT_ACHIEVEMENTS, persisted per game
-static int achievement_sound = 1;    // FE_OPT_ACHIEVEMENT_SOUND
-static int achievement_notify = 0;   // FE_OPT_ACHIEVEMENT_NOTIFY, RA_NOTIFY_ALL
+// RetroAchievements, set in minui's Quick Menu: read from msettings at boot
+static int achievements_enabled = 1; // the global switch, set in minui
+static int achievements_game = 1;    // FE_OPT_ACHIEVEMENTS: this game's own, saved with its options
+static int achievement_sound = 1;
+static int achievement_notify = 0;   // RA_NOTIFY_ALL
 
 // PLAT_VIDEO_* from the command line (--32bits, --gl), fixed for the session
 static int video_mode = 0;
@@ -704,8 +707,6 @@ enum {
     FE_OPT_DEBUG,
     FE_OPT_MAXFF,
     FE_OPT_ACHIEVEMENTS,
-    FE_OPT_ACHIEVEMENT_SOUND,
-    FE_OPT_ACHIEVEMENT_NOTIFY,
     FE_OPT_COUNT,
 };
 
@@ -987,14 +988,6 @@ typedef char button_labels_size_check[
     (sizeof(button_labels) / sizeof(button_labels[0])
      == 2 * BINDABLE_BUTTON_COUNT + 2) ? 1 : -1];
 
-// order matches RA_NOTIFY_* in ra_offline.h, so the value indexes straight in
-static char* achievement_notify_labels[] = {
-    "All",
-    "Unlocks Only",
-    "General Only",
-    "Off",
-    NULL,
-};
 static char* overclock_labels[] = {
     "Powersave",
     "Normal",
@@ -1095,32 +1088,12 @@ static struct Config {
             [FE_OPT_ACHIEVEMENTS] = {
                 .key    = "minarch_achievements",
                 .name    = "Achievements",
-                .desc    = "Track RetroAchievements for this game.\nTurning this off restores save states.",
+                .desc    = "Track RetroAchievements in this game.\nOff brings save states back at once,\nOn applies from the next launch.",
                 .default_value = 1,
                 .value = 1,
                 .count = 2,
                 .values = onoff_labels,
                 .labels = onoff_labels,
-            },
-            [FE_OPT_ACHIEVEMENT_SOUND] = {
-                .key    = "minarch_achievement_sound",
-                .name    = "Achievement Sound",
-                .desc    = "Play a chime when an achievement\nis unlocked.",
-                .default_value = 1,
-                .value = 1,
-                .count = 2,
-                .values = onoff_labels,
-                .labels = onoff_labels,
-            },
-            [FE_OPT_ACHIEVEMENT_NOTIFY] = {
-                .key    = "minarch_achievement_notify",
-                .name    = "Notifications",
-                .desc    = "Which achievement toasts to show.\nUnlocks, general messages, both or none.",
-                .default_value = 0, // All
-                .value = 0,
-                .count = 4,
-                .values = achievement_notify_labels,
-                .labels = achievement_notify_labels,
             },
             [FE_OPT_COUNT] = {NULL}
         }
@@ -1205,18 +1178,13 @@ static void Config_syncFrontend(char* key, int value) {
         i = FE_OPT_MAXFF;
     }
     else if (exactMatch(key,config.frontend.options[FE_OPT_ACHIEVEMENTS].key)) {
-        achievements_enabled = value;
+        achievements_game = value;
+        // Off takes effect now: the set goes (its progress flushed if need
+        // be) and with it the hardcore rules, so save states come back. On
+        // waits for the next launch: a state may have been loaded since the
+        // game started, and the core's memory map is only reported at load.
+        if (!value && RA_isActive()) RA_unloadGame();
         i = FE_OPT_ACHIEVEMENTS;
-    }
-    else if (exactMatch(key,config.frontend.options[FE_OPT_ACHIEVEMENT_SOUND].key)) {
-        achievement_sound = value;
-        RA_setChime(achievement_sound); // cosmetic, so it applies at once
-        i = FE_OPT_ACHIEVEMENT_SOUND;
-    }
-    else if (exactMatch(key,config.frontend.options[FE_OPT_ACHIEVEMENT_NOTIFY].key)) {
-        achievement_notify = value;
-        RA_setNotify(achievement_notify);
-        i = FE_OPT_ACHIEVEMENT_NOTIFY;
     }
     if (i==-1) return;
     Option* option = &config.frontend.options[i];
@@ -3103,16 +3071,25 @@ static void Menu_buildRows(void) {
     menu.rows[n++] = ITEM_CONT;
     if (RA_isActive()) menu.rows[n++] = ITEM_ACHIEVEMENTS;
     else               menu.rows[n++] = ITEM_SAVELOAD;
-    menu.rows[n++] = ITEM_OPTS;
-    // simple_mode turns the Options row itself into Reset, so adding a second
-    // one there would just show "Reset" twice
-    if (!simple_mode) menu.rows[n++] = ITEM_RESET;
+    if (!kids_mode) menu.rows[n++] = ITEM_OPTS; // scaling, filters, achievements: not for kids
+    menu.rows[n++] = ITEM_RESET;
 
     menu.rows[n++] = ITEM_QUIT;
 
     menu.row_count = n;
 }
 
+// Every string the menus show, in the system language. Only what's shown: the
+// frontend options keep their English values (what the config files store)
+// and the shortcuts their English names (the config's "bind" keys).
+static const int shortcut_names[SHORTCUT_COUNT] = {
+    [SHORTCUT_SAVE_STATE]  = STR_MA_SC_SAVE_STATE,
+    [SHORTCUT_LOAD_STATE]  = STR_MA_SC_LOAD_STATE,
+    [SHORTCUT_RESET_GAME]  = STR_MA_SC_RESET_GAME,
+    [SHORTCUT_CYCLE_SCALE] = STR_MA_SC_CYCLE_SCALE,
+    [SHORTCUT_TOGGLE_FF]   = STR_MA_SC_TOGGLE_FF,
+    [SHORTCUT_HOLD_FF]     = STR_MA_SC_HOLD_FF,
+};
 void Menu_init(void) {
     char emu_name[256];
     getEmuName(game.path, emu_name);
@@ -3120,8 +3097,6 @@ void Menu_init(void) {
     mkdir(menu.minui_dir, 0755);
 
     sprintf(menu.slot_path, "%s/%s.txt", menu.minui_dir, game.name);
-    
-    if (simple_mode) menu.items[ITEM_OPTS] = "Reset";
     
     if (game.m3u_path[0]) {
         char* tmp;
@@ -3232,6 +3207,7 @@ typedef struct MenuList {
     MenuItem* items;
     MenuList_callback_t on_confirm;
     MenuList_callback_t on_change;
+    MenuList_callback_t on_chord; // optional, L1+R1+SELECT+START all held
 } MenuList;
 
 // Modal prompt. Returns 1 if the user accepted with A, 0 if they backed out
@@ -3270,7 +3246,7 @@ static int Menu_message(char* message, char** pairs) {
 
 // B is the default here: the user has to reach for A on purpose.
 static int Menu_confirm(char* message) {
-    return Menu_prompt(message, (char*[]){ "B","CANCEL", "A","CONFIRM", NULL });
+    return Menu_prompt(message, (char*[]){ "B",(char*)T(STR_MA_CANCEL), "A",(char*)T(STR_MA_CONFIRM), NULL });
 }
 
 #define OPTION_PADDING 8
@@ -3283,32 +3259,8 @@ static int MenuList_freeItems(MenuList* list, int i) {
     return MENU_CALLBACK_NOP;
 }
 
-static int OptionAchievements_openMenu(MenuList* list, int i);
-
-// Exactly the rule the root-menu row used before this moved into Frontend:
-// worth showing when there is a set to manage, or when achievements are
-// switched off and the user needs a way to turn them back on. Hidden when
-// they are on but this game has no set, because then there is nothing to
-// configure and nothing to erase.
-//
-// Both inputs are fixed for the session - RA_isActive() is decided at boot and
-// achievements_enabled only ever changes the saved config - so deciding this
-// once, when the list is first built, is enough.
-static int OptionAchievements_isRelevant(void) {
-    return RA_isActive() || !achievements_enabled;
-}
-
-// The achievement options are presented together in their own submenu rather
-// than scattered through the generic Frontend list.
-static int fe_opt_is_achievement(int i) {
-    return i==FE_OPT_ACHIEVEMENTS
-        || i==FE_OPT_ACHIEVEMENT_SOUND
-        || i==FE_OPT_ACHIEVEMENT_NOTIFY;
-}
-
 static int OptionFrontend_optionChanged(MenuList* list, int i) {
     MenuItem* item = &list->items[i];
-    if (!item->key) return MENU_CALLBACK_NOP; // the Achievements submenu row
     Config_syncFrontend(item->key, item->value);
     return MENU_CALLBACK_NOP;
 }
@@ -3323,7 +3275,6 @@ static int OptionFrontend_openMenu(MenuList* list, int i) {
         if (!config.frontend.enabled_count) {
             int enabled_count = 0;
             for (int i=0; i<config.frontend.count; i++) {
-                if (fe_opt_is_achievement(i)) continue; // lives in the submenu
                 if (!config.frontend.options[i].lock) enabled_count += 1;
             }
             config.frontend.enabled_count = enabled_count;
@@ -3331,18 +3282,15 @@ static int OptionFrontend_openMenu(MenuList* list, int i) {
             int j = 0;
             for (int i=0; i<config.frontend.count; i++) {
                 Option* item = &config.frontend.options[i];
-                if (fe_opt_is_achievement(i)) continue; // lives in the submenu
                 if (item->lock) continue;
                 config.frontend.enabled_options[j] = item;
                 j += 1;
             }
         }
 
-        // room for the options, the Achievements row when it applies, and the
-        // NULL sentinel calloc leaves at the end
-        int extra = OptionAchievements_isRelevant() ? 1 : 0;
+        // and the NULL sentinel calloc leaves at the end
         OptionFrontend_menu.items =
-            calloc(config.frontend.enabled_count + extra + 1, sizeof(MenuItem));
+            calloc(config.frontend.enabled_count + 1, sizeof(MenuItem));
         for (int j=0; j<config.frontend.enabled_count; j++) {
             Option* option = config.frontend.enabled_options[j];
             MenuItem* item = &OptionFrontend_menu.items[j];
@@ -3351,14 +3299,6 @@ static int OptionFrontend_openMenu(MenuList* list, int i) {
             item->desc = option->desc;
             item->value = option->value;
             item->values = option->labels;
-        }
-        // No key and no values: OptionFrontend_optionChanged skips it, and
-        // Menu_options treats a row with on_confirm as a drill-down.
-        if (extra) {
-            MenuItem* ach = &OptionFrontend_menu.items[config.frontend.enabled_count];
-            ach->name = "Achievements";
-            ach->desc = "RetroAchievements: on/off, sound,\nnotifications and erasing progress.";
-            ach->on_confirm = OptionAchievements_openMenu;
         }
     }
     else {
@@ -3387,7 +3327,7 @@ static int OptionEmulator_optionChanged(MenuList* list, int i) {
 static int OptionEmulator_optionDetail(MenuList* list, int i) {
     MenuItem* item = &list->items[i];
     Option* option = OptionList_getOption(&config.core, item->key);
-    if (option->full) return Menu_message(option->full, (char*[]){ "B","BACK", NULL });
+    if (option->full) return Menu_message(option->full, (char*[]){ "B",(char*)T(STR_BACK), NULL });
     else return MENU_CALLBACK_NOP;
 }
 static MenuList OptionEmulator_menu = {
@@ -3439,7 +3379,7 @@ static int OptionEmulator_openMenu(MenuList* list, int i) {
         Menu_options(&OptionEmulator_menu);
     }
     else {
-        Menu_message("This core has no options.", (char*[]){ "B","BACK", NULL });
+        Menu_message((char*)T(STR_MA_NO_CORE_OPTIONS), (char*[]){ "B",(char*)T(STR_BACK), NULL });
     }
     
     return MENU_CALLBACK_NOP;
@@ -3569,9 +3509,9 @@ static MenuList OptionShortcuts_menu = {
 };
 static char* getSaveDesc(void) {
     switch (config.loaded) {
-        case CONFIG_NONE:        return "Using defaults."; break;
-        case CONFIG_CONSOLE:    return "Using console config."; break;
-        case CONFIG_GAME:        return "Using game config."; break;
+        case CONFIG_NONE:        return (char*)T(STR_MA_USING_DEFAULTS); break;
+        case CONFIG_CONSOLE:    return (char*)T(STR_MA_USING_CONSOLE); break;
+        case CONFIG_GAME:        return (char*)T(STR_MA_USING_GAME); break;
     }
     return NULL;
 }
@@ -3583,7 +3523,7 @@ static int OptionShortcuts_openMenu(MenuList* list, int i) {
             ButtonMapping* button = &config.shortcuts[j];
             MenuItem* item = &OptionShortcuts_menu.items[j];
             item->id = j;
-            item->name = button->name;
+            item->name = (char*)T(shortcut_names[j]); // button->name is the config's key
             item->desc = NULL;
             item->value = button->local + 1;
             if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
@@ -3609,22 +3549,22 @@ static int OptionSaveChanges_onConfirm(MenuList* list, int i) {
     switch (i) {
         case 0: {
             Config_write(CONFIG_WRITE_ALL);
-            message = "Saved for console.";
+            message = (char*)T(STR_MA_SAVED_CONSOLE);
             break;
         }
         case 1: {
             Config_write(CONFIG_WRITE_GAME);
-            message = "Saved for game.";
+            message = (char*)T(STR_MA_SAVED_GAME);
             break;
         }
         default: {
             Config_restore();
-            if (config.loaded) message = "Restored console defaults.";
-            else message = "Restored defaults.";
+            if (config.loaded) message = (char*)T(STR_MA_RESTORED_CONSOLE);
+            else message = (char*)T(STR_MA_RESTORED);
             break;
         }
     }
-    Menu_message(message, (char*[]){ "A","OKAY", NULL });
+    Menu_message(message, (char*[]){ "A",(char*)T(STR_MA_OKAY), NULL });
     OptionSaveChanges_updateDesc();
     return MENU_CALLBACK_EXIT;
 }
@@ -3790,92 +3730,25 @@ static int OptionKeyboard_openMenu(MenuList* list, int i) {
 // --- FIN DE IMPLEMENTACIÓN DEL MENÚ DE TECLADO ---
 
 ///////////////////////////////////////
-// achievements options
+// achievements
 
-enum {
-    ACHIEVEMENT_OPT_ENABLED,
-    ACHIEVEMENT_OPT_SOUND,
-    ACHIEVEMENT_OPT_NOTIFY,
-    ACHIEVEMENT_OPT_RESET,
-};
+// The settings live in minui's Quick Menu now. What stays is erasing this
+// game's progress, behind L1+R1+SELECT+START in the Achievements List.
+static int ra_list_rebuild = 0; // the achievement list's progress was just erased: build it again
 
-static int OptionAchievements_toggled(MenuList* list, int i) {
-    MenuItem* item = &list->items[ACHIEVEMENT_OPT_ENABLED];
+static int Achievements_resetChord(MenuList* list, int i) {
+    if (!RA_isActive()) return MENU_CALLBACK_NOP; // no set loaded, nothing to erase
 
-    // routed through the config so Save Changes persists it per game
-    Config_syncFrontend(config.frontend.options[FE_OPT_ACHIEVEMENTS].key, item->value);
-
-    // Deliberately *not* applied to the running session. Switching them off
-    // mid-game would hand back the save state menu, which is a free way around
-    // hardcore: load a state before the boss, switch achievements back on,
-    // collect. Whatever was decided when the game booted stays decided, so
-    // RA_isActive(), the hardcore gates and the pause menu rows never move.
-    Menu_message("Save options (for game or console)\nand restart to apply", (char*[]){ "A","OKAY", NULL });
-    return MENU_CALLBACK_NOP;
-}
-
-static int OptionAchievements_reset(MenuList* list, int i) {
-    if (!RA_isActive()) {
-        // either the game has no set, or they were switched off at launch and
-        // the set was never read -- nothing is loaded to erase either way
-        Menu_message("Achievements are off for this game.\nRestart with them on to erase progress.",
-                     (char*[]){ "A","OKAY", NULL });
-        return MENU_CALLBACK_NOP;
-    }
-
-    if (!Menu_confirm("Erase all achievement progress\nfor this game?\n\nThis cannot be undone.")) {
+    if (!Menu_confirm((char*)T(STR_MA_ACH_ERASE))) {
         return MENU_CALLBACK_NOP;
     }
 
     RA_wipeProgress();
-    Menu_message("Achievement progress erased", (char*[]){ "A","OKAY", NULL });
-    return MENU_CALLBACK_NOP;
-}
-
-// Sound and notifications are cosmetic, so they apply as soon as they change.
-// Only the on/off switch waits for the next launch, because changing it live
-// would hand back the save state menu mid-run.
-static int OptionAchievements_soundChanged(MenuList* list, int i) {
-    MenuItem* item = &list->items[ACHIEVEMENT_OPT_SOUND];
-    Config_syncFrontend(config.frontend.options[FE_OPT_ACHIEVEMENT_SOUND].key, item->value);
-    return MENU_CALLBACK_NOP;
-}
-
-static int OptionAchievements_notifyChanged(MenuList* list, int i) {
-    MenuItem* item = &list->items[ACHIEVEMENT_OPT_NOTIFY];
-    Config_syncFrontend(config.frontend.options[FE_OPT_ACHIEVEMENT_NOTIFY].key, item->value);
-    return MENU_CALLBACK_NOP;
-}
-
-static MenuList OptionAchievements_menu = {
-    .type = MENU_FIXED,
-    // Only a fallback: every row below carries its own help text, which
-    // Menu_options prefers over this one.
-    .desc = "RetroAchievements settings for this game.",
-    .items = (MenuItem[]){
-        {"Achievements",
-            .desc = "Track achievements for this game. Off\nrestores the savestates. Save, then close core to apply.",
-            .values = onoff_labels, .on_change = OptionAchievements_toggled},
-        {"Achievement Sound",
-            .desc = "Chime when an achievement unlocks.\nApplies now; save changes to keep it.",
-            .values = onoff_labels, .on_change = OptionAchievements_soundChanged},
-        {"Notifications",
-            .desc = "Which toasts to show: all, unlocks only,\ngeneral only, or none. Applies now; save to keep it.",
-            .values = achievement_notify_labels, .on_change = OptionAchievements_notifyChanged},
-        {"Reset Achievements",
-            .desc = "Erase this game's progress so the set can\nbe earned again. Cannot be undone.",
-            .on_confirm = OptionAchievements_reset},
-        {NULL},
-    }
-};
-
-static int OptionAchievements_openMenu(MenuList* list, int i) {
-    // any of these can also change by loading a config, so re-read them here
-    OptionAchievements_menu.items[ACHIEVEMENT_OPT_ENABLED].value = achievements_enabled;
-    OptionAchievements_menu.items[ACHIEVEMENT_OPT_SOUND].value = achievement_sound;
-    OptionAchievements_menu.items[ACHIEVEMENT_OPT_NOTIFY].value = achievement_notify;
-    Menu_options(&OptionAchievements_menu);
-    return MENU_CALLBACK_NOP;
+    Menu_message((char*)T(STR_MA_ACH_ERASED), (char*[]){ "A",(char*)T(STR_MA_OKAY), NULL });
+    // the rows on screen still say what was earned: close the list, and
+    // Menu_achievements opens it again from the wiped data
+    ra_list_rebuild = 1;
+    return MENU_CALLBACK_EXIT;
 }
 
 static MenuList options_menu = {
@@ -3892,6 +3765,56 @@ static MenuList options_menu = {
         {NULL},
     }
 };
+
+static void Menu_localize(void) {
+    #define TS(id) ((char*)T(id))
+    static char* onoff[3], *scaling[5], *sharpness[3], *tearing[4], *sync[3], *overclock[4], *max_ff[9];
+    onoff[0] = TS(STR_QM_OFF); onoff[1] = TS(STR_QM_ON);
+    scaling[SCALE_NATIVE] = TS(STR_MA_NATIVE); scaling[SCALE_ASPECT] = TS(STR_MA_ASPECT);
+    scaling[SCALE_FULLSCREEN] = TS(STR_MA_FULLSCREEN); scaling[SCALE_CROPPED] = TS(STR_MA_CROPPED);
+    sharpness[0] = TS(STR_MA_CRISP); sharpness[1] = TS(STR_MA_SOFT);
+    tearing[0] = TS(STR_QM_OFF); tearing[1] = TS(STR_MA_LENIENT); tearing[2] = TS(STR_MA_STRICT);
+    sync[0] = TS(STR_MA_VIDEO); sync[1] = TS(STR_MA_AUDIO);
+    overclock[0] = TS(STR_MA_POWERSAVE); overclock[1] = TS(STR_MA_NORMAL); overclock[2] = TS(STR_MA_PERFORMANCE);
+    max_ff[0] = TS(STR_MA_NONE);
+    for (int i=1; i<8; i++) max_ff[i] = max_ff_labels[i]; // 2x..8x
+
+    static const struct { int opt; int name; int desc; char** labels; } fe[] = {
+        {FE_OPT_SCALING,   STR_MA_OPT_SCALING,   STR_MA_DESC_SCALING,   scaling},
+        {FE_OPT_SHARPNESS, STR_MA_OPT_SHARPNESS, STR_MA_DESC_SHARPNESS, sharpness},
+        {FE_OPT_TEARING,   STR_MA_OPT_TEARING,   STR_MA_DESC_TEARING,   tearing},
+        {FE_OPT_SYNC,      STR_MA_OPT_SYNC,      STR_MA_DESC_SYNC,      sync},
+        {FE_OPT_OVERCLOCK, STR_MA_OPT_CPU,       STR_MA_DESC_CPU,       overclock},
+        {FE_OPT_DEBUG,     STR_MA_OPT_DEBUG,     STR_MA_DESC_DEBUG,     onoff},
+        {FE_OPT_MAXFF,     STR_MA_OPT_MAXFF,     STR_MA_DESC_MAXFF,     max_ff},
+        {FE_OPT_ACHIEVEMENTS, STR_QM_ACHIEVEMENTS, STR_MA_DESC_ACH_GAME, onoff},
+    };
+    for (int i=0; i<(int)(sizeof(fe)/sizeof(fe[0])); i++) {
+        Option* option = &config.frontend.options[fe[i].opt];
+        option->name = TS(fe[i].name);
+        option->desc = TS(fe[i].desc);
+        option->labels = fe[i].labels;
+    }
+
+    menu.items[ITEM_CONT]         = TS(STR_MA_CONTINUE);
+    menu.items[ITEM_ACHIEVEMENTS] = TS(STR_QM_ACHIEVEMENTS);
+    menu.items[ITEM_SAVELOAD]     = TS(STR_MA_SAVELOAD);
+    menu.items[ITEM_OPTS]         = TS(STR_MA_OPTIONS);
+    menu.items[ITEM_RESET]        = TS(STR_MA_RESET);
+    menu.items[ITEM_QUIT]         = TS(STR_MA_QUIT);
+
+    static const int options_names[] = {STR_MA_FRONTEND, STR_MA_EMULATOR, STR_MA_CONTROLS, STR_MA_SHORTCUTS, STR_MA_KEYBOARD, STR_MA_SAVE_CHANGES};
+    for (int i=0; i<6; i++) options_menu.items[i].name = TS(options_names[i]);
+    OptionSaveChanges_menu.items[0].name = TS(STR_MA_SAVE_FOR_CONSOLE);
+    OptionSaveChanges_menu.items[1].name = TS(STR_MA_SAVE_FOR_GAME);
+    OptionSaveChanges_menu.items[2].name = TS(STR_MA_RESTORE_DEFAULTS);
+
+    OptionControls_menu.desc = TS(STR_MA_DESC_BIND);
+    OptionShortcuts_menu.desc = TS(STR_MA_DESC_BIND);
+    OptionKeyboard_menu.desc = TS(STR_MA_DESC_KEYBOARD);
+    OptionKeyboard_keyMenu.desc = TS(STR_MA_DESC_KEY);
+    #undef TS
+}
 
 static void OptionSaveChanges_updateDesc(void) {
     // by callback rather than index: the Achievements row above it is dropped
@@ -4059,6 +3982,15 @@ static int Menu_options(MenuList* list) {
         if (list->menu_exits && BTN_WAKE!=BTN_MENU && PAD_tappedMenu(SDL_GetTicks())) {
             exit_to_game = 1;
             show_options = 0;
+            continue;
+        }
+
+        // a hidden combo: all four held, on the press that completes it
+        #define MENU_CHORD (BTN_L1 | BTN_R1 | BTN_SELECT | BTN_START)
+        if (list->on_chord && PAD_justPressed(MENU_CHORD) &&
+            PAD_isPressed(BTN_L1) && PAD_isPressed(BTN_R1) && PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_START)) {
+            if (list->on_chord(list, selected)==MENU_CALLBACK_EXIT) show_options = 0;
+            dirty = 1;
             continue;
         }
 
@@ -4578,7 +4510,7 @@ static int Menu_achievements(MenuShot* backing) {
 
             if (!heading) { // only when the group turns out to be non-empty
                 heading = 1;
-                items[n].name = pass ? "--- unlocked ---" : "--- locked ---";
+                items[n].name = (char*)T(pass ? STR_MA_ACH_UNLOCKED : STR_MA_ACH_LOCKED);
                 items[n].dim  = 1;
                 items[n].skip = 1;
                 n++;
@@ -4635,7 +4567,7 @@ static int Menu_achievements(MenuShot* backing) {
         .type = MENU_FIXED,
         .jump_ends = 1,  // RIGHT jumps to the top, LEFT to the bottom
         .menu_exits = 1, // MENU goes straight back to the game
-        .subtitle = "Achievements List",
+        .subtitle = (char*)T(STR_MA_ACH_LIST),
         .subtitle_icon = ASSET_TROPHY,
         .subtitle_left = ra_points,
         .subtitle_right = ra_tally,
@@ -4643,6 +4575,7 @@ static int Menu_achievements(MenuShot* backing) {
         .pill_alpha = RA_PILL_ALPHA,
         .keep = &ra_list_pos,
         .backing = backing,
+        .on_chord = Achievements_resetChord, // erase this game's progress
         .desc = NULL,
         .items = items,
     };
@@ -4653,6 +4586,13 @@ static int Menu_achievements(MenuShot* backing) {
     free(values);
     free(descs);
 
+    // erased from inside the list: straight back into a fresh one, from the
+    // top (every row has moved to the locked group)
+    if (ra_list_rebuild) {
+        ra_list_rebuild = 0;
+        ra_list_pos = (MenuPosition){0};
+        return Menu_achievements(backing);
+    }
     return result;
 }
 
@@ -4672,6 +4612,7 @@ static void RA_loadForGame(void) {
     RA_setChime(achievement_sound);
     RA_setNotify(achievement_notify);
     RA_setMemoryFuncs(core.get_memory_data, core.get_memory_size);
+    RA_setGamePath(game.m3u_path[0] ? game.m3u_path : game.path, SDCARD_PATH);
     RA_loadGame((char*)core.tag, game.tmp_path[0]?game.tmp_path:game.path, game.data, game.size);
 }
 
@@ -4841,8 +4782,8 @@ static void Menu_blitSlotPreview(MenuShot* preview) {
         Menu_blitShot(preview, ox, oy);
     }
     else {
-        if (menu.save_exists) GFX_blitMessage(font.large, "No Preview", screen, &preview_rect);
-        else GFX_blitMessage(font.large, "Empty Slot", screen, &preview_rect);
+        if (menu.save_exists) GFX_blitMessage(font.large, (char*)T(STR_MA_NO_PREVIEW), screen, &preview_rect);
+        else GFX_blitMessage(font.large, (char*)T(STR_MA_EMPTY_SLOT), screen, &preview_rect);
     }
 
     // pagination
@@ -4862,15 +4803,15 @@ enum {
 };
 
 // Slots are 0-based on disk (<game>.st0 .. .st7); show them 1-based.
-static void Menu_saveLoadLabels(char labels[SAVELOAD_COUNT][24]) {
-    snprintf(labels[SAVELOAD_SAVE], 24, "Save / Slot %i", menu.slot + 1);
-    snprintf(labels[SAVELOAD_LOAD], 24, "Load / Slot %i", menu.slot + 1);
-    snprintf(labels[SAVELOAD_BACK], 24, "Back");
+static void Menu_saveLoadLabels(char labels[SAVELOAD_COUNT][32]) {
+    snprintf(labels[SAVELOAD_SAVE], 32, T(STR_MA_SAVE_SLOT), menu.slot + 1);
+    snprintf(labels[SAVELOAD_LOAD], 32, T(STR_MA_LOAD_SLOT), menu.slot + 1);
+    snprintf(labels[SAVELOAD_BACK], 32, "%s", T(STR_MA_BACK_ROW));
 }
 
 // Everything that depends on which slot is active. Called on entry and when
 // LEFT/RIGHT moves the slot - never per frame.
-static void Menu_slotChanged(MenuShot* preview, char labels[SAVELOAD_COUNT][24]) {
+static void Menu_slotChanged(MenuShot* preview, char labels[SAVELOAD_COUNT][32]) {
     Menu_updateState();        // save_exists / preview_exists / paths
     Menu_loadSlotPreview(preview);
     Menu_saveLoadLabels(labels);
@@ -4880,7 +4821,7 @@ static void Menu_slotChanged(MenuShot* preview, char labels[SAVELOAD_COUNT][24])
 // open. `backing` is the pause menu's dimmed game shot, reused so the two
 // screens look like one.
 static int Menu_saveLoad(MenuShot* backing) {
-    char labels[SAVELOAD_COUNT][24];
+    char labels[SAVELOAD_COUNT][32];
     MenuShot preview_shot = {0};
     MenuShot* preview = &preview_shot;
 
@@ -4948,8 +4889,8 @@ static int Menu_saveLoad(MenuShot* backing) {
             GFX_Text text;
 
             if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
-            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU","SLEEP", NULL }, 0, screen, 0);
-            GFX_blitButtonGroup((char*[]){ "B","BACK", "A","OKAY", NULL }, 1, screen, 1);
+            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU",(char*)T(STR_SLEEP), NULL }, 0, screen, 0);
+            GFX_blitButtonGroup((char*[]){ "B",(char*)T(STR_BACK), "A",(char*)T(STR_MA_OKAY), NULL }, 1, screen, 1);
 
             // rows, drawn like the pause menu's
             int oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (SAVELOAD_COUNT * PILL_SIZE)) / 2;
@@ -5039,10 +4980,10 @@ static void Menu_loop(void) {
     getDisplayName(game.name, rom_name);
     
     int rom_disc = -1;
-    char disc_name[16];
+    char disc_name[32];
     if (menu.total_discs) {
         rom_disc = menu.disc;
-        sprintf(disc_name, "Disc %i", menu.disc+1);
+        snprintf(disc_name, sizeof(disc_name), T(STR_MA_DISC), menu.disc+1);
     }
         
     Menu_buildRows();
@@ -5090,7 +5031,7 @@ static void Menu_loop(void) {
                 menu.disc -= 1;
                 if (menu.disc<0) menu.disc += menu.total_discs;
                 dirty = 1;
-                sprintf(disc_name, "Disc %i", menu.disc+1);
+                snprintf(disc_name, sizeof(disc_name), T(STR_MA_DISC), menu.disc+1);
             }
         }
         else if (PAD_justPressed(BTN_RIGHT)) {
@@ -5098,7 +5039,7 @@ static void Menu_loop(void) {
                 menu.disc += 1;
                 if (menu.disc==menu.total_discs) menu.disc -= menu.total_discs;
                 dirty = 1;
-                sprintf(disc_name, "Disc %i", menu.disc+1);
+                snprintf(disc_name, sizeof(disc_name), T(STR_MA_DISC), menu.disc+1);
             }
         }
 
@@ -5135,15 +5076,10 @@ static void Menu_loop(void) {
                 }
                 break;
                 case ITEM_OPTS: {
-                    if (simple_mode) {
-                        core.reset();
-                        RA_resetRuntime();
-                        status = STATUS_RESET;
-                        show_menu = 0;
-                    }
-                    else {
+                    {
                         int old_scaling = screen_scaling;
                         Menu_options(&options_menu);
+                        Menu_buildRows(); // achievements may have been switched off: Save / Load is back
                         if (screen_scaling!=old_scaling) {
                             selectScaler(renderer.true_w,renderer.true_h,renderer.src_p);
 
@@ -5207,8 +5143,8 @@ static void Menu_loop(void) {
             }, screen, SCALE1(PADDING+BUTTON_PADDING), SCALE1(PADDING+4));
             
             if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
-            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU","SLEEP", NULL }, 0, screen, 0);
-            GFX_blitButtonGroup((char*[]){ "B","BACK", "A","OKAY", NULL }, 1, screen, 1);
+            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU",(char*)T(STR_SLEEP), NULL }, 0, screen, 0);
+            GFX_blitButtonGroup((char*[]){ "B",(char*)T(STR_BACK), "A",(char*)T(STR_MA_OKAY), NULL }, 1, screen, 1);
             
             // list
             oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (menu.row_count * PILL_SIZE)) / 2;
@@ -5461,17 +5397,26 @@ int main(int argc , char* argv[]) {
     Game_open(rom_path);
     if (!game.is_open) goto finish;
 
-    simple_mode = exists(SIMPLE_MODE_PATH);
-    
+    // before the config and the achievements: they're set in minui
+    InitSettings();
+    I18N_init();
+    Menu_localize();
+    kids_mode = exists(SIMPLE_MODE_PATH);
+    achievements_enabled = GetRAEnabled();
+    achievement_sound = GetRASound();
+    achievement_notify = GetRANotify();
+
     // restore options
     Config_load();
     Config_init();
     Config_readOptions(); // cores with boot logo option (eg. gb) need to load options early
 
-    // After the config, so the per-game switch is known, but still before
-    // Core_load() so the memory map the core reports isn't thrown away.
-    // Switched off means we never hash the rom or parse the set at all.
-    if (achievements_enabled) RA_loadForGame();
+    // Before Core_load() so the memory map the core reports isn't thrown away.
+    // Switched off (everywhere, or for this game) means we never hash the rom
+    // or parse the set at all. With the global switch off, this game's own
+    // has nothing to do, so it isn't offered.
+    if (!achievements_enabled) config.frontend.options[FE_OPT_ACHIEVEMENTS].lock = 1;
+    if (achievements_enabled && achievements_game) RA_loadForGame();
     setOverclock(overclock);
     GFX_setVsync(prevent_tearing);
 
@@ -5498,7 +5443,7 @@ int main(int argc , char* argv[]) {
     Config_free();
         
     SND_init(core.sample_rate, core.fps);
-    InitSettings(); // after we initialize audio
+    SetVolume(GetVolume()); // again, now that the audio is open
     Menu_init();
     State_resume();
     Menu_initState(); // make ready for state shortcuts

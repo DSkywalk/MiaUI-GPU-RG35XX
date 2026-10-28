@@ -22,11 +22,13 @@ static const char* const lang_es[STR_COUNT] = {
 
 static const struct {
     const char* code;
+    const char* name; // in itself, for the language picker
     const char* const* strings;
 } languages[] = {
-    {"en", lang_en},
-    {"es", lang_es},
+    {"en", "English", lang_en},
+    {"es", "Español", lang_es},
 };
+#define LANGUAGE_COUNT (int)(sizeof(languages) / sizeof(languages[0]))
 
 static int current = 0;
 
@@ -37,7 +39,7 @@ const char* T(int id) {
 }
 
 int I18N_setLanguage(const char* code) {
-    for (int i = 0; i < (int)(sizeof(languages) / sizeof(languages[0])); i++) {
+    for (int i = 0; i < LANGUAGE_COUNT; i++) {
         if (!strcmp(code, languages[i].code)) {
             current = i;
             return 1;
@@ -48,6 +50,27 @@ int I18N_setLanguage(const char* code) {
 
 const char* I18N_getLanguage(void) {
     return languages[current].code;
+}
+
+int I18N_count(void) {
+    return LANGUAGE_COUNT;
+}
+int I18N_index(void) {
+    return current;
+}
+const char* I18N_code(int i) {
+    return i >= 0 && i < LANGUAGE_COUNT ? languages[i].code : "";
+}
+const char* I18N_name(int i) {
+    return i >= 0 && i < LANGUAGE_COUNT ? languages[i].name : "";
+}
+
+int I18N_save(const char* code) {
+    FILE* f = fopen(I18N_PATH, "w");
+    if (!f) return 0;
+    fprintf(f, "%s\n", code);
+    fclose(f);
+    return 1;
 }
 
 // "es", "ES", "es_ES", "es-ES\n": the first word, lowercased, then just its

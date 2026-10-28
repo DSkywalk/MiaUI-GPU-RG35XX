@@ -100,7 +100,7 @@ INCDIR = -I. -I./libretro-common/include/ -I../common/ -I../platform/ -I/opt/rg3
 INCDIR += $(RC_INCDIR) $(CHD_INCDIR)
 LIBDIR = -L/opt/rg35xx/arm-buildroot-linux-gnueabihf/sysroot/usr/lib -L/opt/rg35xx/lib
 
-SOURCE = $(TARGET).c ra_offline.c chd_reader.c ../common/utils.c ../common/api.c ../common/profile.c ../platform/platform.c
+SOURCE = $(TARGET).c ra_offline.c chd_reader.c ../common/utils.c ../common/api.c ../common/i18n.c ../common/profile.c ../platform/platform.c
 SOURCE += $(RC_SOURCE) $(CHD_SOURCE)
 
 CC = $(CROSS_COMPILE)gcc

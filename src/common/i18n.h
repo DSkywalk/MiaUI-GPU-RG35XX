@@ -24,5 +24,14 @@ const char* I18N_getLanguage(void);
 
 // Reads the system language (Profile/language.conf, eg. "es"), if it's set.
 void I18N_init(void);
+// Writes it there, for every app that reads it. Returns 1 on success.
+int I18N_save(const char* code);
+
+// The languages compiled in, for a picker: 0..I18N_count()-1, the current one
+// at I18N_index(). Names are in the language itself ("Español").
+int I18N_count(void);
+int I18N_index(void);
+const char* I18N_code(int i);
+const char* I18N_name(int i);
 
 #endif
