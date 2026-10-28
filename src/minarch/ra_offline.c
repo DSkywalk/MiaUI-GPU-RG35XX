@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -53,6 +54,8 @@ typedef char ra_unlock_is_packed[(sizeof(RA_Unlock) == 2*sizeof(uint32_t)) ? 1 :
 // how long a popup stays on screen, in frames (~4s at 60fps)
 #define RA_MSG_FRAMES 240
 #define RA_MSG_SIZE   160
+#define RA_MSG_QUEUE  6  // toasts waiting behind the one on screen
+#define RA_MSG_GAP    12 // frames of nothing between two, so each slides in on its own
 
 // RA ships a dummy "Warning: Outdated Emulator" achievement in every set.
 // Its trigger is `1=1.300.` so it would always pop after 300 frames.
@@ -87,11 +90,20 @@ static struct {
     char      root[MAX_PATH];
     char      data_path[MAX_PATH];     // the set we parsed, so we can re-read it
     char      progress_path[MAX_PATH];
+    char      game_path[MAX_PATH];     // relative to the card, "" = unknown
+    char      stored_path[MAX_PATH];   // what the progress file says
 
     char      msg[RA_MSG_SIZE];
     int       msg_frames;
     int       msg_kind;    // RA_MSG_*, so a mode change can retire a live toast
     uint32_t  msg_id;      // bumped per message so the ui can cache its render
+    struct {
+        char text[RA_MSG_SIZE];
+        int  kind;
+    }         msg_queue[RA_MSG_QUEUE]; // a ring: the next one is at msg_head
+    int       msg_head;
+    int       msg_count;
+    int       msg_gap;     // frames the strip has been clear with toasts waiting
 
     int       notify;      // RA_NOTIFY_*, how talkative the toasts are
     int       chime;       // 0 silences the unlock sound
@@ -200,8 +212,12 @@ static void ra_addUnlocked(uint32_t id, uint32_t date) {
 ///////////////////////////////////////
 // progress file
 //
-//   {"hash":"<md5>","set":"a1b2c3d4","total":23,
+//   {"hash":"<md5>","set":"a1b2c3d4","total":23,"path":"/Roms/...",
 //    "unlocked":[1001,1002],"check":"e5f6a7b8"}
+//
+// `path` is where the game was last played from, relative to the card, for
+// NekoBit to find it by. It isn't part of the checksum: moving a game must
+// never cost its progress. It's rewritten only when it changes.
 //
 // `set` fingerprints the base set the file was written against; `check` is an
 // FNV-1a over the game hash, that `set` value and the unlocked list. A file
@@ -282,6 +298,30 @@ static int ra_readField(const char* json, const char* key, char* out, size_t siz
     return 1;
 }
 
+// "key":"string", with the \" and \\ escapes ra_saveProgress writes
+static int ra_readString(const char* json, const char* key, char* out, size_t size) {
+    const char* at = strstr(json, key);
+    if (!at || !(at = strchr(at + strlen(key), ':'))) return 0;
+    while (*++at == ' ');
+    if (*at++ != '"') return 0;
+    size_t n = 0;
+    for (; *at && *at != '"' && n + 1 < size; at++) {
+        if (*at == '\\' && at[1]) at++;
+        out[n++] = *at;
+    }
+    out[n] = '\0';
+    return 1;
+}
+
+static void ra_writeString(FILE* f, const char* str) {
+    fputc('"', f);
+    for (; *str; str++) {
+        if (*str == '"' || *str == '\\') fputc('\\', f);
+        fputc(*str, f);
+    }
+    fputc('"', f);
+}
+
 static void ra_loadProgress(void) {
     char* json = ra_readFile(ra.progress_path, NULL);
     if (!json) return;
@@ -296,6 +336,9 @@ static void ra_loadProgress(void) {
     // the file has to name this game, or it belongs to something else
     int hash_ok = ra_readField(json, "\"hash\"", field, sizeof(field)) &&
                   strcasecmp(field, ra.hash)==0;
+
+    if (!ra_readString(json, "\"path\"", ra.stored_path, sizeof(ra.stored_path)))
+        ra.stored_path[0] = '\0';
 
     // "unlocked":[{"id":N,"date":N},...] - we wrote this file ourselves, so
     // walking { to } and pulling the two keys out of each object is enough.
@@ -332,6 +375,12 @@ static void ra_loadProgress(void) {
         // retired achievement). The ids still mean the same thing, so keep the
         // progress and just refresh the file.
         LOG_info("RA: achievement set changed, keeping progress\n");
+        ra.progress_stale = 1;
+    }
+
+    // played from somewhere new: one write
+    if (ra.game_path[0] && strcmp(ra.game_path, ra.stored_path)) {
+        LOG_info("RA: recording the game's path\n");
         ra.progress_stale = 1;
     }
 
@@ -375,8 +424,15 @@ static void ra_saveProgress(void) {
         return;
     }
 
-    fprintf(f, "{\"hash\":\"%s\",\"set\":\"%08x\",\"total\":%u,\"unlocked\":[",
+    fprintf(f, "{\"hash\":\"%s\",\"set\":\"%08x\",\"total\":%u,",
             ra.hash, ra.set_check, ra.total);
+    const char* path = ra.game_path[0] ? ra.game_path : ra.stored_path;
+    if (path[0]) {
+        fputs("\"path\":", f);
+        ra_writeString(f, path);
+        fputc(',', f);
+    }
+    fputs("\"unlocked\":[", f);
     for (uint32_t i=0; i<ra.unlocked_count; i++) {
         fprintf(f, "%s{\"id\":%u,\"date\":%u}", i ? "," : "",
                 ra.unlocked[i].id, ra.unlocked[i].date);
@@ -431,6 +487,57 @@ static uint32_t ra_readMemory(uint32_t address, uint8_t* buffer, uint32_t num_by
 ///////////////////////////////////////
 // runtime events
 
+static void ra_showMsg(int kind, const char* text) {
+    memcpy(ra.msg, text, sizeof(ra.msg));
+    ra.msg_kind = kind;
+    ra.msg_frames = RA_MSG_FRAMES;
+    ra.msg_id++;
+}
+
+// A toast: on screen straight away if the strip is free, else in line behind
+// what's showing, so unlocks in the same frame each get their turn. A full
+// line drops the newcomer (the unlock itself is recorded either way).
+static void ra_postMsg(int kind, const char* fmt, ...) {
+    if (!ra_wantsMsg(kind)) return;
+    char text[RA_MSG_SIZE];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+
+    if (ra.msg_frames==0 && ra.msg_count==0) {
+        ra_showMsg(kind, text);
+        return;
+    }
+    if (ra.msg_count==RA_MSG_QUEUE) {
+        LOG_info("RA: toast queue full, dropping \"%s\"\n", text);
+        return;
+    }
+    int slot = (ra.msg_head + ra.msg_count++) % RA_MSG_QUEUE;
+    memcpy(ra.msg_queue[slot].text, text, sizeof(text));
+    ra.msg_queue[slot].kind = kind;
+}
+
+// Once per frame: when the strip has been clear for RA_MSG_GAP frames, the
+// next toast in line, skipping any the notify setting has turned off since
+static void ra_nextMsg(void) {
+    if (ra.msg_frames>0 || ra.msg_count==0) return;
+    if (ra.msg_gap<RA_MSG_GAP) {
+        ra.msg_gap++;
+        return;
+    }
+    ra.msg_gap = 0;
+    while (ra.msg_count>0) {
+        int i = ra.msg_head;
+        ra.msg_head = (ra.msg_head + 1) % RA_MSG_QUEUE;
+        ra.msg_count--;
+        if (ra_wantsMsg(ra.msg_queue[i].kind)) {
+            ra_showMsg(ra.msg_queue[i].kind, ra.msg_queue[i].text);
+            return;
+        }
+    }
+}
+
 static void ra_eventHandler(const rc_runtime_event_t* event) {
     if (event->type!=RC_RUNTIME_EVENT_ACHIEVEMENT_TRIGGERED) return;
 
@@ -449,13 +556,7 @@ static void ra_eventHandler(const rc_runtime_event_t* event) {
     // the trophy the toast draws is the points symbol, so the number needs no
     // unit beside it. Only the toast is suppressed here - the unlock itself is
     // recorded and saved below either way.
-    if (ra_wantsMsg(RA_MSG_UNLOCK)) {
-        snprintf(ra.msg, sizeof(ra.msg), "%u   %s",
-                 entry ? entry->points : 0, title ? title : "???");
-        ra.msg_kind = RA_MSG_UNLOCK;
-        ra.msg_frames = RA_MSG_FRAMES;
-        ra.msg_id++;
-    }
+    ra_postMsg(RA_MSG_UNLOCK, "%u   %s", entry ? entry->points : 0, title ? title : "???");
 
     //LOG_debug("RA: unlocked %u (%s)\n", event->id, title ? title : "???");
 
@@ -603,6 +704,13 @@ void RA_setNotify(int mode) {
     // Retire a toast that is still on screen but no longer wanted, so picking
     // "Off" takes the current one down rather than leaving it to time out.
     if (ra.msg_frames>0 && !ra_wantsMsg(ra.msg_kind)) ra.msg_frames = 0;
+}
+
+void RA_setGamePath(const char* path, const char* sd_root) {
+    size_t n = strlen(sd_root);
+    ra.game_path[0] = '\0';
+    if (path && !strncmp(path, sd_root, n) && path[n] == '/')
+        snprintf(ra.game_path, sizeof(ra.game_path), "%s", path + n);
 }
 
 void RA_setChime(int enabled) {
@@ -783,17 +891,8 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     // loading actually changed something, which for a good file it does not.
     ra_saveProgress();
 
-    if (ra_wantsMsg(RA_MSG_GENERAL)) {
-        if (ra.invalidated) {
-            snprintf(ra.msg, sizeof(ra.msg), "Progress file was modified - progress reset");
-        }
-        else {
-            snprintf(ra.msg, sizeof(ra.msg), "%u   %u/%u", ra.points, ra.unlocked_count, ra.total);
-        }
-        ra.msg_kind = RA_MSG_GENERAL;
-        ra.msg_frames = RA_MSG_FRAMES;
-        ra.msg_id++;
-    }
+    if (ra.invalidated) ra_postMsg(RA_MSG_GENERAL, "Progress file was modified - progress reset");
+    else ra_postMsg(RA_MSG_GENERAL, "%u   %u/%u", ra.points, ra.unlocked_count, ra.total);
 
     return 1;
 }
@@ -818,23 +917,31 @@ void RA_unloadGame(void) {
     free(ra.unlocked);
     free(ra.descriptors);
 
-    // keep root and the memory funcs; they outlive the game
+    // keep root, the memory funcs and the settings; they outlive the game.
+    // RA_loadGame starts here, so this also keeps what was set up for it
+    // (the toasts, the chime and the game's path would be lost otherwise)
     RA_GetMemoryData get_data = ra.get_data;
     RA_GetMemorySize get_size = ra.get_size;
-    char root[MAX_PATH];
+    int notify = ra.notify, chime = ra.chime;
+    static char root[MAX_PATH], game_path[MAX_PATH];
     memcpy(root, ra.root, sizeof(root));
+    memcpy(game_path, ra.game_path, sizeof(game_path));
 
     memset(&ra, 0, sizeof(ra));
 
     ra.get_data = get_data;
     ra.get_size = get_size;
+    ra.notify = notify;
+    ra.chime = chime;
     memcpy(ra.root, root, sizeof(ra.root));
+    memcpy(ra.game_path, game_path, sizeof(ra.game_path));
 }
 
 void RA_doFrame(void) {
     if (!ra.active) return;
 
     if (ra.msg_frames>0) ra.msg_frames--;
+    ra_nextMsg();
 
     if (!ra.mem_ready) {
         // some cores only map their memory after a few retro_run() calls
@@ -886,12 +993,7 @@ int RA_wipeProgress(void) {
 
     LOG_info("RA: progress wiped, tracking %u/%u\n", activated, ra.total);
 
-    if (ra_wantsMsg(RA_MSG_GENERAL)) {
-        snprintf(ra.msg, sizeof(ra.msg), "0   0/%u", ra.total);
-        ra.msg_kind = RA_MSG_GENERAL;
-        ra.msg_frames = RA_MSG_FRAMES;
-        ra.msg_id++;
-    }
+    ra_postMsg(RA_MSG_GENERAL, "0   0/%u", ra.total);
 
     return activated>0;
 }

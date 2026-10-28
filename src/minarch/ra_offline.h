@@ -44,6 +44,12 @@ void RA_setMemoryFuncs(RA_GetMemoryData get_data, RA_GetMemorySize get_size);
 // are deep-copied, the core may free its own copy afterwards.
 void RA_setMemoryMap(const struct retro_memory_map* mmap);
 
+// The game as the player picked it (the m3u of a multi-disc game, the zip
+// rather than its unzipped copy), recorded in the progress file relative to
+// `sd_root` so NekoBit can take the player straight to it. A path outside
+// sd_root isn't recorded. Before RA_loadGame, after RA_init.
+void RA_setGamePath(const char* path, const char* sd_root);
+
 // Hash the rom, look for <root>/data/<hash>.json and arm the runtime.
 // `rom_data`/`rom_size` may be NULL/0 when the core loads from disk.
 // Returns 1 if achievements were loaded for this game, 0 otherwise.
