@@ -30,3 +30,7 @@ clean:
 	rm -f "lib$(TARGET).so"
 	rm -f $(PREFIX)/include/$(TARGET).h
 	rm -f $(PREFIX)/lib/lib$(TARGET).so
+
+send: build
+	/root/workspace/tools/adb push lib$(TARGET).so /lib/lib$(TARGET).so
+	/root/workspace/tools/adb kill-server

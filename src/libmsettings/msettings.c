@@ -13,15 +13,20 @@
 
 ///////////////////////////////////////
 
-#define SETTINGS_VERSION 2
+#define SETTINGS_VERSION 3
 typedef struct Settings {
-    int version; // future proofing
+    int version; // a file from another version is ignored: defaults instead
     int brightness;
     int headphones;
     int speaker;
     int unused[2]; // for future use
     // NOTE: doesn't really need to be persisted but still needs to be shared
     int jack; 
+    int auto_sleep;  // index, see msettings.h
+    int sleep_off;   // index, see msettings.h
+    int ra_enabled;
+    int ra_sound;
+    int ra_notify;   // minarch's RA_NOTIFY_* order
 } Settings;
 static Settings DefaultSettings = {
     .version = SETTINGS_VERSION,
@@ -29,6 +34,11 @@ static Settings DefaultSettings = {
     .headphones = 4,
     .speaker = 8,
     .jack = 0,
+    .auto_sleep = 2, // 2 minutes
+    .sleep_off = 0,  // 5 minutes
+    .ra_enabled = 1,
+    .ra_sound = 1,
+    .ra_notify = 0,  // all
 };
 static Settings* settings;
 
@@ -71,10 +81,9 @@ void InitSettings(void) {
         if (fd>=0) {
             //printf("Loading settings from: %s\n", SettingsPath);
             read(fd, settings, shm_size);
-            // TODO: use settings->version for future proofing?
             close(fd);
         }
-        else {
+        if (fd<0 || settings->version!=SETTINGS_VERSION) {
             // load defaults
             //printf("Loading defaults (ign: %s)\n", SettingsPath);
             memcpy(settings, &DefaultSettings, shm_size);
@@ -97,8 +106,8 @@ void SaveSettings(void) {
     int fd = open(SettingsPath, O_CREAT|O_WRONLY, 0644);
     if (fd>=0) {
         write(fd, settings, shm_size);
+        fsync(fd); // just this file: a whole sync() stalls whoever saves
         close(fd);
-        sync();
     }
 }
 
@@ -174,6 +183,18 @@ void SetJack(int value) {
     settings->jack = value;
     SetVolume(GetVolume());
 }
+
+int GetAutoSleep(void) { return settings->auto_sleep; }
+void SetAutoSleep(int value) { settings->auto_sleep = value; }
+int GetSleepPowerOff(void) { return settings->sleep_off; }
+void SetSleepPowerOff(int value) { settings->sleep_off = value; }
+
+int GetRAEnabled(void) { return settings->ra_enabled; }
+void SetRAEnabled(int value) { settings->ra_enabled = value; }
+int GetRASound(void) { return settings->ra_sound; }
+void SetRASound(int value) { settings->ra_sound = value; }
+int GetRANotify(void) { return settings->ra_notify; }
+void SetRANotify(int value) { settings->ra_notify = value; }
 
 int GetHDMI(void) {
     return 0;
