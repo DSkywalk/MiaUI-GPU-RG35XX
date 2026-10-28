@@ -58,6 +58,13 @@ enum {
 	ASSET_SWAP_GRAY,
 	ASSET_SWAP_DARK_GRAY,
 	ASSET_TROPHY,
+
+	ASSET_WIFI_SMALL, // sized like the usb plug: the Quick Menu, the battery pill
+	ASSET_GEAR,
+	ASSET_USB,
+	ASSET_CLOCK,
+	ASSET_GAMEPAD,
+	ASSET_SDCARD,
 };
 
 typedef struct GFX_Fonts {
@@ -196,6 +203,8 @@ void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect);
 void GFX_blitPillAlpha(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity); // 0..255
 void GFX_blitPillColor(SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color); // any colour, eg. COLOR_DARK_PILL
 void GFX_blitAssetColor(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color); // white parts take color
+void GFX_blitAssetScaled(int asset, SDL_Surface* dst, SDL_Rect* box, int scale, SDL_Color color); // `scale` times its size (nearest), centred in box
+void GFX_blitAssetSized(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color); // stretched to dst_rect's w x h (nearest)
 void GFX_blitRect(int asset, SDL_Surface* dst, SDL_Rect* dst_rect);
 void GFX_blitBattery(SDL_Surface* dst, SDL_Rect* dst_rect);
 int GFX_getButtonWidth(char* hint, char* button);
@@ -280,6 +289,14 @@ void PWR_enableSleep(void);
 void PWR_disableAutosleep(void);
 void PWR_enableAutosleep(void);
 int PWR_preventAutosleep(void);
+
+// The USB gadget mode minui's Quick Menu switched on. It can't be switched off
+// or changed (the console hangs), so it holds until a reboot; the file is in
+// tmpfs for the same reason. Read once per process, it's drawn by the battery.
+enum { USB_MODE_NONE, USB_MODE_ADB, USB_MODE_NET };
+#define USB_MODE_PATH "/tmp/usb_mode"
+int USB_getMode(void);
+void USB_setMode(int mode);
 
 int PWR_isCharging(void);
 int PWR_getBattery(void);

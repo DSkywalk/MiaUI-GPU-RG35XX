@@ -98,6 +98,13 @@ static SDL_Rect asset_rects[] = {
     [ASSET_SWAP_GRAY]        = (SDL_Rect){SCALE4(105,51,10,10)},
     [ASSET_SWAP_DARK_GRAY]   = (SDL_Rect){SCALE4(114,51,10,10)},
     [ASSET_TROPHY]           = (SDL_Rect){SCALE4(114,39,10,10)},
+
+    [ASSET_WIFI_SMALL]       = (SDL_Rect){SCALE4( 8,65,11, 8)},
+    [ASSET_GEAR]             = (SDL_Rect){SCALE4(22,64,10,10)},
+    [ASSET_USB]              = (SDL_Rect){SCALE4(36,65, 5, 8)},
+    [ASSET_CLOCK]            = (SDL_Rect){SCALE4(44,64,10,10)},
+    [ASSET_GAMEPAD]          = (SDL_Rect){SCALE4(57,65,10, 8)},
+    [ASSET_SDCARD]           = (SDL_Rect){SCALE4(95,51, 8,10)}, // ASSET_SWAP's card, without its neighbour's edge
 };
 // the flat colour of each asset that is stretched with a fill
 static const SDL_Color asset_colors[ASSET_COLORS] = {
@@ -528,6 +535,16 @@ static void GFX_blitAssetAlpha(int asset, SDL_Rect* src_rect, SDL_Surface* dst, 
 void GFX_blitAssetColor(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
     GFX_blitAssetTint(asset, src_rect, dst, dst_rect, color, 255);
 }
+void GFX_blitAssetScaled(int asset, SDL_Surface* dst, SDL_Rect* box, int scale, SDL_Color color) {
+    SDL_Rect* rect = &asset_rects[asset];
+    int w = rect->w * scale;
+    int h = rect->h * scale;
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, rect,
+                &(SDL_Rect){box->x + (box->w - w) / 2, box->y + (box->h - h) / 2, w, h}, color, 255);
+}
+void GFX_blitAssetSized(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &asset_rects[asset], dst_rect, color, 255);
+}
 void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
     GFX_blitAssetAlpha(asset, src_rect, dst, dst_rect, 255);
 }
@@ -783,12 +800,22 @@ int GFX_blitHardwareGroup(SDL_Surface* dst, int show_setting) {
         }
     }
     else {
-        // TODO: handle wifi
-        int show_wifi = PLAT_isOnline(); // NOOOOO! not every frame!
+        // what USB is up to, ahead of the battery: the plug for ADB, the
+        // plug and wifi for ADB + network
+        int usb = USB_getMode();
+        int icons[2];
+        int n = 0;
+        if (usb!=USB_MODE_NONE) icons[n++] = ASSET_USB;
+        if (usb==USB_MODE_NET) icons[n++] = ASSET_WIFI_SMALL;
 
-        int ww = SCALE1(PILL_SIZE-3);
+        int lead = SCALE1(9); // pill edge to the first icon
+        int gap = SCALE1(6);  // after each icon
+        int battery_margin = SCALE1(5); // the battery's own space, left of it
         ow = SCALE1(PILL_SIZE);
-        if (show_wifi) ow += ww;
+        if (n) {
+            ow += lead - battery_margin;
+            for (int i=0; i<n; i++) ow += asset_rects[icons[i]].w + gap;
+        }
 
         ox = dst->w - SCALE1(PADDING) - ow;
         oy = SCALE1(PADDING);
@@ -798,17 +825,13 @@ int GFX_blitHardwareGroup(SDL_Surface* dst, int show_setting) {
             ow,
             SCALE1(PILL_SIZE)
         });
-        if (show_wifi) {
-            SDL_Rect rect = asset_rects[ASSET_WIFI];
-            int x = ox;
-            int y = oy;
-            x += (SCALE1(PILL_SIZE) - rect.w) / 2;
-            y += (SCALE1(PILL_SIZE) - rect.h) / 2;
-            
-            GFX_blitAsset(ASSET_WIFI, NULL, dst, &(SDL_Rect){x,y});
-            ox += ww;
+        int x = ox + lead;
+        for (int i=0; i<n; i++) {
+            SDL_Rect rect = asset_rects[icons[i]];
+            GFX_blitAsset(icons[i], NULL, dst, &(SDL_Rect){x, oy + (SCALE1(PILL_SIZE) - rect.h) / 2});
+            x += rect.w + gap;
         }
-        GFX_blitBattery(dst, &(SDL_Rect){ox,oy});
+        GFX_blitBattery(dst, &(SDL_Rect){ox + ow - SCALE1(PILL_SIZE),oy});
     }
     
     return ow;
@@ -1562,7 +1585,8 @@ void PAD_poll(void) {
                 btn = 1 << id;
                 if (state==0) {
                     pad.is_pressed        &= ~btn; // unset
-                    pad.just_repeated    &= ~btn; // unset
+                    // a tap that came and went within one poll still counts once
+                    if (!(pad.just_pressed & btn)) pad.just_repeated &= ~btn; // unset
                     pad.just_released    |= btn; // set
                 }
                 else if (state==1 && (pad.is_pressed & btn)==BTN_NONE) {
@@ -1603,7 +1627,8 @@ void PAD_poll(void) {
         
         if (!pressed) {
             pad.is_pressed        &= ~btn; // unset
-            pad.just_repeated    &= ~btn; // unset
+            // a tap that came and went within one poll still counts once
+            if (!(pad.just_pressed & btn)) pad.just_repeated &= ~btn; // unset
             pad.just_released    |= btn; // set
         }
         else if ((pad.is_pressed & btn)==BTN_NONE) {
@@ -1997,12 +2022,18 @@ void PWR_update(int* _dirty, int* _show_setting, PWR_callback_t before_sleep, PW
         power_pressed_at = now;
     }
     
-    // Handle Sleep
-    #define SLEEP_DELAY 120000 // 120 seconds
-    if (now-last_input_at>=SLEEP_DELAY && PWR_preventAutosleep()) last_input_at = now;
+    // Handle Sleep, after the time set in the Quick Menu (0: never)
+    static const uint32_t sleep_delays[] = {0, 60000, 120000, 300000, 600000};
+    int sleep_i = GetAutoSleep();
+    uint32_t sleep_delay = sleep_i>=0 && sleep_i<5 ? sleep_delays[sleep_i] : 120000;
+    int idle = sleep_delay && now-last_input_at>=sleep_delay;
+    if (idle && PWR_preventAutosleep()) {
+        last_input_at = now;
+        idle = 0;
+    }
     
     if (
-        now-last_input_at>=SLEEP_DELAY || // autosleep
+        idle || // autosleep
         (pwr.can_sleep && PAD_justReleased(BTN_SLEEP)) // manual sleep
     ) {
         if (before_sleep) before_sleep();
@@ -2111,6 +2142,8 @@ static void PWR_waitForWake(void) {
     SDL_Event event;
     int wake = 0;
     uint32_t sleep_ticks = SDL_GetTicks();
+    int off_i = GetSleepPowerOff(); // 5, 10 or 15 minutes asleep
+    uint32_t off_after = (off_i>=0 && off_i<3 ? off_i + 1 : 1) * 300000;
     while (!wake) {
         while (SDL_PollEvent(&event)) {
             if (event.type==SDL_KEYUP) {
@@ -2135,7 +2168,7 @@ static void PWR_waitForWake(void) {
             } 
         }
         SDL_Delay(200);
-        if (pwr.can_poweroff && SDL_GetTicks()-sleep_ticks>=300000) { // five minutes
+        if (pwr.can_poweroff && SDL_GetTicks()-sleep_ticks>=off_after) {
             if (pwr.is_charging) sleep_ticks += 60000; // check again in a minute
             else PWR_powerOff();
         }
@@ -2158,6 +2191,20 @@ void PWR_enableAutosleep(void) {
 }
 int PWR_preventAutosleep(void) {
     return pwr.is_charging || !pwr.can_autosleep;
+}
+
+static int usb_mode = -1;
+int USB_getMode(void) {
+    if (usb_mode<0) {
+        char mode[8] = {0};
+        if (exists(USB_MODE_PATH)) getFile(USB_MODE_PATH, mode, sizeof(mode));
+        usb_mode = !strncmp(mode, "net", 3) ? USB_MODE_NET : !strncmp(mode, "adb", 3) ? USB_MODE_ADB : USB_MODE_NONE;
+    }
+    return usb_mode;
+}
+void USB_setMode(int mode) {
+    usb_mode = mode;
+    putFile(USB_MODE_PATH, mode==USB_MODE_NET ? "net" : mode==USB_MODE_ADB ? "adb" : "");
 }
 
 // updated by PWR_updateBatteryStatus()
