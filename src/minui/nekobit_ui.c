@@ -16,21 +16,23 @@
 // where the art would be, button hints along the bottom. On the home screen
 // the list takes only what its labels need and the card (what NekoBit says,
 // its level and stats) gets the rest; the mission lists get 60/40.
-#define NBUI_ROWS MAIN_ROW_COUNT
+// Under the title, so a row fewer than minui's list
+#define NBUI_ROWS (MAIN_ROW_COUNT - 1)
+#define NBUI_TOP SCALE1(PADDING + PILL_SIZE + 4) // the first row's y
 #define NBUI_BADGE_UI   COLOR_GRAY      // NekoBit's face and banners: on the UI
 #define NBUI_BADGE_MAIN (SDL_Color){TRIAD_DARK_GRAY} // NekoBit's face and banners: on main menu
 
-// ASSET_TROPHY as minarch's achievements list draws it: the atlas' 10x10
-// (logical px) at 1:1, the text 1px after the cell
-#define TROPHY_SIZE 10
-#define TROPHY_GAP 1
+// ASSET_TROPHY as tall as the capitals of the row's text. The cup fills 17
+// of its cell's 20 rows (@2x), so the cell is that much taller than the caps.
+#define TROPHY_INK_PCT 85
+#define TROPHY_GAP 2
 #define BANNER_MS 2600
 #define FACE_FONT_SIZE 24
 
 enum { SCR_HOME, SCR_MISSIONS, SCR_ACTIONS, SCR_OFFERS, SCR_HISTORY, SCR_CONFIRM, SCR_MESSAGE, SCR_COUNT };
-enum { HOME_MISSIONS, HOME_NEW, HOME_HISTORY, HOME_SAVE, HOME_RESET, HOME_COUNT };
+enum { HOME_MISSIONS, HOME_NEW, HOME_HISTORY, HOME_COUNT }; // Reset is in the Quick Menu's Settings
 enum { ACT_GO, ACT_CANCEL };
-enum { CONFIRM_CANCEL, CONFIRM_RESET, CONFIRM_RESET2 };
+enum { CONFIRM_CANCEL };
 
 static TTF_Font* face_font = NULL;
 
@@ -79,6 +81,88 @@ static struct {
     uint32_t last; // ANIM_RISE: when it last moved
     uint32_t next_hop;
 } anim;
+
+// The XP going up on the home card, from what the player last saw to what it
+// is now: the numbers tick and the bar fills. Each level crossed fills to the
+// end in its own beat and empties into the next; the last level eases out
+// into the new total.
+#define XP_DELAY_MS 400 // the overlay is up and still before it starts
+#define XP_LEVEL_MS 550 // a level crossed
+#define XP_LAST_MS 900  // the last stretch
+#define XP_MAX_MS 3000  // many levels at once share it
+static struct {
+    int active;
+    uint32_t start;
+    uint32_t level_ms;  // each level crossed
+    uint32_t ms;        // all of it, after the delay
+    uint32_t level, xp; // where it starts
+    uint32_t total;     // what it adds up to (stays on the card until it closes)
+} xpanim;
+
+static uint32_t nbui_xpNext(uint32_t level) {
+    const NB_Save* s = NB_state();
+    return level == s->level ? s->xp_next : NB_xpToNext(level);
+}
+
+static void nbui_xpStart(uint32_t now) {
+    memset(&xpanim, 0, sizeof(xpanim));
+    uint32_t level, xp;
+    if (!NB_xpToShow(&level, &xp)) {
+        NB_xpShown(); // in step, or a reset started it over
+        return;
+    }
+    const NB_Save* s = NB_state();
+    uint32_t levels = s->level - level;
+    uint64_t total = s->xp;
+    for (uint32_t l = level; l < s->level; l++) total += nbui_xpNext(l);
+    xpanim.active = 1;
+    xpanim.start = now;
+    uint32_t share = levels ? (XP_MAX_MS - XP_LAST_MS) / levels : 0;
+    xpanim.level_ms = share < XP_LEVEL_MS ? share : XP_LEVEL_MS;
+    xpanim.ms = levels * xpanim.level_ms + XP_LAST_MS;
+    xpanim.level = level;
+    xpanim.xp = xp;
+    xpanim.total = (uint32_t)(total - xp);
+    NB_xpShown(); // seen now, even if the overlay closes before it's done
+}
+
+// What the card shows at `now`: level, xp and the XP to the next level.
+// Returns the XP added so far (0 when there's nothing to show).
+static uint32_t nbui_xpNow(uint32_t now, uint32_t* level, uint32_t* xp, uint32_t* next) {
+    const NB_Save* s = NB_state();
+    if (!xpanim.total) {
+        *level = s->level;
+        *xp = s->xp;
+        *next = s->xp_next;
+        return 0;
+    }
+    uint32_t t = now - xpanim.start > XP_DELAY_MS ? now - xpanim.start - XP_DELAY_MS : 0;
+    uint32_t l = xpanim.level, from = xpanim.xp, added = 0;
+    // the levels crossed, a beat each (ease in-out, so each one lands)
+    while (l < s->level && t >= xpanim.level_ms) {
+        added += nbui_xpNext(l) - from;
+        t -= xpanim.level_ms;
+        from = 0;
+        l++;
+    }
+    uint32_t to;
+    float e;
+    if (l < s->level) {
+        to = nbui_xpNext(l);
+        float u = (float)t / xpanim.level_ms;
+        e = u * u * (3 - 2 * u);
+    }
+    else { // the last one, eased out
+        to = s->xp;
+        float u = t < XP_LAST_MS ? 1 - (float)t / XP_LAST_MS : 0;
+        e = 1 - u * u * u;
+    }
+    uint32_t x = from + (uint32_t)((to - from) * e + 0.5f);
+    *level = l;
+    *xp = x;
+    *next = nbui_xpNext(l);
+    return added + x - from;
+}
 
 static void nbui_animate(int kind, uint32_t now, int summon) {
     anim.kind = kind;
@@ -144,12 +228,14 @@ void NBUI_open(const NB_Library* lib) {
     anim.woken = 0;
     snprintf(ui.speech, sizeof(ui.speech), "%s", ui.woken ? NB_wokenGreeting() : NB_greeting());
     nbui_refreshSlots();
+    nbui_xpStart(SDL_GetTicks());
 }
 
 static void nbui_close(void) {
     ui.open = 0;
     ui.woken = 0; // awake now: back to its mood's face
     ui.lib = NULL;
+    memset(&xpanim, 0, sizeof(xpanim));
 }
 
 ///////////////////////////////////////
@@ -189,7 +275,7 @@ static void nbui_label(int screen, int i, char* out, size_t size) {
     out[0] = '\0';
     switch (screen) {
     case SCR_HOME: {
-        static const int ids[HOME_COUNT] = {STR_NB_MENU_MISSIONS, STR_NB_MENU_NEW, STR_NB_MENU_HISTORY, STR_NB_MENU_SAVE, STR_NB_MENU_RESET};
+        static const int ids[HOME_COUNT] = {STR_NB_MENU_MISSIONS, STR_NB_MENU_NEW, STR_NB_MENU_HISTORY};
         snprintf(out, size, T(ids[i]), ui.slot_count, NB_MAX_MISSIONS);
         break;
     }
@@ -249,12 +335,6 @@ static void nbui_activate(NBUI_Action* action) {
             ui.sel[SCR_HISTORY] = ui.start[SCR_HISTORY] = 0;
             ui.screen = SCR_HISTORY;
             break;
-        case HOME_SAVE:
-            NB_saveNow(); // its banner says how it went
-            break;
-        case HOME_RESET:
-            nbui_dialog(SCR_CONFIRM, CONFIRM_RESET, SCR_HOME);
-            break;
         }
         break;
     case SCR_MISSIONS:
@@ -287,14 +367,6 @@ static void nbui_confirmed(void) {
         NB_cancel(ui.act_slot);
         nbui_refreshSlots();
         ui.screen = SCR_MISSIONS;
-        break;
-    case CONFIRM_RESET:
-        nbui_dialog(SCR_CONFIRM, CONFIRM_RESET2, SCR_HOME);
-        break;
-    case CONFIRM_RESET2:
-        NB_reset();
-        nbui_refreshSlots();
-        ui.screen = SCR_HOME;
         break;
     }
 }
@@ -353,7 +425,7 @@ int NBUI_input(NBUI_Action* action) {
         nbui_activate(action);
         return 1;
     }
-    if (ui.screen == SCR_OFFERS && PAD_justPressed(BTN_Y)) {
+    if (ui.screen == SCR_OFFERS && PAD_justPressed(BTN_X)) {
         ui.offer_count = NB_offers(ui.lib, ui.offers, NB_MAX_OFFERS);
         *sel = *start = 0;
         if (!ui.offer_count) nbui_dialog(SCR_MESSAGE, STR_NB_NO_OFFERS, SCR_HOME);
@@ -466,29 +538,52 @@ static int nbui_trophy(int screen, int i) {
     return 0;
 }
 
+// the trophy's cell and the caps' height in font.large, in pixels
+static int nbui_trophySize(int* caps) {
+    static int size = 0, cap = 0;
+    if (!size) {
+        if (TTF_GlyphMetrics(font.large, 'H', NULL, NULL, NULL, &cap, NULL) || cap <= 0) cap = SCALE1(12);
+        size = cap * 100 / TROPHY_INK_PCT;
+    }
+    if (caps) *caps = cap;
+    return size;
+}
+
+// rows start under the title; ui.start[] is the first one shown
 static void nbui_rows(SDL_Surface* dst, int width) {
     int count = nbui_count(ui.screen);
     int sel = ui.sel[ui.screen];
     int start = ui.start[ui.screen];
+    int cap;
+    int trophy = nbui_trophySize(&cap);
     for (int j = 0, i = start; j < NBUI_ROWS && i < count; j++, i++) {
         char label[256], fit[256];
         nbui_label(ui.screen, i, label, sizeof(label));
-        int icon = nbui_trophy(ui.screen, i) ? SCALE1(TROPHY_SIZE + TROPHY_GAP) : 0;
+        int icon = nbui_trophy(ui.screen, i) ? trophy + SCALE1(TROPHY_GAP) : 0;
         int w = nbui_fit(font.large, label, fit, sizeof(fit), width - SCALE1(BUTTON_PADDING * 2) - icon) + SCALE1(BUTTON_PADDING * 2) + icon;
-        int y = SCALE1(PADDING + j * PILL_SIZE);
+        int y = NBUI_TOP + SCALE1(j * PILL_SIZE);
+        int text_y = y + SCALE1(4);
         SDL_Color color = COLOR_WHITE;
         if (i == sel) {
             GFX_blitPill(ASSET_WHITE_PILL, dst, &(SDL_Rect){SCALE1(PADDING), y, nbui_min(w, width), SCALE1(PILL_SIZE)});
             color = COLOR_BLACK;
         }
         int x = SCALE1(PADDING + BUTTON_PADDING);
-        if (icon) { // black on the white pill, white elsewhere
-            GFX_blitAssetColor(ASSET_TROPHY, NULL, dst, &(SDL_Rect){x, y + (SCALE1(PILL_SIZE) - SCALE1(TROPHY_SIZE)) / 2}, color);
+        if (icon) { // black on the white pill, white elsewhere; centred on the caps
+            int caps_mid = text_y + TTF_FontAscent(font.large) - cap / 2;
+            GFX_blitAssetSized(ASSET_TROPHY, dst, &(SDL_Rect){x, (caps_mid - trophy / 2) - 2, trophy, trophy}, color);
             x += icon;
         }
         GFX_Text text = GFX_renderText(font.large, fit, color);
-        GFX_blitRenderedText(&text, NULL, dst, x, y + SCALE1(4));
+        GFX_blitRenderedText(&text, NULL, dst, x, text_y);
     }
+}
+
+// "NekoBit" top left, in the pill the Quick Menu's pages have their names in
+static void nbui_drawTitle(SDL_Surface* dst) {
+    GFX_Text text = GFX_renderText(font.large, T(STR_NB_NAME), COLOR_DARK_TEXT);
+    GFX_blitPill(ASSET_DARK_GRAY_PILL, dst, &(SDL_Rect){SCALE1(PADDING), SCALE1(PADDING), text.w + SCALE1(BUTTON_PADDING * 2), SCALE1(PILL_SIZE)});
+    GFX_blitRenderedText(&text, NULL, dst, SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING) + (SCALE1(PILL_SIZE) - text.h) / 2);
 }
 
 // Its level and stats; the card is just as tall as they need (draw 0: only
@@ -500,11 +595,14 @@ static int nbui_cardHome(SDL_Surface* dst, SDL_Rect* card, int draw) {
     int w = card->w - pad * 2;
     int tiny_h = TTF_FontLineSkip(font.tiny);
     int small_h = TTF_FontLineSkip(font.small);
-    char level[128], xp[64], played[64], clock_s[32], missions[64], achievements[64], counts[160];
+    char level[128], xp[96], played[64], clock_s[32], missions[64], achievements[64], counts[160];
 
-    snprintf(level, sizeof(level), T(STR_NB_LEVEL), (int)s->level);
+    uint32_t lvl, xp_now, xp_next;
+    uint32_t added = nbui_xpNow(SDL_GetTicks(), &lvl, &xp_now, &xp_next);
+    snprintf(level, sizeof(level), T(STR_NB_LEVEL), (int)lvl);
     snprintf(level + strlen(level), sizeof(level) - strlen(level), " - %s", T(NB_moodString(s->mood)));
-    snprintf(xp, sizeof(xp), T(STR_NB_XP), (int)s->xp, (int)s->xp_next);
+    snprintf(xp, sizeof(xp), T(STR_NB_XP), (int)xp_now, (int)xp_next);
+    if (added) snprintf(xp + strlen(xp), sizeof(xp) - strlen(xp), "  +%u", added);
     NB_formatTime(s->play_clock, clock_s, sizeof(clock_s));
     snprintf(played, sizeof(played), T(STR_NB_STAT_PLAYED), clock_s);
     snprintf(missions, sizeof(missions), T(STR_NB_STAT_MISSIONS), (int)s->missions_completed);
@@ -519,7 +617,7 @@ static int nbui_cardHome(SDL_Surface* dst, SDL_Rect* card, int draw) {
 
     int y = card->y + SCALE1(8);
     y += nbui_text(dst, font.small, level, COLOR_WHITE, x, y, w, 1, 1) + SCALE1(2);
-    nbui_bar(dst, x, y, w, s->xp, s->xp_next);
+    nbui_bar(dst, x, y, w, xp_now, xp_next);
     y += SCALE1(SETTINGS_SIZE + 2);
     y += nbui_text(dst, font.tiny, xp, COLOR_LIGHT_TEXT, x, y, w, 1, 1) + SCALE1(4);
     y += nbui_text(dst, font.tiny, played, COLOR_WHITE, x, y, w, 1, 1);
@@ -631,7 +729,7 @@ static void nbui_buttons(SDL_Surface* dst, int show_setting, char* left_button, 
 }
 
 static void nbui_drawDialog(SDL_Surface* dst, int show_setting) {
-    static const int confirms[] = {STR_NB_CONFIRM_CANCEL, STR_NB_CONFIRM_RESET, STR_NB_CONFIRM_RESET2};
+    static const int confirms[] = {STR_NB_CONFIRM_CANCEL};
     int id = ui.screen == SCR_CONFIRM ? confirms[ui.confirm] : ui.message;
     SDL_Rect box = {SCALE1(PADDING * 4), SCALE1(PADDING * 2 + PILL_SIZE), dst->w - SCALE1(PADDING * 8), 0};
     box.h = dst->h - box.y * 2;
@@ -664,6 +762,7 @@ static int nbui_homeSplit(SDL_Surface* dst) {
 }
 
 void NBUI_draw(SDL_Surface* dst, int show_setting) {
+    nbui_drawTitle(dst);
     if (ui.screen == SCR_CONFIRM || ui.screen == SCR_MESSAGE) {
         nbui_drawDialog(dst, show_setting);
         return;
@@ -680,7 +779,7 @@ void NBUI_draw(SDL_Surface* dst, int show_setting) {
     nbui_rows(dst, list_w);
     if (!count) {
         int id = ui.screen == SCR_HISTORY ? STR_NB_NO_HISTORY : STR_NB_NO_MISSIONS;
-        nbui_text(dst, font.small, T(id), COLOR_LIGHT_TEXT, SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + 4), list_w - SCALE1(BUTTON_PADDING), 0, 4);
+        nbui_text(dst, font.small, T(id), COLOR_LIGHT_TEXT, SCALE1(PADDING + BUTTON_PADDING), NBUI_TOP + SCALE1(4), list_w - SCALE1(BUTTON_PADDING), 0, 4);
     }
 
     const NB_Save* s = NB_state();
@@ -704,7 +803,7 @@ void NBUI_draw(SDL_Surface* dst, int show_setting) {
 
     if (ui.screen == SCR_HOME) { // what it says: under the list, the whole width, just above its face
         int line_h = TTF_FontLineSkip(font.tiny);
-        int y = nbui_max(SCALE1(PADDING + HOME_COUNT * PILL_SIZE), card.y + card.h) + SCALE1(6);
+        int y = nbui_max(NBUI_TOP + SCALE1(HOME_COUNT * PILL_SIZE), card.y + card.h) + SCALE1(6);
         int bottom = dst->h - SCALE1(PADDING + PILL_SIZE + 2);
         int x = SCALE1(PADDING + BUTTON_PADDING);
         int w = dst->w - x * 2;
@@ -720,7 +819,7 @@ void NBUI_draw(SDL_Surface* dst, int show_setting) {
     case SCR_HOME: nbui_buttons(dst, show_setting, NULL, NULL, T(STR_OPEN)); break;
     case SCR_MISSIONS: nbui_buttons(dst, show_setting, NULL, NULL, count ? T(STR_OPEN) : NULL); break;
     case SCR_ACTIONS: nbui_buttons(dst, show_setting, NULL, NULL, T(STR_NB_OK)); break;
-    case SCR_OFFERS: nbui_buttons(dst, show_setting, "Y", T(STR_NB_SHUFFLE), T(STR_NB_ACCEPT)); break;
+    case SCR_OFFERS: nbui_buttons(dst, show_setting, "X", T(STR_NB_SHUFFLE), T(STR_NB_ACCEPT)); break;
     case SCR_HISTORY: nbui_buttons(dst, show_setting, NULL, NULL, NULL); break;
     }
 }
@@ -766,6 +865,10 @@ int NBUI_busy(void) {
 
 int NBUI_update(uint32_t now, int on_root) {
     int result = 0;
+    if (ui.open && xpanim.active) { // a frame of the XP going up
+        result |= NBUI_REDRAW;
+        if (now - xpanim.start >= XP_DELAY_MS + xpanim.ms) xpanim.active = 0;
+    }
     if (banner.showing && anim.summon) banner.until = now + BANNER_MS; // on hold: NekoBit is coming up through it
     if (banner.showing && (int32_t)(now - banner.until) >= 0) {
         banner.showing = 0;

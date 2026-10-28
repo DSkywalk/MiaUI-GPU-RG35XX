@@ -37,6 +37,7 @@
 
 #define NB_SESSION_MAGIC   0x5353424e // "NBSS"
 #define NB_SESSION_VERSION 1
+#define NB_SESSION_VIA_NEKOBIT 1 // launched from where a mission took the player
 
 // One game launch, written by minui just before it exits to start the game and
 // consumed by the next minui. Times are CLOCK_MONOTONIC (system wide, so it
@@ -52,7 +53,7 @@ typedef struct NB_Session {
     uint32_t end_valid;
     uint32_t elapsed_s;
     uint32_t wall_end;
-    uint32_t reserved;
+    uint32_t flags; // NB_SESSION_*
     char rom[MAX_PATH];  // what the emulator was given
     char game[MAX_PATH]; // what the player picked: the m3u for multi-disc games
     char tag[64];        // emulator tag, as minarch's RA code files it

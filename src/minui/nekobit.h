@@ -51,6 +51,7 @@ enum { // wording and reward variants
 #define NB_MAX_HISTORY  32
 #define NB_MAX_GAMES    32
 #define NB_MAX_OFFERS   5
+#define NB_PAID_BITS    (8 * 8192) // the paid ledger: 8 KB, for life
 
 typedef struct NB_Mission {
     uint8_t  type;
@@ -79,15 +80,10 @@ typedef struct NB_History {
     char title[NB_TITLE_LEN];
 } NB_History;
 
-// What NekoBit knows about a game it has seen played. The RA hash is learned
-// the first time an unlock happens in one of its sessions.
+// What NekoBit knows about a game it has seen played, for "play it again"
+// missions. The slot played least recently makes room for a new one.
 typedef struct NB_Game {
     char path[NB_PATH_LEN];
-    char tag[32];
-    char hash[33];
-    uint8_t pad[3];
-    uint16_t ra_total;
-    uint16_t ra_unlocked;
     uint32_t secs;
     uint32_t plays;
     uint32_t last_session;
@@ -119,10 +115,12 @@ typedef struct NB_Save {
     uint8_t present; // NekoBit is out on the root menu (rolled each boot)
     uint8_t engaged; // ...and the player has talked to it this boot, so it stays
     uint8_t pad8[2];
-    uint32_t reserved[3];
+    uint32_t shown_level; // the XP the player last saw: the overlay animates
+    uint32_t shown_xp;    // from here to level/xp
     NB_Mission missions[NB_MAX_MISSIONS];
     NB_History history[NB_MAX_HISTORY]; // ring, newest at (history_count-1) % NB_MAX_HISTORY
     NB_Game games[NB_MAX_GAMES];
+    uint8_t paid[NB_PAID_BITS / 8]; // every achievement and set milestone ever paid (NB_paidOnce)
 } NB_Save;
 
 enum {
@@ -155,6 +153,8 @@ typedef struct NB_Library {
 
 // Where a mission's game lives, for minui to navigate to. Absolute paths;
 // `system` empty = use `tag` to find the system, both empty = nowhere.
+// `select` is exact (in a subfolder at any depth): minarch records where an
+// RA set is played from in its progress file.
 typedef struct NB_Target {
     char system[MAX_PATH];
     char select[MAX_PATH];
@@ -164,7 +164,10 @@ typedef struct NB_Target {
 void NB_init(void);  // loads the state, settles the game that just ended
 void NB_quit(void);
 // Right before minui exits to launch a game. Safe before NB_init().
-void NB_beginSession(const char* rom, const char* game, const char* tag);
+// flags: NB_SESSION_VIA_NEKOBIT if a mission led the player there.
+void NB_beginSession(const char* rom, const char* game, const char* tag, int flags);
+// The game that just ended was launched via a mission (NB_init settled it)
+int NB_cameFromMission(void);
 
 const NB_Save* NB_state(void);
 
@@ -178,7 +181,16 @@ const char* NB_face(int mood);
 const char* NB_sleepyFace(void); // woken up by SELECT while hiding
 int NB_moodString(int mood); // STR_NB_MOOD_*
 int NB_popEvent(NB_Event* out); // 1 while there are banners to show
-int NB_saveNow(void);            // the explicit save: <0 failed
+
+uint32_t NB_xpToNext(uint32_t level); // XP from `level` to the next one, no cap
+int NB_levelScale(uint32_t level);    // reward multiplier at `level`, in %
+#define NB_MISSION_XP 80 // a standard play mission at level 1: the offers' average
+int NB_masteryXp(uint32_t level, uint32_t mastered, uint32_t xp_to_next);
+
+// XP the player hasn't seen go up yet: where it was when they last looked
+// (1 and its level/xp), 0 if they're up to date. NB_xpShown(): they have now.
+int NB_xpToShow(uint32_t* level, uint32_t* xp);
+void NB_xpShown(void);
 
 int NB_freeSlots(void);
 int NB_offers(const NB_Library* lib, NB_Mission* out, int max);
@@ -195,7 +207,8 @@ const char* NB_wokenGreeting(void); // what it says when SELECT wakes it
 
 // exposed for the unit tests
 int NB_xpForUnlock(int points, int rarity_x100, int before, int total);
-int NB_milestoneBonus(int before, int after, int total, int* percent);
+int NB_milestonesCrossed(int before, int after, int total); // bit 0 = 25% .. bit 3 = 100%
+int NB_paidOnce(uint64_t key); // 1 if `key` was paid for already; marks it paid either way
 void NB_endSession(const NB_Session* s, uint32_t elapsed_s, uint32_t wall_end);
 uint32_t NB_buildEpoch(void);
 void NB_seed(uint32_t seed);

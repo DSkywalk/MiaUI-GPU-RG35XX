@@ -24,7 +24,7 @@
 
 static NB_Save S;
 
-static NB_Event events[8];
+static NB_Event events[16];
 static int event_head = 0;
 static int event_count = 0;
 
@@ -119,6 +119,14 @@ static char* nb_readAll(const char* path) { // malloc'd, NUL terminated
 }
 
 static void nb_event(int kind, int a, int b, const char* text) {
+    if (kind == NB_EV_LEVEL) { // a run of level-ups is one banner, with the level it ended on
+        for (int i = 0; i < event_count; i++) {
+            NB_Event* ev = &events[(event_head + i) % (sizeof(events) / sizeof(events[0]))];
+            if (ev->kind != NB_EV_LEVEL) continue;
+            ev->a = a;
+            return;
+        }
+    }
     if (event_count == (int)(sizeof(events) / sizeof(events[0]))) return; // the player won't read more
     NB_Event* ev = &events[(event_head + event_count++) % (sizeof(events) / sizeof(events[0]))];
     ev->kind = kind;
@@ -180,8 +188,9 @@ static int nb_wallOk(uint32_t now) {
 static void nb_fresh(void) {
     memset(&S, 0, sizeof(S));
     S.level = 1;
-    S.xp_next = 100;
+    S.xp_next = NB_xpToNext(1);
     S.mood = NB_MOOD_HAPPY;
+    S.shown_level = S.level;
 }
 
 #define NB_CRC_OFFSET (offsetof(NB_Save, crc) + sizeof(uint32_t))
@@ -256,15 +265,51 @@ static void nb_moodUp(int allow_excited) {
     }
 }
 
+static int leveled = 0; // a level went up since NB_init: worth a card write
+
+// The level curve, with no cap: leaving level 1 costs 100 XP, and each level
+// after costs 8% more than the one before up to level 30, then 16% more for
+// ever - compound growth, so the late levels are a lifelong wall. Worked in
+// thousandths of an XP so the rounding doesn't drift, shown rounded to tens,
+// and held at NB_XP_MAX so it can't overflow (level ~150 and up).
+#define NB_XP_MAX 2000000000u
+uint32_t NB_xpToNext(uint32_t level) {
+    uint64_t milli = 100 * 1000;
+    for (uint32_t l = 2; l <= level && milli < NB_XP_MAX * 1000ull; l++)
+        milli = milli * (l <= 30 ? 108 : 116) / 100;
+    uint64_t xp = (milli / 1000 + 5) / 10 * 10;
+    return xp < NB_XP_MAX ? (uint32_t)xp : NB_XP_MAX;
+}
+
+// Rewards grow with the player so the late levels stay in reach: +4% a level,
+// x2.5 at most (level 38 on). Play missions, achievements and their missions
+// alike, so hunting achievements never falls behind just playing.
+int NB_levelScale(uint32_t level) {
+    return level >= 38 ? 250 : 100 + 4 * (int)(level - 1);
+}
+static int nb_scaled(int xp) {
+    return (int)((int64_t)xp * NB_levelScale(S.level) / 100);
+}
+
+// A mastery (100% of an RA set). The Golden Guarantee: exactly one whole level
+// for any of the first 6 sets mastered, while under level 20. After either,
+// for good: 3 standard missions at the player's level, so a short easy set
+// can't be farmed for levels. `mastered` = sets mastered before this one.
+int NB_masteryXp(uint32_t level, uint32_t mastered, uint32_t xp_to_next) {
+    if (mastered < 6 && level < 20) return (int)xp_to_next;
+    return 3 * NB_MISSION_XP * NB_levelScale(level) / 100;
+}
+
 static void nb_addXp(int xp) {
     if (xp <= 0) return;
     S.xp += xp;
     while (S.xp >= S.xp_next) {
         S.xp -= S.xp_next;
         S.level++;
-        S.xp_next = S.level * 50 + 50;
+        S.xp_next = NB_xpToNext(S.level);
         S.mood = NB_MOOD_EXCITED;
         nb_event(NB_EV_LEVEL, S.level, 0, NULL);
+        leveled = 1;
     }
 }
 
@@ -292,24 +337,57 @@ int NB_xpForUnlock(int points, int rarity_x100, int before, int total) {
     return base * progress / 100 * rare / 100;
 }
 
-// Bonus for crossing 25/50/75% of a set in a session, a big one for 100%
-int NB_milestoneBonus(int before, int after, int total, int* percent) {
-    *percent = 0;
+// The marks of a set crossed going from `before` to `after` unlocks: bit 0
+// = 25% .. bit 3 = 100%. 25/50/75% pay NB_MILESTONE_XP (at level 1), 100%
+// is a mastery (NB_masteryXp).
+static const int NB_MILESTONE_XP[3] = {50, 100, 200};
+int NB_milestonesCrossed(int before, int after, int total) {
     if (total <= 0 || after <= before) return 0;
-    if (after >= total && before < total) {
-        *percent = 100;
-        return 250 + 10 * total;
+    int crossed = 0;
+    for (int i = 0; i < 4; i++) {
+        int pct = 25 * (i + 1);
+        if (before * 100 < pct * total && after * 100 >= pct * total) crossed |= 1 << i;
     }
-    static const int quarter[3] = {25, 50, 75};
-    static const int bonus[3] = {50, 100, 200};
-    int sum = 0;
-    for (int i = 0; i < 3; i++) {
-        if (before * 100 < quarter[i] * total && after * 100 >= quarter[i] * total) {
-            sum += bonus[i];
-            *percent = quarter[i];
+    return crossed;
+}
+
+///////////////////////////////////////
+// the paid ledger
+//
+// Every reward paid, ever: each achievement by its RA id (unique across all
+// of RetroAchievements, so another dump of the same game shares it) and each
+// 25/50/75/100% of a set by the set's RA game id. Wiping a game's progress in
+// minarch, or deleting its file, makes minarch hand out the same unlocks
+// again; this is how NekoBit knows it has paid for them.
+//
+// A Bloom filter, so it never grows: NB_PAID_BITS bits, NB_PAID_K of them
+// set per key. It can only err one way - taking something new for paid
+// (~0.02% of the time at 2,000 unlocks, ~0.5% at 5,000) - so it never pays
+// twice.
+#define NB_PAID_K 4
+#define NB_KEY_ACH(id)        ((uint64_t)(id))
+#define NB_KEY_SET(game, pct) ((1ull << 63) | (((game) & ((1ull << 55) - 1)) << 8) | (uint64_t)(pct))
+
+static uint64_t nb_mix(uint64_t x) { // splitmix64
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
+int NB_paidOnce(uint64_t key) {
+    uint64_t h = nb_mix(key);
+    uint32_t h1 = (uint32_t)h, h2 = (uint32_t)(h >> 32) | 1;
+    int seen = 1;
+    for (uint32_t i = 0; i < NB_PAID_K; i++) {
+        uint32_t bit = (h1 + i * h2) % NB_PAID_BITS;
+        uint8_t mask = 1u << (bit & 7);
+        if (!(S.paid[bit >> 3] & mask)) {
+            seen = 0;
+            S.paid[bit >> 3] |= mask;
         }
     }
-    return sum;
+    return seen;
 }
 
 ///////////////////////////////////////
@@ -423,7 +501,7 @@ static NB_Game* nb_findGame(const char* path) {
     return NULL;
 }
 
-static NB_Game* nb_game(const char* path, const char* tag) {
+static NB_Game* nb_game(const char* path) {
     NB_Game* g = nb_findGame(path);
     if (g) return g;
     g = &S.games[0];
@@ -436,7 +514,6 @@ static NB_Game* nb_game(const char* path, const char* tag) {
     }
     memset(g, 0, sizeof(*g));
     nb_copy(g->path, path, sizeof(g->path));
-    nb_copy(g->tag, tag, sizeof(g->tag));
     return g;
 }
 
@@ -445,13 +522,13 @@ static NB_Game* nb_game(const char* path, const char* tag) {
 //
 //   progress/<TAG>/<md5>_progress.json
 //     {"hash":"..","set":"..","total":23,"unlocked":[{"id":N,"date":N},..],"check":".."}
-//     (older files: "unlocked":[N,N,..], no dates)
 //   data/<TAG>/<md5>.json (or data/<md5>.json): the RA "patch" response, for
 //     the game title and each achievement's Points and Rarity
 
 typedef struct NB_Unlocks {
     char hash[33];
     char tag[32];
+    char path[NB_PATH_LEN]; // minarch's record of where it's played from, "" = none
     int total;
     int unlocked;
     int fresh; // unlocked inside the session
@@ -508,36 +585,64 @@ static int nb_jsonString(const char* at, char* out, size_t size) {
     return 1;
 }
 
+// minarch's tamper check (ra_progressChecksum): FNV-1a over the hash, the
+// set's fingerprint, the count, and every {id, date} record in file order
+static uint32_t nb_fnv(uint32_t sum, const void* data, size_t size) {
+    const uint8_t* p = (const uint8_t*)data;
+    while (size--) sum = (sum ^ *p++) * 16777619u;
+    return sum;
+}
+
+// the {"id":N,"date":N} record at or after `at`, inside the "unlocked" list:
+// past it, or NULL when the list is done
+static const char* nb_nextUnlock(const char* at, uint32_t* id, uint32_t* date) {
+    while (at && *at && *at != ']') {
+        if (*at != '{') {
+            at++;
+            continue;
+        }
+        const char* close = strchr(at, '}');
+        if (!close) return NULL;
+        const char* i = nb_jsonKey(at, close, "\"id\"");
+        const char* d = nb_jsonKey(at, close, "\"date\"");
+        if (i && isdigit((unsigned char)*i)) {
+            *id = (uint32_t)strtoul(i, NULL, 10);
+            *date = d ? (uint32_t)strtoul(d, NULL, 10) : 0;
+            return close + 1;
+        }
+        at = close + 1;
+    }
+    return NULL;
+}
+
+// 0 for a file that isn't minarch's as it wrote it: unreadable, or edited by
+// hand (its checksum fails), so none of it is believed
 static int nb_parseProgress(const char* json, uint32_t lo, uint32_t hi, NB_Unlocks* u) {
     memset(u, 0, sizeof(*u));
+    char field[16];
     if (!nb_jsonString(nb_jsonKey(json, NULL, "\"hash\""), u->hash, sizeof(u->hash))) return 0;
+    if (!nb_jsonString(nb_jsonKey(json, NULL, "\"set\""), field, sizeof(field))) return 0;
+    uint32_t set = (uint32_t)strtoul(field, NULL, 16);
+    if (!nb_jsonString(nb_jsonKey(json, NULL, "\"check\""), field, sizeof(field))) return 0;
+    uint32_t check = (uint32_t)strtoul(field, NULL, 16);
+    if (!nb_jsonString(nb_jsonKey(json, NULL, "\"path\""), u->path, sizeof(u->path))) u->path[0] = '\0';
     const char* at = nb_jsonKey(json, NULL, "\"total\"");
     u->total = at ? atoi(at) : 0;
-    at = strstr(json, "\"unlocked\"");
-    if (at) at = strchr(at, '[');
-    if (!at) return 1;
-    for (at++; *at && *at != ']';) {
-        if (*at == '{') {
-            const char* close = strchr(at, '}');
-            if (!close) break;
-            const char* id = nb_jsonKey(at, close, "\"id\"");
-            const char* date = nb_jsonKey(at, close, "\"date\"");
-            if (id) {
-                u->unlocked++;
-                uint32_t when = date ? (uint32_t)strtoul(date, NULL, 10) : 0;
-                if (when && when >= lo && when <= hi && u->fresh < NB_MAX_FRESH)
-                    u->ids[u->fresh++] = (uint32_t)strtoul(id, NULL, 10);
-            }
-            at = close + 1;
-        }
-        else if (isdigit((unsigned char)*at)) { // an old file: an id with no date
-            char* end;
-            strtoul(at, &end, 10);
-            u->unlocked++;
-            at = end;
-        }
-        else at++;
+    const char* list = strstr(json, "\"unlocked\"");
+    if (list) list = strchr(list, '[');
+
+    uint32_t id, date, count = 0;
+    for (at = list; (at = nb_nextUnlock(at, &id, &date));) count++; // the count goes in first
+    uint32_t sum = nb_fnv(2166136261u, u->hash, strlen(u->hash));
+    sum = nb_fnv(sum, &set, sizeof(set));
+    sum = nb_fnv(sum, &count, sizeof(count));
+    for (at = list; (at = nb_nextUnlock(at, &id, &date));) {
+        uint32_t record[2] = {id, date};
+        sum = nb_fnv(sum, record, sizeof(record));
+        if (date && date >= lo && date <= hi && u->fresh < NB_MAX_FRESH) u->ids[u->fresh++] = id;
     }
+    if (sum != check) return 0;
+    u->unlocked = (int)count;
     return 1;
 }
 
@@ -548,6 +653,14 @@ static char* nb_readSet(const char* tag, const char* hash) {
     if (json) return json;
     snprintf(path, sizeof(path), "%s/data/%s.json", RETROACHIVEMENTS_PATH, hash);
     return nb_readAll(path);
+}
+
+// The set's RA game id (PatchData's "ID", the same for every dump of the
+// game), or a key from the hash if the set can't say
+static uint64_t nb_gameKey(const char* set, const char* hash) {
+    const char* at = set ? nb_jsonKey(set, NULL, "\"ID\"") : NULL;
+    if (at && isdigit((unsigned char)*at)) return strtoull(at, NULL, 10);
+    return (1ull << 54) | nb_fnv(2166136261u, hash, strlen(hash));
 }
 
 // the game's title is PatchData's first "Title", before the achievements'
@@ -614,46 +727,57 @@ static int nb_findUnlocks(const NB_Session* s, uint32_t elapsed, uint32_t wall_e
     return count;
 }
 
-static void nb_creditUnlocks(NB_Unlocks* u, NB_Game* learn, const char* fallback_title) {
+static void nb_creditUnlocks(NB_Unlocks* u, const char* fallback_title) {
     char* set = nb_readSet(u->tag, u->hash);
     char title[NB_TITLE_LEN];
     if (!nb_setTitle(set, title, sizeof(title))) nb_copy(title, fallback_title, sizeof(title));
 
+    // only what has never been paid for: a reset hands out the same ids again
     int before = u->unlocked - u->fresh;
     if (before < 0) before = 0;
-    int xp = 0;
+    int fresh = 0, xp = 0;
     for (int i = 0; i < u->fresh; i++) {
+        if (NB_paidOnce(NB_KEY_ACH(u->ids[i]))) continue;
         int points, rarity;
         nb_achInfo(set, u->ids[i], &points, &rarity);
         xp += NB_xpForUnlock(points, rarity, before + i, u->total);
+        fresh++;
     }
+    uint64_t game = nb_gameKey(set, u->hash);
     free(set);
 
-    S.achievements += u->fresh;
-    nb_event(NB_EV_ACH, u->fresh, xp, title);
-    nb_moodUp(0);
-    nb_addXp(xp);
-
-    int percent;
-    int bonus = NB_milestoneBonus(before, u->unlocked, u->total, &percent);
-    if (bonus) {
-        if (percent == 100) {
-            S.masteries++;
-            nb_event(NB_EV_MASTERY, percent, bonus, title);
-            S.mood = NB_MOOD_EXCITED;
-        }
-        else {
-            nb_event(NB_EV_MILESTONE, percent, bonus, title);
-            nb_moodUp(1);
-        }
-        nb_addXp(bonus);
+    if (fresh) {
+        xp = nb_scaled(xp);
+        S.achievements += fresh;
+        nb_event(NB_EV_ACH, fresh, xp, title);
+        nb_moodUp(0);
+        nb_addXp(xp);
     }
 
-    if (learn) {
-        nb_copy(learn->hash, u->hash, sizeof(learn->hash));
-        nb_copy(learn->tag, u->tag, sizeof(learn->tag));
-        learn->ra_total = u->total;
-        learn->ra_unlocked = u->unlocked;
+    // each mark of a set pays once in a lifetime, however often it's crossed.
+    // A first mastery pays alone: the quarters it crossed with it are only
+    // marked, as they always were.
+    int crossed = NB_milestonesCrossed(before, u->unlocked, u->total), unpaid = 0;
+    for (int i = 0; i < 4; i++)
+        if ((crossed >> i & 1) && !NB_paidOnce(NB_KEY_SET(game, 25 * (i + 1)))) unpaid |= 1 << i;
+    if (unpaid & 8) { // with what the unlocks paid already in
+        int mastery = NB_masteryXp(S.level, S.masteries, S.xp_next);
+        S.masteries++;
+        nb_event(NB_EV_MASTERY, 100, mastery, title);
+        S.mood = NB_MOOD_EXCITED;
+        nb_addXp(mastery);
+    }
+    else if (unpaid) {
+        int bonus = 0, percent = 0;
+        for (int i = 0; i < 3; i++) {
+            if (!(unpaid >> i & 1)) continue;
+            bonus += NB_MILESTONE_XP[i];
+            percent = 25 * (i + 1);
+        }
+        bonus = nb_scaled(bonus);
+        nb_event(NB_EV_MILESTONE, percent, bonus, title);
+        nb_moodUp(1);
+        nb_addXp(bonus);
     }
 
     for (int i = 0; i < NB_MAX_MISSIONS; i++) {
@@ -662,8 +786,11 @@ static void nb_creditUnlocks(NB_Unlocks* u, NB_Game* learn, const char* fallback
                   (m->type == NB_MIS_ACH_GAME && !strcmp(m->hash, u->hash)) ||
                   (m->type == NB_MIS_ACH_SYSTEM && !strcmp(m->tag, u->tag));
         if (!hit) continue;
-        m->progress += u->fresh;
-        if (m->type == NB_MIS_ACH_GAME) m->ra_unlocked = u->unlocked;
+        m->progress += fresh;
+        if (m->type == NB_MIS_ACH_GAME) {
+            m->ra_unlocked = u->unlocked;
+            if (u->path[0]) nb_copy(m->path, u->path, sizeof(m->path)); // where it's played from now
+        }
         nb_checkDone(i);
     }
 }
@@ -671,13 +798,14 @@ static void nb_creditUnlocks(NB_Unlocks* u, NB_Game* learn, const char* fallback
 ///////////////////////////////////////
 // sessions
 
-void NB_beginSession(const char* rom, const char* game, const char* tag) {
+void NB_beginSession(const char* rom, const char* game, const char* tag, int flags) {
     NB_Session s;
     memset(&s, 0, sizeof(s));
     s.magic = NB_SESSION_MAGIC;
     s.version = NB_SESSION_VERSION;
     s.mono_start_ms = NB_monoMs();
     s.wall_start = nb_now();
+    s.flags = flags;
     nb_copy(s.rom, rom, sizeof(s.rom));
     nb_copy(s.game, game && game[0] ? game : rom, sizeof(s.game));
     nb_copy(s.tag, tag ? tag : "", sizeof(s.tag));
@@ -704,7 +832,7 @@ void NB_endSession(const NB_Session* s, uint32_t elapsed, uint32_t wall_end) {
     uint32_t now = nb_now();
     if (nb_wallOk(now)) S.last_wall = now;
 
-    NB_Game* g = nb_game(game, s->tag);
+    NB_Game* g = nb_game(game);
     g->secs += elapsed;
     g->plays++;
     g->last_session = S.sessions;
@@ -727,8 +855,7 @@ void NB_endSession(const NB_Session* s, uint32_t elapsed, uint32_t wall_end) {
     int n = nb_findUnlocks(s, elapsed, wall_end, found, 4);
     char title[NB_TITLE_LEN];
     nb_displayName(s->game[0] ? s->game : s->rom, title, sizeof(title));
-    // one set changed: it is this game's, so remember the pairing
-    for (int i = 0; i < n; i++) nb_creditUnlocks(&found[i], n == 1 ? g : NULL, title);
+    for (int i = 0; i < n; i++) nb_creditUnlocks(&found[i], title);
     free(found);
 }
 
@@ -765,6 +892,25 @@ static void nb_newBoot(void) {
 }
 
 static int arrived = 0;
+static int via_mission = 0;
+
+int NB_cameFromMission(void) {
+    return via_mission;
+}
+
+int NB_xpToShow(uint32_t* level, uint32_t* xp) {
+    if (S.shown_level == S.level && S.shown_xp == S.xp) return 0;
+    *level = S.shown_level;
+    *xp = S.shown_xp;
+    return 1;
+}
+
+void NB_xpShown(void) {
+    if (S.shown_level == S.level && S.shown_xp == S.xp) return;
+    S.shown_level = S.level;
+    S.shown_xp = S.xp;
+    nb_store(); // tmpfs; on the card with the rest at power-off
+}
 
 int NB_isAchievement(int type) {
     return type >= NB_MIS_ACH_ANY && type <= NB_MIS_ACH_SYSTEM;
@@ -785,6 +931,8 @@ void NB_interact(void) {
 void NB_init(void) {
     NB_seed((uint32_t)NB_monoMs() ^ nb_now() ^ ((uint32_t)getpid() << 16));
     event_head = event_count = 0;
+    leveled = 0;
+    via_mission = 0;
 
     static NB_Save loaded;
     int was_present = 0;
@@ -806,6 +954,7 @@ void NB_init(void) {
     if (NB_readFile(NB_TMP_SESSION, &s, sizeof(s)) == (int)sizeof(s) && s.magic == NB_SESSION_MAGIC &&
         s.version == NB_SESSION_VERSION) {
         unlink(NB_TMP_SESSION);
+        via_mission = (s.flags & NB_SESSION_VIA_NEKOBIT) != 0;
         uint64_t now = NB_monoMs();
         uint32_t elapsed = now > s.mono_start_ms ? (uint32_t)((now - s.mono_start_ms) / 1000) : 0;
         NB_endSession(&s, elapsed, nb_now());
@@ -821,17 +970,15 @@ void NB_init(void) {
         nb_store();
     else if (moved.present != loaded.present || moved.engaged != loaded.engaged)
         nb_storeAs(0);
+
+    // A level up is a milestone: on the card straight away, not only at
+    // power-off, so a hard power cut can't take it back. The game is over by
+    // now (this is minui starting), so play itself still writes nothing.
+    if (leveled) NB_flushToCard();
 }
 
 void NB_quit(void) {
     // nothing pending: every change is in tmpfs the moment it happens
-}
-
-int NB_saveNow(void) {
-    nb_store();
-    int result = NB_flushToCard();
-    nb_event(NB_EV_TEXT, result < 0 ? STR_NB_EV_SAVE_FAILED : STR_NB_EV_SAVED, 0, NULL);
-    return result;
 }
 
 void NB_reset(void) {
@@ -961,7 +1108,7 @@ static int nb_offerHistory(const NB_Library* lib, NB_Mission* m) {
             m->flavor = NB_FLAVOR_PLAYMORE;
             m->target = nb_range(10, 24);
         }
-        m->xp = m->target * 5;
+        m->xp = nb_scaled(m->target * 5);
         nb_setGame(m, lib, abs);
         return 1;
     }
@@ -974,7 +1121,7 @@ static int nb_offerSystem(const NB_Library* lib, NB_Mission* m) {
     memset(m, 0, sizeof(*m));
     m->type = NB_MIS_PLAY_SYSTEM;
     m->target = nb_range(5, 19);
-    m->xp = m->target * 6;
+    m->xp = nb_scaled(m->target * 6);
     nb_copy(m->path, nb_rel(sys->path), sizeof(m->path));
     nb_copy(m->title, sys->name, sizeof(m->title));
     nb_copy(m->system, sys->name, sizeof(m->system));
@@ -994,7 +1141,7 @@ static int nb_offerRandomGame(const NB_Library* lib, NB_Mission* m) {
     m->type = NB_MIS_PLAY_GAME;
     m->flavor = NB_FLAVOR_RANDOM;
     m->target = nb_range(5, 19);
-    m->xp = m->target * 7;
+    m->xp = nb_scaled(m->target * 7);
     nb_setGame(m, lib, abs);
     return 1;
 }
@@ -1002,6 +1149,7 @@ static int nb_offerRandomGame(const NB_Library* lib, NB_Mission* m) {
 typedef struct NB_RACandidate {
     char tag[32];
     char hash[33];
+    char path[NB_PATH_LEN];
     uint16_t total;
     uint16_t unlocked;
 } NB_RACandidate;
@@ -1033,6 +1181,7 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
                 NB_RACandidate* c = &cands[n++];
                 nb_copy(c->tag, tp->d_name, sizeof(c->tag));
                 nb_copy(c->hash, u.hash, sizeof(c->hash));
+                nb_copy(c->path, u.path, sizeof(c->path));
                 c->total = u.total;
                 c->unlocked = u.unlocked;
                 masteries += u.unlocked * 2 >= u.total;
@@ -1061,7 +1210,7 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
         m->type = NB_MIS_ACH_GAME;
         m->flavor = c->unlocked * 2 >= c->total ? NB_FLAVOR_MASTERY : NB_FLAVOR_NONE;
         m->target = nb_range(1, remaining < 2 ? remaining : 2);
-        m->xp = m->target * (40 + 2 * percent); // the deeper into a set, the bigger the reward
+        m->xp = nb_scaled(m->target * (40 + 2 * percent)); // the deeper into a set, the bigger the reward
         m->ra_total = c->total;
         m->ra_unlocked = c->unlocked;
         nb_copy(m->tag, c->tag, sizeof(m->tag));
@@ -1071,8 +1220,10 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
         free(set);
         const NB_System* sys = nb_systemForTag(lib, c->tag);
         nb_copy(m->system, sys ? sys->name : c->tag, sizeof(m->system));
-        for (int i = 0; i < NB_MAX_GAMES; i++) // a game NekoBit has seen this set unlock in
-            if (S.games[i].path[0] && !strcmp(S.games[i].hash, c->hash)) nb_copy(m->path, S.games[i].path, sizeof(m->path));
+        // where minarch last played the set from, if the game is still there
+        char abs[MAX_PATH];
+        nb_abs(c->path, abs, sizeof(abs));
+        if (c->path[0] == '/' && !access(abs, F_OK)) nb_copy(m->path, c->path, sizeof(m->path));
         found = 1;
     }
     free(cands);
@@ -1096,7 +1247,7 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
         const NB_System* sys = systems[nb_range(0, count - 1)];
         m->type = NB_MIS_ACH_SYSTEM;
         m->target = 1;
-        m->xp = 50;
+        m->xp = nb_scaled(50);
         nb_tagOf(sys->path, m->tag, sizeof(m->tag));
         nb_copy(m->title, sys->name, sizeof(m->title));
         nb_copy(m->system, sys->name, sizeof(m->system));
@@ -1106,7 +1257,7 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
     if (nb_hasMission(NB_MIS_ACH_ANY, NULL, NULL)) return 0;
     m->type = NB_MIS_ACH_ANY;
     m->target = nb_range(1, 3);
-    m->xp = 40 * m->target;
+    m->xp = nb_scaled(40 * m->target);
     return 1;
 }
 
@@ -1119,7 +1270,7 @@ int NB_offers(const NB_Library* lib, NB_Mission* out, int max) {
             memset(&m, 0, sizeof(m));
             m.type = NB_MIS_PLAY_ANY;
             m.target = nb_range(5, 14);
-            m.xp = m.target * 5;
+            m.xp = nb_scaled(m.target * 5);
             out[n++] = m;
         }
     }
@@ -1130,7 +1281,7 @@ int NB_offers(const NB_Library* lib, NB_Mission* out, int max) {
         m.type = NB_MIS_PLAY_SURPRISE;
         m.flavor = NB_FLAVOR_SURPRISE;
         m.target = nb_range(10, 24);
-        m.xp = m.target * 8;
+        m.xp = nb_scaled(m.target * 8);
         out[n++] = m;
     }
     if (n < max && nb_offerAchievement(lib, &m)) out[n++] = m;
@@ -1175,7 +1326,7 @@ int NB_target(const NB_Mission* m, NB_Target* t) {
             return 1;
         }
         if (m->type == NB_MIS_ACH_GAME && m->tag[0]) {
-            nb_copy(t->tag, m->tag, sizeof(t->tag));
+            nb_copy(t->tag, m->tag, sizeof(t->tag)); // the system, but no game to pick
             return 1;
         }
         return 0;
