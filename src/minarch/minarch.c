@@ -2495,6 +2495,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         if (x>top_width) top_width = x; // keep the largest width because triple buffer
     }
     
+    PLAT_setUIInGame(show_debug);
     GFX_flip(screen);
     last_flip_time = SDL_GetTicks();
 }
@@ -4302,7 +4303,11 @@ static void trackFPS(void) {
         cpu_ticks = 0;
         fps_ticks = 0;
         
-         //LOG_info("fps: %f cpu: %f core: %f\n", fps_double, cpu_double, core.fps);
+        // perf: once per second when MINARCH_FPS_LOG is set. Integer math only: the core's
+        // NEON code leaves the VFP registers dirty, so doubles here come out as nan/inf.
+        static int fps_log = -1;
+        if (fps_log < 0) fps_log = getenv("MINARCH_FPS_LOG") != NULL;
+        if (fps_log) PLAT_perfReport(prevent_tearing);
     }
 }
 

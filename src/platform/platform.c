@@ -165,7 +165,19 @@ static struct VID_Context {
 
 	int nearest;            // Filtering mode: 1=Nearest, 0=Linear
 	int cleared;            // Flag to indicate if screen was cleared
+
+	int swap_interval;      // Swap interval currently set on the GL context
+	int ui_in_game;         // 1 = UI layer has content over the game (debug HUD)
+	int ui_drawn;           // 1 = screen_tex holds what the last flip showed
 } vid;
+
+// eglSwapBuffers blocks until vsync on this driver, so the interval is what
+// "Lenient" has to change: only call into EGL when it actually changes.
+static void set_swap_interval(int interval) {
+	if (interval == vid.swap_interval) return;
+	SDL_GL_SetSwapInterval(interval);
+	vid.swap_interval = interval;
+}
 
 // Struct to track game blit state for optimized texture updates
 static struct {
@@ -291,6 +303,7 @@ SDL_Surface* PLAT_initVideo(void) {
 	printGLString("Renderer", GL_RENDERER);
 
 	SDL_GL_SetSwapInterval(1); // Enable VSync
+	vid.swap_interval = 1;
 
 	printf("Compiling shaders...\n");
 	GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_shader_source);
@@ -424,8 +437,8 @@ void PLAT_fadeVideo(int type) { // 0 = fade out (a negro), 1 = fade in
 			draw_cached_quad(vid.vbo_game_overlay, ovl_game.tex);
 		}
 
-		// C) Dibujar Overlay UI (pantalla principal)
-		if (vid.screen_tex) {
+		// C) Dibujar Overlay UI (pantalla principal), only if the last flip showed it
+		if (vid.screen_tex && vid.ui_drawn) {
 			draw_cached_quad(vid.vbo_screen, vid.screen_tex);
 		}
 
@@ -446,7 +459,7 @@ void PLAT_fadeVideo(int type) { // 0 = fade out (a negro), 1 = fade in
 }
 
 void PLAT_quitVideo(void) {
-	SDL_GL_SetSwapInterval(0);
+	set_swap_interval(0);
 	PLAT_fadeVideo(0);
 
 	// Clear to black
@@ -488,7 +501,52 @@ void PLAT_clearAll(void) {
 }
 
 void PLAT_setVsync(int vsync) {
-	SDL_GL_SetSwapInterval(vsync ? 1 : 0);
+	set_swap_interval(vsync ? 1 : 0);
+}
+
+void PLAT_setUIInGame(int enabled) {
+	vid.ui_in_game = enabled;
+}
+
+// -------------------------------------------------------------------------
+// Perf counters (integer only, see PLAT_perfReport)
+// -------------------------------------------------------------------------
+
+#include <time.h>
+static uint64_t perf_us(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000u + ts.tv_nsec / 1000;
+}
+static struct {
+	uint64_t start, last_flip;
+	uint32_t flips, game_frames;
+	uint64_t emu_us, upload_us, ui_us, swap_us; // emu = time from end of last flip to this flip
+	uint32_t worst_frame_us, slow_frames;      // slow = interval > 17.5 ms
+	uint32_t vsync_frames;                      // flips done with swap interval 1
+	uint32_t audio_wait_ms;                     // part of emu spent sleeping on a full audio buffer
+} perf;
+
+void PLAT_perfAudioWait(uint32_t ms) {
+	perf.audio_wait_ms += ms;
+}
+
+void PLAT_perfReport(int vsync_mode) {
+	uint64_t now = perf_us();
+	if (perf.start && perf.flips) {
+		uint32_t span = (uint32_t)(now - perf.start);
+		uint32_t n = perf.flips;
+		printf("PERF mode=%d fps_x10=%u game=%u slow=%u worst_ms=%u vsync_on=%u | avg_us emu=%u (audio_wait=%u) upload=%u ui=%u swap=%u\n",
+			vsync_mode, (uint32_t)((uint64_t)n * 10000000u / span), perf.game_frames, perf.slow_frames,
+			perf.worst_frame_us / 1000, perf.vsync_frames,
+			(uint32_t)(perf.emu_us / n), perf.audio_wait_ms * 1000u / n,
+			(uint32_t)(perf.upload_us / n), (uint32_t)(perf.ui_us / n), (uint32_t)(perf.swap_us / n));
+		fflush(stdout);
+	}
+	uint64_t keep = perf.last_flip;
+	memset(&perf, 0, sizeof(perf));
+	perf.start = now;
+	perf.last_flip = keep;
 }
 
 // -------------------------------------------------------------------------
@@ -622,6 +680,21 @@ void PLAT_blitRenderer(GFX_Renderer* renderer) {
 // -------------------------------------------------------------------------
 
 void PLAT_flip(SDL_Surface* IGNORED, int sync) {
+	// GFX_flip passes 0 when a Lenient frame is over budget: don't wait for vsync then
+	set_swap_interval(sync ? 1 : 0);
+
+	// During gameplay the UI layer is empty unless the debug HUD is on: skip its
+	// 640x480 upload (CPU-side on this driver) and the blended full-screen quad
+	int draw_ui = !gles_blit.src || vid.ui_in_game;
+
+	uint64_t t0 = perf_us(), t1, t2, t3;
+	if (perf.last_flip) {
+		uint32_t interval = (uint32_t)(t0 - perf.last_flip);
+		perf.emu_us += interval;
+	}
+	if (gles_blit.src) perf.game_frames++;
+	if (sync) perf.vsync_frames++;
+
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	// disable for plane textures
@@ -671,6 +744,7 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		draw_cached_quad(vid.vbo_game, vid.game_tex);
 		gles_blit.src = NULL;
 	}
+	t1 = perf_us();
 
 	// enable blending for ui/overlays
 	glEnable(GL_BLEND);
@@ -682,9 +756,12 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 	}
 
 	// 3. Draw Screen Overlay (UI) — cached VBO, only pixels change
-	glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
+	if (draw_ui) {
+		glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.width, vid.height, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, vid.screen->pixels);
-	draw_cached_quad(vid.vbo_screen, vid.screen_tex);
+		draw_cached_quad(vid.vbo_screen, vid.screen_tex);
+	}
+	vid.ui_drawn = draw_ui;
 
 	// 4. Draw Pill Overlay (Battery/Volume popup) if enabled
 	if (ovl.enabled && ovl.surface) {
@@ -693,11 +770,25 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		draw_cached_quad(vid.vbo_overlay, ovl.tex);
 	}
 
+	t2 = perf_us();
 	#ifndef PROFILE_GPU
 	SDL_GL_SwapWindow(vid.window);
 	#else
 	PLAT_checkGPULoad();
 	#endif
+	t3 = perf_us();
+
+	// full frame = from the end of the previous flip to the end of this one
+	if (perf.last_flip) {
+		uint32_t frame = (uint32_t)(t3 - perf.last_flip);
+		if (frame > perf.worst_frame_us) perf.worst_frame_us = frame;
+		if (frame > 17500) perf.slow_frames++;
+	}
+	perf.upload_us += t1 - t0;
+	perf.ui_us += t2 - t1;
+	perf.swap_us += t3 - t2;
+	perf.flips++;
+	perf.last_flip = t3;
 
 	// Swap pages for double buffering of the UI surface
 	vid.page ^= 1;

@@ -205,6 +205,7 @@ int GFX_hdmiChanged(void) {
 }
 
 #define FRAME_BUDGET 17 // 60fps
+#define PANEL_HZ_X100 6046 // RG35XX panel refresh, measured (vsync interrupt and Lenient fps)
 static uint32_t frame_start = 0;
 void GFX_startFrame(void) {
     frame_start = SDL_GetTicks();
@@ -1017,7 +1018,9 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_s
         while (tries < 10 && snd.frame_in==snd.frame_filled) {
             tries++;
             SDL_UnlockAudio();
+            uint32_t w0 = SDL_GetTicks();
             SDL_Delay(1);
+            PLAT_perfAudioWait(SDL_GetTicks() - w0);
             SDL_LockAudio();
         }
 
@@ -1064,6 +1067,16 @@ void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
     
     snd.buffer_seconds = 5;
     snd.sample_rate_in  = sample_rate;
+    // The panel refreshes at 60.46 Hz (measured), so with vsync a ~60 fps core runs at
+    // 60.46 fps and makes ~0.8% more audio than the card plays: the buffer fills and a
+    // frame misses vsync every ~2 s. Scale the input rate so the resampler drops that excess.
+    {
+        int fps100 = (int)(frame_rate * 100 + 0.5);
+        if (fps100 > 5850 && fps100 < 6150) {
+            snd.sample_rate_in = (int)((int64_t)(int)sample_rate * PANEL_HZ_X100 / fps100);
+            LOG_info("SND_init: %i fps x100 core on a %i x100 Hz panel: input rate %i\n", fps100, PANEL_HZ_X100, snd.sample_rate_in);
+        }
+    }
     snd.sample_rate_out = spec_out.freq;
     
     SND_selectResampler();

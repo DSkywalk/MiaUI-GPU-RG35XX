@@ -297,6 +297,9 @@ void PLAT_clearVideo(SDL_Surface* screen);
 void PLAT_clearAll(void);
 void PLAT_clearLayers(int layer);
 void PLAT_setVsync(int vsync);
+void PLAT_setUIInGame(int enabled); // 1 = something is drawn on the UI layer over the game
+void PLAT_perfReport(int vsync_mode); // prints and resets the PLAT_flip timing counters
+void PLAT_perfAudioWait(uint32_t ms); // time the emulation thread slept on a full audio buffer
 SDL_Surface* PLAT_resizeVideo(int w, int h, int pitch);
 void PLAT_setVideoScaleClip(int x, int y, int width, int height);
 void PLAT_setNearestNeighbor(int enabled);
