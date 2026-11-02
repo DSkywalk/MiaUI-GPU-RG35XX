@@ -1547,8 +1547,10 @@ void PLAT_enableOverlay(int enable) {
 	ovl.enabled = enable;
 }
 
+// 32-bit: a bezel's gradients band visibly at 4 bits a channel (the Game
+// Gear's), and it costs nothing per frame - uploaded once, then only sampled.
 void PLAT_initGameOverlay(const char* ovl_path) {
-	PLAT_initSurfaceOverlay(ovl_path, MODE_444A);
+	PLAT_initSurfaceOverlay(ovl_path, MODE_RGBA);
 }
 
 void PLAT_initSurfaceOverlay(const char* filename, int mode) {
@@ -1610,6 +1612,14 @@ void PLAT_initSurfaceOverlay(const char* filename, int mode) {
                 printf(">> loading %s as 4BPP buffer converted to 4444 (16bits alpha channel).\n", filename);
                 break;
             case MODE_RGBA:
+                // bytes R,G,B,A whatever IMG_Load picked (it can be ARGB)
+                converted = SDL_ConvertSurfaceFormat(surface, SDL_PIXELFORMAT_ABGR8888, 0);
+                SDL_FreeSurface(surface);
+                if (!converted) {
+                    fprintf(stderr, "Failed to convert surface to RGBA8888: %s\n", SDL_GetError());
+                    return;
+                }
+                surface = converted;
                 format = GL_RGBA;
                 ftype = GL_UNSIGNED_BYTE;
                 printf(">> loading %s as 4BPP buffer as full RGBA.\n", filename);
