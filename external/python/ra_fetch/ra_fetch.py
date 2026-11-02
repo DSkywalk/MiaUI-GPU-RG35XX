@@ -14,7 +14,8 @@ layout minarch's ra_offline.c expects:
 Sets are filed per console (the TAG is the one in the Roms/ folder name) so a
 big library doesn't turn into a single directory with thousands of files.
 
-Copy <output> to the SD card as /userdata/retroachievements and you're done.
+Copy <output> to the SD card as Profile/retroachievements
+(/userdata/Profile/retroachievements on the console) and you're done.
 
 The hashes produced here must match rc_hash_generate() on the device byte for
 byte, otherwise minarch looks for a file that will never exist. The routines
@@ -23,27 +24,30 @@ below are deliberately direct ports of rcheevos' own (src/hash/*.c).
 Usage:
     ./ra_fetch.py --roms /path/to/Roms --out ./retroachievements -u <user>
 
-Requires: requests
+Requires: requests (only to talk to the server; the hashing below is plain
+standard library, which is how the console's own downloader reuses this file:
+its Python has no ssl, requests or lzma, see _lzma_raw)
 """
 
 from __future__ import annotations
 
 import argparse
+import array
 import getpass
 import hashlib
 import json
 import os
 import re
 import sys
+import subprocess
 import time
 import zlib
-import lzma
 from pathlib import Path
 
 try:
-    import requests
-except ImportError:
-    sys.exit("error: this script needs `requests` (pip install requests)")
+    import lzma
+except ImportError:      # the console's Python is built without it
+    lzma = None
 
 
 DOREQUEST_URL = "https://retroachievements.org/dorequest.php"
@@ -100,11 +104,18 @@ CONSOLES = {
     "N64":       (2,  N64),     # byteswapped to z64 before hashing
     "PS":        (12, PSX),     # boot executable name + contents
     "MDCD":      (9,  SEGACD),  # first 512 bytes of sector 0
+    # the arcade folders: one RA system, several cores (minarch's
+    # common/utils.c RA_ARCADE_TAGS lists the same tags)
     "MAME":      (27, ARCADE),  # hash is the romset filename
     "KMMAME":    (27, ARCADE),
     "KMMAMECPS": (27, ARCADE),
+    "MAME2003P": (27, ARCADE),
     "FBANEO":    (27, ARCADE),
+    "FBNEOCPS":  (27, ARCADE),
+    "FBNEOGEO":  (27, ARCADE),
 }
+
+ARCADE_TAGS = {tag for tag, (_, method) in CONSOLES.items() if method == ARCADE}
 
 # Folders whose systems RetroAchievements/rcheevos can't be hashed by this
 # script. Listed explicitly so they're reported as skipped rather than silently
@@ -122,9 +133,9 @@ UNSUPPORTED = {
     "ECWOLF": "Wolfenstein",
 }
 
-# never ROMs
+# never ROMs (not ".md": that's a Mega Drive rom, the Rust port dropped it too)
 IGNORED_EXTS = {
-    ".txt", ".xml", ".json", ".dat", ".nfo", ".md", ".sh", ".cfg", ".ini",
+    ".txt", ".xml", ".json", ".dat", ".nfo", ".sh", ".cfg", ".ini",
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
     ".srm", ".sav", ".state", ".rtc", ".bak", ".db",
     ".m3u", ".pak", ".zip7", ".part",
@@ -241,17 +252,35 @@ def hash_n64(path: Path) -> str | None:
             if swap:
                 # rcheevos byteswaps whole words only; a ragged tail is left be
                 usable = len(chunk) - (len(chunk) % swap)
-                body = bytearray(chunk[:usable])
-                for i in range(0, usable, swap):
-                    body[i:i + swap] = body[i:i + swap][::-1]
-                chunk = bytes(body) + chunk[usable:]
+                words = array.array("H" if swap == 2 else "I", chunk[:usable])
+                words.byteswap()
+                chunk = words.tobytes() + chunk[usable:]
             h.update(chunk)
     return h.hexdigest()
 
 
+# FBNeo loads other systems' games from folders with these names; rcheevos
+# puts the folder in the hash then (rc_hash_arcade)
+_FBNEO_FOLDERS = {"nes", "fds", "sms", "msx", "ngp", "pce", "chf", "sgx", "tg16", "msx1",
+                  "neocd", "coleco", "sg1000", "genesis", "gamegear", "megadriv",
+                  "pcengine", "channelf", "spectrum", "megadrive", "supergrafx",
+                  "zxspectrum", "mastersystem", "colecovision"}
+
+
 def hash_arcade(path: Path) -> str | None:
-    """Arcade sets are identified by romset name, not contents."""
-    return _md5(path.stem.encode("utf-8"))
+    """Arcade sets are identified by romset name, not contents: the md5 of
+    the file name without its extension ("sf2.zip" -> md5("sf2")), never of
+    the zip's bytes. A port of rcheevos' rc_hash_arcade, folder rule and all."""
+    name = path.name.encode("utf-8")
+    dot = name.rfind(b".")
+    if dot < 0:
+        return _md5(name)                       # an unpacked romset folder
+    stem = name[:dot]
+    folder = path.parent.name.encode("utf-8")
+    if 0 < len(folder) < 16 and folder.lower().decode("utf-8", "replace") in _FBNEO_FOLDERS \
+            and len(folder) + len(stem) + 1 < 128:
+        return _md5(folder.lower() + b"_" + stem)
+    return _md5(stem)
 
 
 ###############################################################################
@@ -541,9 +570,31 @@ def _lzma_dict_size(reduce_size: int) -> int:
 
 
 def _lzma_raw(data: bytes, outlen: int, dict_size: int) -> bytes:
+    if lzma is None:
+        return _lzma_raw_xz(data, outlen, dict_size)
     dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[
         {"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": dict_size}])
     return dec.decompress(data, max_length=outlen)
+
+
+def _lzma_raw_xz(data: bytes, outlen: int, dict_size: int) -> bytes:
+    """The same raw LZMA1 decode through an lzma tool, for a Python without
+    lzma (the console's). The stream gets the 13-byte .lzma ("alone") header
+    in front: properties, dictionary size and the output size, which is known
+    here and lets the decoder stop there without an end marker (libchdr's
+    streams have none). BusyBox's unlzma reads that format; its xz doesn't
+    know raw streams, which is why not --format=raw."""
+    props = (2 * 5 + 0) * 9 + 3                      # pb=2, lp=0, lc=3
+    alone = bytes([props]) + dict_size.to_bytes(4, "little") + outlen.to_bytes(8, "little")
+    for cmd in (["unlzma", "-c"], ["lzma", "-dc"], ["xz", "-dc", "--format=lzma"]):
+        try:
+            out = subprocess.run(cmd, input=alone + data, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL).stdout
+        except OSError:
+            continue
+        if len(out) >= outlen:
+            return out[:outlen]
+    raise ChdError("lzma hunk didn't decode (needs Python's lzma or an unlzma tool)")
 
 
 def _cd_decompress(src: bytes, destlen: int, base_decode) -> bytes:
@@ -1028,6 +1079,35 @@ HASHERS = {
     SEGACD: hash_segacd, ARCADE: hash_arcade,
 }
 
+# a zipped game bigger than this isn't unpacked to be hashed
+MAX_UNZIP = 96 * 1024 * 1024
+
+
+def hash_rom(method: str, path: Path) -> str | None:
+    """The hash minarch computes for this file. A zip is the game inside it,
+    except for arcade, where the zip IS the romset and only its name counts:
+    minarch unpacks a zip for a core without zip support (most of them) and
+    hashes the first file in it with a game's extension, which is what
+    happens here, in a temporary folder."""
+    if path.suffix.lower() != ".zip" or method == ARCADE:
+        return HASHERS[method](path)
+    import tempfile
+    import zipfile
+    with zipfile.ZipFile(str(path)) as z:
+        entry = next((i for i in z.infolist() if not i.is_dir()
+                      and Path(i.filename).suffix.lower() not in IGNORED_EXTS | {".zip"}), None)
+        if entry is None or entry.file_size > MAX_UNZIP:
+            return None
+        with tempfile.TemporaryDirectory(prefix="ra_fetch_") as tmp:
+            out = Path(tmp) / (Path(entry.filename).name or "rom")
+            with z.open(entry) as src, out.open("wb") as dst:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            return HASHERS[method](out)
+
 
 ###############################################################################
 # RetroAchievements client
@@ -1035,6 +1115,10 @@ HASHERS = {
 
 class RAClient:
     def __init__(self, username: str, user_agent: str, delay: float):
+        try:
+            import requests
+        except ImportError:
+            sys.exit("error: this script needs `requests` (pip install requests)")
         self.username = username
         self.delay = delay
         self.session = requests.Session()
@@ -1155,7 +1239,7 @@ def main() -> int:
     ap.add_argument("--roms", required=True, type=Path,
                     help="source Roms/ folder (containing 'Name (TAG)' sub-folders)")
     ap.add_argument("--out", required=True, type=Path,
-                    help="output folder, copy to /userdata/retroachievements on the device")
+                    help="output folder, copy to Profile/retroachievements on the card")
     ap.add_argument("-u", "--username", required=True, help="RetroAchievements username")
     ap.add_argument("-p", "--password",
                     help="RA password (omit to be prompted, or set RA_PASSWORD)")
@@ -1228,7 +1312,7 @@ def main() -> int:
         label = f"[{tag}] {rom.name}"
 
         try:
-            digest = HASHERS[method](rom)
+            digest = hash_rom(method, rom)
         except ChdError as exc:
             # an unreadable CHD is a skip, not a wrong hash
             print(f"  ?     {label}: {exc}")
@@ -1322,7 +1406,8 @@ def main() -> int:
           f"{stats['unknown']} not in database, {stats['nohash']} unhashable, "
           f"{stats['failed']} failed")
     if stats["written"] or stats["cached"]:
-        print(f"\ncopy {args.out} to your SD card as /userdata/retroachievements")
+        print(f"\ncopy {args.out} to your SD card as Profile/retroachievements "
+              "(/userdata/Profile/retroachievements on the console)")
     return 0
 
 
