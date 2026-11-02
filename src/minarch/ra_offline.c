@@ -21,6 +21,7 @@
 #endif
 
 #include "ra_offline.h"
+#include "utils.h" // isArcadeTag: the arcade folders are one RA system
 
 // Declared by common/api.h, but that header drags in SDL/GLES which this
 // module has no use for -- keep it standalone and just borrow the logger.
@@ -156,6 +157,44 @@ static int ra_wantsMsg(int kind) {
 static int ra_fileExists(const char* path) {
     struct stat st;
     return stat(path, &st)==0 && st.st_size>0;
+}
+
+// An arcade romset played from another arcade folder before (moved, or kept
+// in two for two cores) starts from what was unlocked there: the newest of
+// those progress files is copied in. The tamper check covers the hash and the
+// set, not the folder, so the copy is as good as the original. From here on
+// this folder's file is the one written.
+static void ra_adoptArcadeProgress(const char* emu_tag) {
+    char best[MAX_PATH] = "";
+    time_t best_time = 0;
+    for (int i = 0; RA_ARCADE_TAGS[i]; i++) {
+        if (!strcasecmp(RA_ARCADE_TAGS[i], emu_tag)) continue;
+        char path[MAX_PATH];
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/progress/%s/%s_progress.json", ra.root, RA_ARCADE_TAGS[i], ra.hash);
+        if (stat(path, &st) == 0 && st.st_size > 0 && st.st_mtime >= best_time) {
+            best_time = st.st_mtime;
+            snprintf(best, sizeof(best), "%s", path);
+        }
+    }
+    if (!best[0]) return;
+    FILE* in = fopen(best, "rb");
+    if (!in) return;
+    char tmp[MAX_PATH];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", ra.progress_path);
+    FILE* out = fopen(tmp, "wb");
+    if (!out) {
+        fclose(in);
+        return;
+    }
+    char buf[4096];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) ok = ok && fwrite(buf, 1, n, out) == n;
+    fclose(in);
+    ok = fclose(out) == 0 && ok;
+    if (ok && rename(tmp, ra.progress_path) == 0) LOG_info("RA: progress taken over from %s\n", best);
+    else unlink(tmp);
 }
 
 // Reads a saved `r=patch` body and hands it to rcheevos' own parser. On
@@ -752,7 +791,6 @@ static uint32_t ra_consoleIdForTag(const char* tag) {
     static const struct { const char* tag; uint32_t console_id; } map[] = {
         { "BMSX",      RC_CONSOLE_MSX },
         { "CPC",       RC_CONSOLE_AMSTRAD_PC },
-        { "FBANEO",    RC_CONSOLE_ARCADE },
         { "FC",        RC_CONSOLE_NINTENDO },
         { "FUSE",      RC_CONSOLE_ZX_SPECTRUM },
         { "GB",        RC_CONSOLE_GAMEBOY },
@@ -760,9 +798,6 @@ static uint32_t ra_consoleIdForTag(const char* tag) {
         { "GBC",       RC_CONSOLE_GAMEBOY_COLOR },
         { "GG",        RC_CONSOLE_GAME_GEAR },
         { "HANDY",     RC_CONSOLE_ATARI_LYNX },
-        { "KMMAME",    RC_CONSOLE_ARCADE },
-        { "KMMAMECPS", RC_CONSOLE_ARCADE },
-        { "MAME",      RC_CONSOLE_ARCADE },
         { "MD",        RC_CONSOLE_MEGA_DRIVE },
         { "MD32X",     RC_CONSOLE_SEGA_32X },
         { "MDCD",      RC_CONSOLE_SEGA_CD },
@@ -784,6 +819,8 @@ static uint32_t ra_consoleIdForTag(const char* tag) {
     };
 
     if (!tag) return RC_CONSOLE_UNKNOWN;
+    // every arcade folder (MAME, FBNeo, ...: common/utils.c) is the one system
+    if (isArcadeTag(tag)) return RC_CONSOLE_ARCADE;
 
     for (size_t i=0; i<sizeof(map)/sizeof(map[0]); i++) {
         if (!strcasecmp(map[i].tag, tag)) return map[i].console_id;
@@ -831,6 +868,10 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     // 2. the set has to be on the card already. Sets are filed per console so
     // a big library doesn't end up as one directory with thousands of entries.
     snprintf(ra.data_path, sizeof(ra.data_path), "%s/data/%s/%s.json", ra.root, emu_tag, ra.hash);
+    // an arcade romset's hash is its name, the same in every arcade folder:
+    // a set filed under another arcade tag is this game's too
+    for (int i = 0; RA_ARCADE_TAGS[i] && !ra_fileExists(ra.data_path) && isArcadeTag(emu_tag); i++)
+        snprintf(ra.data_path, sizeof(ra.data_path), "%s/data/%s/%s.json", ra.root, RA_ARCADE_TAGS[i], ra.hash);
     if (!ra_fileExists(ra.data_path)) {
         // tolerate a flat data/ folder from an older run of the fetch tool
         snprintf(ra.data_path, sizeof(ra.data_path), "%s/data/%s.json", ra.root, ra.hash);
@@ -860,6 +901,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
 
     snprintf(ra.progress_path, sizeof(ra.progress_path),
              "%s/%s_progress.json", progress_dir, ra.hash);
+    if (isArcadeTag(emu_tag) && !ra_fileExists(ra.progress_path)) ra_adoptArcadeProgress(emu_tag);
     ra_loadProgress();
 
     // 5. arm the runtime with everything still locked

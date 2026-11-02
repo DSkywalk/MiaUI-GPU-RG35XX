@@ -13,6 +13,14 @@ const char* getMameName(int index);
 void getEmuName(const char* in_name, char* out_name);
 void getEmuPath(char* emu_name, char* pak_path);
 
+// RetroAchievements knows every arcade romset as one system (the hash is the
+// romset's name, rc_hash_arcade), which this card splits over several Roms
+// folders so each set runs on the core it suits. Tags compare without case.
+// Keep in step with ra_fetch.py's CONSOLES and the Rust tool's.
+extern const char* const RA_ARCADE_TAGS[]; // NULL-terminated
+int isArcadeTag(const char* tag);
+int sameRaSystem(const char* a, const char* b); // the same tag, or both arcade
+
 void normalizeNewline(char* line);
 void trimTrailingNewlines(char* line);
 void trimSortingMeta(char** str);

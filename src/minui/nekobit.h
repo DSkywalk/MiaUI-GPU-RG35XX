@@ -47,6 +47,9 @@ enum { // wording and reward variants
 
 #define NB_PATH_LEN     256 // relative to SDCARD_PATH, like recent.txt
 #define NB_TITLE_LEN    64
+// the arcade folders (common/utils.c's RA_ARCADE_TAGS) as one system, the
+// name RetroAchievements.pak gives them too
+#define NB_ARCADE_NAME  "Arcade (MAME / FBNeo)"
 #define NB_MAX_MISSIONS 5
 #define NB_MAX_HISTORY  32
 #define NB_MAX_GAMES    32

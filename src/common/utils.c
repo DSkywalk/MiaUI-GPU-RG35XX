@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <math.h>
@@ -148,6 +149,22 @@ int getDisplayName(const char* in_name, char* out_name) {
  */
 const char* getMameName(int index) {
     return mame_list[index].name;
+}
+
+const char* const RA_ARCADE_TAGS[] = {
+    "MAME", "KMMAME", "KMMAMECPS", "MAME2003P", "FBANEO", "FBNEOCPS", "FBNEOGEO", NULL,
+};
+
+int isArcadeTag(const char* tag) {
+    if (!tag) return 0;
+    for (int i = 0; RA_ARCADE_TAGS[i]; i++)
+        if (!strcasecmp(RA_ARCADE_TAGS[i], tag)) return 1;
+    return 0;
+}
+
+int sameRaSystem(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    return !strcasecmp(a, b) || (isArcadeTag(a) && isArcadeTag(b));
 }
 
 /**

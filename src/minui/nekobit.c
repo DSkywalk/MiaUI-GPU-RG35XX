@@ -481,6 +481,13 @@ int NB_freeSlots(void) {
     return n;
 }
 
+// An achievement mission for the arcade group, from whichever of its folders
+static int nb_hasArcadeSystemMission(void) {
+    for (int i = 0; i < NB_MAX_MISSIONS; i++)
+        if (S.missions[i].type == NB_MIS_ACH_SYSTEM && isArcadeTag(S.missions[i].tag)) return 1;
+    return 0;
+}
+
 static int nb_hasMission(int type, const char* path, const char* hash) {
     for (int i = 0; i < NB_MAX_MISSIONS; i++) {
         const NB_Mission* m = &S.missions[i];
@@ -651,6 +658,12 @@ static char* nb_readSet(const char* tag, const char* hash) {
     snprintf(path, sizeof(path), "%s/data/%s/%s.json", RETROACHIVEMENTS_PATH, tag, hash);
     char* json = nb_readAll(path);
     if (json) return json;
+    // an arcade romset's hash is its name: the set may be filed under any of
+    // the arcade folders' tags, as minarch also looks for it
+    for (int i = 0; isArcadeTag(tag) && RA_ARCADE_TAGS[i]; i++) {
+        snprintf(path, sizeof(path), "%s/data/%s/%s.json", RETROACHIVEMENTS_PATH, RA_ARCADE_TAGS[i], hash);
+        if ((json = nb_readAll(path))) return json;
+    }
     snprintf(path, sizeof(path), "%s/data/%s.json", RETROACHIVEMENTS_PATH, hash);
     return nb_readAll(path);
 }
@@ -784,7 +797,7 @@ static void nb_creditUnlocks(NB_Unlocks* u, const char* fallback_title) {
         NB_Mission* m = &S.missions[i];
         int hit = m->type == NB_MIS_ACH_ANY ||
                   (m->type == NB_MIS_ACH_GAME && !strcmp(m->hash, u->hash)) ||
-                  (m->type == NB_MIS_ACH_SYSTEM && !strcmp(m->tag, u->tag));
+                  (m->type == NB_MIS_ACH_SYSTEM && sameRaSystem(m->tag, u->tag));
         if (!hit) continue;
         m->progress += fresh;
         if (m->type == NB_MIS_ACH_GAME) {
@@ -1176,21 +1189,33 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
             snprintf(path, sizeof(path), "%s/%s", dir_path, dp->d_name);
             char* json = nb_readAll(path);
             NB_Unlocks u;
-            if (json && nb_parseProgress(json, 1, 0, &u) && u.total > 0 && u.unlocked < u.total &&
-                !nb_hasMission(NB_MIS_ACH_GAME, NULL, u.hash)) {
-                NB_RACandidate* c = &cands[n++];
+            int ok = json && nb_parseProgress(json, 1, 0, &u) && u.total > 0;
+            // the same set in two folders (an arcade romset kept for two cores):
+            // the copy furthest along speaks for it
+            int dup = -1;
+            for (int i = 0; ok && i < n && dup < 0; i++)
+                if (!strcmp(cands[i].hash, u.hash)) dup = i;
+            NB_RACandidate* c = dup >= 0 ? &cands[dup] : ok && !nb_hasMission(NB_MIS_ACH_GAME, NULL, u.hash) ? &cands[n++] : NULL;
+            if (c && (dup < 0 || u.unlocked > c->unlocked)) {
                 nb_copy(c->tag, tp->d_name, sizeof(c->tag));
                 nb_copy(c->hash, u.hash, sizeof(c->hash));
                 nb_copy(c->path, u.path, sizeof(c->path));
                 c->total = u.total;
                 c->unlocked = u.unlocked;
-                masteries += u.unlocked * 2 >= u.total;
             }
             free(json);
         }
         if (dh) closedir(dh);
     }
     if (tags) closedir(tags);
+    for (int i = 0; i < n;) { // sets already mastered have nothing left to offer
+        if (cands[i].unlocked >= cands[i].total) {
+            cands[i] = cands[--n];
+            continue;
+        }
+        masteries += cands[i].unlocked * 2 >= cands[i].total;
+        i++;
+    }
 
     int found = 0;
     if (n) {
@@ -1234,12 +1259,17 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
     DIR* dh = opendir(root);
     if (!dh) return 0;
     const NB_System* systems[64];
-    int count = 0;
+    int count = 0, arcade = 0; // the arcade folders go in once, as one system
     struct dirent* dp;
     while ((dp = readdir(dh)) && count < 64) {
         if (dp->d_name[0] == '.') continue;
         const NB_System* sys = nb_systemForTag(lib, dp->d_name);
-        if (sys && !nb_hasMission(NB_MIS_ACH_SYSTEM, nb_rel(sys->path), NULL)) systems[count++] = sys;
+        if (!sys) continue;
+        if (isArcadeTag(dp->d_name)) {
+            if (arcade++ || nb_hasArcadeSystemMission()) continue;
+        }
+        else if (nb_hasMission(NB_MIS_ACH_SYSTEM, nb_rel(sys->path), NULL)) continue;
+        systems[count++] = sys;
     }
     closedir(dh);
     memset(m, 0, sizeof(*m));
@@ -1249,8 +1279,10 @@ static int nb_offerAchievement(const NB_Library* lib, NB_Mission* m) {
         m->target = 1;
         m->xp = nb_scaled(50);
         nb_tagOf(sys->path, m->tag, sizeof(m->tag));
-        nb_copy(m->title, sys->name, sizeof(m->title));
-        nb_copy(m->system, sys->name, sizeof(m->system));
+        // the folder it opens on is one of them, but any arcade unlock counts
+        const char* name = isArcadeTag(m->tag) ? NB_ARCADE_NAME : sys->name;
+        nb_copy(m->title, name, sizeof(m->title));
+        nb_copy(m->system, name, sizeof(m->system));
         nb_copy(m->path, nb_rel(sys->path), sizeof(m->path));
         return 1;
     }
