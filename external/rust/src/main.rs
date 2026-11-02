@@ -155,9 +155,14 @@ const CONSOLES: &[(&str, u32, Method)] = &[
     ("PS", 12, Method::Psx),    // boot executable name + contents
     ("MDCD", 9, Method::SegaCd), // first 512 bytes of sector 0
     ("MAME", 27, Method::Arcade), // hash is the romset filename
+    // the arcade folders: one RA system, several cores (minarch's
+    // common/utils.c RA_ARCADE_TAGS lists the same tags)
     ("KMMAME", 27, Method::Arcade),
     ("KMMAMECPS", 27, Method::Arcade),
+    ("MAME2003P", 27, Method::Arcade),
     ("FBANEO", 27, Method::Arcade),
+    ("FBNEOCPS", 27, Method::Arcade),
+    ("FBNEOGEO", 27, Method::Arcade),
 ];
 
 /// Folders whose systems this tool can't hash. Listed explicitly so they're
@@ -369,12 +374,35 @@ fn hash_n64(path: &Path) -> Result<Option<String>> {
     Ok(Some(hex(&h.finalize())))
 }
 
-/// Arcade sets are identified by romset name, not contents.
+/// FBNeo loads other systems' games from folders with these names; rcheevos
+/// puts the folder in the hash then (rc_hash_arcade)
+const FBNEO_FOLDERS: &[&str] = &[
+    "nes", "fds", "sms", "msx", "ngp", "pce", "chf", "sgx", "tg16", "msx1", "neocd", "coleco",
+    "sg1000", "genesis", "gamegear", "megadriv", "pcengine", "channelf", "spectrum", "megadrive",
+    "supergrafx", "zxspectrum", "mastersystem", "colecovision",
+];
+
+/// Arcade sets are identified by romset name, not contents: the md5 of the
+/// file name without its extension ("sf2.zip" -> md5("sf2")), never of the
+/// zip's bytes. A port of rcheevos' rc_hash_arcade, folder rule and all.
 fn hash_arcade(path: &Path) -> Result<Option<String>> {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(dot) = name.rfind('.') else {
+        return Ok(Some(md5_of(&[name.as_bytes()]))); // an unpacked romset folder
+    };
+    let stem = &name[..dot];
+    let folder = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
+    if !folder.is_empty()
+        && folder.len() < 16
+        && FBNEO_FOLDERS.contains(&folder.as_str())
+        && folder.len() + stem.len() + 1 < 128
+    {
+        return Ok(Some(md5_of(&[folder.as_bytes(), b"_", stem.as_bytes()])));
+    }
     Ok(Some(md5_of(&[stem.as_bytes()])))
 }
 
@@ -1516,7 +1544,108 @@ fn hash_segacd(path: &Path) -> Result<Option<String>> {
     Ok(Some(md5_of(&[&header])))
 }
 
+/// A zipped game bigger than this isn't unpacked to be hashed.
+const MAX_UNZIP: u64 = 96 * 1024 * 1024;
+
+/// The first file in a zip with a game's extension, unpacked into `dir`: what
+/// minarch does for a core without zip support (most of them) before it
+/// hashes. Only the plain zip minarch reads: stored or deflated, no ZIP64.
+/// None when there's no such file.
+fn unzip_first_rom(zip: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+    let le16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as u64;
+    let mut f = File::open(zip)?;
+    let size = f.metadata()?.len();
+    // the end-of-central-directory record, within the last 64 KiB + 22
+    let tail_len = size.min(65536 + 22);
+    f.seek(SeekFrom::Start(size - tail_len))?;
+    let mut tail = vec![0u8; tail_len as usize];
+    f.read_exact(&mut tail)?;
+    let Some(eocd) = (0..tail.len().saturating_sub(21)).rev().find(|&i| tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06])
+    else {
+        bail!("not a zip");
+    };
+    let entries = le16(&tail, eocd + 10);
+    let (cd_size, cd_offset) = (le32(&tail, eocd + 12), le32(&tail, eocd + 16));
+    if cd_size > 64 * 1024 * 1024 || cd_offset + cd_size > size {
+        bail!("zip directory out of range");
+    }
+    f.seek(SeekFrom::Start(cd_offset))?;
+    let mut cd = vec![0u8; cd_size as usize];
+    f.read_exact(&mut cd)?;
+    let mut at = 0;
+    for _ in 0..entries {
+        if at + 46 > cd.len() || cd[at..at + 4] != [0x50, 0x4b, 0x01, 0x02] {
+            bail!("bad zip directory");
+        }
+        let method = le16(&cd, at + 10);
+        let (csize, usize_) = (le32(&cd, at + 20), le32(&cd, at + 24));
+        let (n, e, c) = (le16(&cd, at + 28), le16(&cd, at + 30), le16(&cd, at + 32));
+        let local = le32(&cd, at + 42);
+        let name = String::from_utf8_lossy(&cd[at + 46..(at + 46 + n).min(cd.len())]).into_owned();
+        at += 46 + n + e + c;
+        let ext = Path::new(&name)
+            .extension()
+            .map(|x| format!(".{}", x.to_string_lossy().to_lowercase()))
+            .unwrap_or_default();
+        if name.ends_with('/') || IGNORED_EXTS.contains(&ext.as_str()) || ext == ".zip" {
+            continue;
+        }
+        // the first game file decides, as in minarch
+        if csize == 0xFFFF_FFFF || usize_ == 0xFFFF_FFFF || usize_ > MAX_UNZIP || (method != 0 && method != 8) {
+            return Ok(None);
+        }
+        let mut head = [0u8; 30];
+        f.seek(SeekFrom::Start(local))?;
+        f.read_exact(&mut head)?;
+        if head[..4] != [0x50, 0x4b, 0x03, 0x04] {
+            bail!("bad zip entry");
+        }
+        f.seek(SeekFrom::Start(local + 30 + le16(&head, 26) as u64 + le16(&head, 28) as u64))?;
+        let data = (&mut f).take(csize);
+        let base = Path::new(&name).file_name().map(|b| b.to_os_string()).unwrap_or_else(|| "rom".into());
+        let out_path = dir.join(base);
+        let mut out = File::create(&out_path)?;
+        let written = if method == 8 {
+            std::io::copy(&mut flate2::read::DeflateDecoder::new(data).take(MAX_UNZIP), &mut out)?
+        } else {
+            std::io::copy(&mut data.take(MAX_UNZIP), &mut out)?
+        };
+        if written != usize_ {
+            bail!("zip entry is {written} bytes, the zip says {usize_}");
+        }
+        return Ok(Some(out_path));
+    }
+    Ok(None)
+}
+
+/// The hash minarch computes for this file. A zip is the game inside it,
+/// except for arcade, where the zip IS the romset and only its name counts.
 fn hash_rom(method: Method, path: &Path) -> Result<Option<String>> {
+    let is_zip = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    if !is_zip || method == Method::Arcade {
+        return hash_file(method, path);
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ra_fetch_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let result = match unzip_first_rom(path, &dir) {
+        Ok(Some(rom)) => hash_file(method, &rom),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn hash_file(method: Method, path: &Path) -> Result<Option<String>> {
     match method {
         Method::Whole => hash_whole(path),
         Method::Nes => hash_nes(path),
@@ -1823,8 +1952,13 @@ fn find_roms(
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 #[serde(default)]
 struct Settings {
-    /// The card itself. Roms/ and Profile/retroachievements/ hang off this.
-    sd_root: String,
+    /// The folder holding the "Name (TAG)" system folders. Asked for on its
+    /// own: on Windows the card's ext4 partition can't be opened, so the roms
+    /// are usually a copy on the PC.
+    roms: String,
+    /// Where Profile/retroachievements/ is created, ready to be copied to the
+    /// root of the card as it is.
+    out: String,
     username: String,
     force: bool,
     /// Folder names the user has explicitly unticked. Stored as the negative
@@ -1837,32 +1971,35 @@ struct Settings {
     /// reference data, never sent to the server (gameid is looked up by hash
     /// alone) and never read by the device.
     mappings: BTreeMap<String, Method>,
-    /// Only read, never written: migrates settings saved before the card root
-    /// replaced the two separate paths.
-    roms: String,
+    /// Only read, never written: migrates settings saved by the build that
+    /// took the card root and derived both folders from it.
+    sd_root: String,
 }
 
 impl Settings {
     fn roms_dir(&self) -> PathBuf {
-        Path::new(self.sd_root.trim()).join("Roms")
+        PathBuf::from(self.roms.trim())
     }
+    /// The sets go in <out>/Profile/retroachievements, the same path as on
+    /// the card, so the user copies Profile/ over and nothing else.
     fn out_dir(&self) -> PathBuf {
-        Path::new(self.sd_root.trim())
+        Path::new(self.out.trim())
             .join("Profile")
             .join("retroachievements")
     }
-    /// An older build stored the Roms folder directly; the card root is its
-    /// parent, so the user does not have to pick it again.
+    /// The build before this one stored the card root: its Roms/ is the roms
+    /// folder, and the card root itself was where Profile/ went.
     fn migrate(&mut self) {
-        if self.sd_root.trim().is_empty() && !self.roms.trim().is_empty() {
-            let old = PathBuf::from(self.roms.trim());
-            if old.file_name().and_then(|n| n.to_str()) == Some("Roms") {
-                if let Some(parent) = old.parent() {
-                    self.sd_root = parent.display().to_string();
-                }
+        let old = self.sd_root.trim().to_string();
+        if !old.is_empty() {
+            if self.roms.trim().is_empty() {
+                self.roms = Path::new(&old).join("Roms").display().to_string();
+            }
+            if self.out.trim().is_empty() {
+                self.out = old;
             }
         }
-        self.roms.clear();
+        self.sd_root.clear();
     }
 }
 
@@ -2480,12 +2617,23 @@ fn run_job_inner(
         );
     }
     if written > 0 || cached_n > 0 {
+        // cfg.out is <output>/Profile/retroachievements: the folder to copy
+        // is the Profile/ above it
+        let profile = cfg.out.parent().unwrap_or(&cfg.out);
+        rep.say(Kind::Ok, format!("DONE. The achievements are in {}", cfg.out.display()));
+        rep.say(
+            Kind::Ok,
+            format!(
+                "Now copy the folder {} to the root of the console's SD card, \
+                 merging it with the Profile folder already there.",
+                profile.display()
+            ),
+        );
         rep.say(
             Kind::Info,
-            format!(
-                "Process completed on: {}",
-                cfg.out.display()
-            ),
+            "On the card it must end up as Profile/retroachievements/ \
+             (/userdata/Profile/retroachievements on the console)."
+                .to_string(),
         );
     }
     Ok(())
@@ -2502,7 +2650,7 @@ struct App {
     password: String, // never persisted
 
     platforms: Vec<Platform>,
-    platforms_for: String, // the card root the list was built from
+    platforms_for: String, // the roms folder the list was built from
 
     /// Lives only as long as the window does, which is the whole point.
     cache: HashCache,
@@ -2543,7 +2691,7 @@ impl App {
     /// Re-read the sub-folders of <card>/Roms. Cheap (one readdir), so it is
     /// called whenever the path changes rather than only on demand.
     fn refresh_platforms(&mut self) {
-        let root = self.cfg.sd_root.trim().to_string();
+        let root = self.cfg.roms.trim().to_string();
         let unselected: HashSet<String> = self.cfg.unselected.iter().cloned().collect();
         self.platforms = if root.is_empty() {
             Vec::new()
@@ -2645,7 +2793,8 @@ impl App {
 
     fn can_start(&self) -> bool {
         !self.running
-            && !self.cfg.sd_root.trim().is_empty()
+            && !self.cfg.roms.trim().is_empty()
+            && !self.cfg.out.trim().is_empty()
             && !self.cfg.username.trim().is_empty()
             && self.platforms.iter().any(|p| p.selectable() && p.selected)
     }
@@ -2692,29 +2841,32 @@ impl App {
         );
         ui.add_space(8.0);
 
-        let before = self.cfg.sd_root.clone();
-        path_row(ui, "SD card root", &mut self.cfg.sd_root, idle);
-        if self.cfg.sd_root != before || self.cfg.sd_root.trim() != self.platforms_for {
+        let before = self.cfg.roms.clone();
+        path_row(ui, "ROMs folder", &mut self.cfg.roms, idle);
+        if self.cfg.roms != before || self.cfg.roms.trim() != self.platforms_for {
             self.refresh_platforms();
         }
-
-        // both paths are fixed by the card layout, so show them rather than
-        // asking for them - and say plainly when the roms folder isn't there
-        if !self.cfg.sd_root.trim().is_empty() {
-            let roms = self.cfg.roms_dir();
-            let out = self.cfg.out_dir();
+        if !self.cfg.roms.trim().is_empty() && !self.cfg.roms_dir().is_dir() {
             ui.horizontal(|ui| {
                 ui.add_space(110.0);
-                let text = format!("roms {}   ->   sets {}", roms.display(), out.display());
-                if roms.is_dir() {
-                    ui.label(egui::RichText::new(text).small().weak());
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!("{text}   (no Roms folder here)"))
-                            .small()
-                            .color(colour_for(Kind::Err)),
-                    );
-                }
+                ui.label(
+                    egui::RichText::new("(no such folder)")
+                        .small()
+                        .color(colour_for(Kind::Err)),
+                );
+            });
+        }
+
+        path_row(ui, "Output folder", &mut self.cfg.out, idle);
+        // the sets land under the same path they have on the card
+        if !self.cfg.out.trim().is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(110.0);
+                ui.label(
+                    egui::RichText::new(format!("sets go in {}", self.cfg.out_dir().display()))
+                        .small()
+                        .weak(),
+                );
             });
         }
 
@@ -3172,6 +3324,122 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rcheevos' own rc_hash_arcade (built from minarch's copy) gave these.
+    #[test]
+    fn arcade_hash_matches_rcheevos() {
+        let cases = [
+            ("Arcade (KMMAME)/sf2.zip", "a7946d9b269b67f7a6b1148d3f5d8155"),
+            ("Neo Geo (FBNEOGEO)/kof98.zip", "c0959b94e46f1811952055be7f59cba6"),
+            ("nes/smb.zip", "bb23ace7414f08c52f38e2565a06148e"),
+            ("NES/smb.zip", "bb23ace7414f08c52f38e2565a06148e"),
+            ("NeoCD/aof.zip", "60acac6374faf41422a2638d5b7912e3"),
+            ("Genesis/a.b.zip", "4b8d948f1a1c9b838af6de14f8d86f1e"),
+            ("msx1/king.zip", "32b3d68c1086b70d59d410e7fc27c146"),
+            ("abcdefghijklmno/x.zip", "9dd4e461268c8034f5c8564e155c67a6"),
+            ("averyveryverylongfolder/x.zip", "9dd4e461268c8034f5c8564e155c67a6"),
+            ("Arcade (MAME)/mslug", "b43c8b4ec999588c04dad79bb8bcc745"),
+        ];
+        for (path, want) in cases {
+            let got = hash_arcade(&Path::new("/card/Roms").join(path)).unwrap().unwrap();
+            assert_eq!(got, want, "{path}");
+        }
+    }
+
+    /// A zip as zip tools write one: local headers, then the central directory.
+    fn make_zip(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+        use std::io::Write;
+        let (mut out, mut cd) = (Vec::new(), Vec::new());
+        for (name, data, deflate) in entries {
+            let body = if *deflate {
+                let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                e.write_all(data).unwrap();
+                e.finish().unwrap()
+            } else {
+                data.to_vec()
+            };
+            let method: u16 = if *deflate { 8 } else { 0 };
+            let at = out.len() as u32;
+            let mut h = Vec::new();
+            h.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0]);
+            h.extend_from_slice(&method.to_le_bytes());
+            h.extend_from_slice(&[0; 8]); // time, date, crc (not checked)
+            h.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&h);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&body);
+            cd.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0]);
+            cd.extend_from_slice(&method.to_le_bytes());
+            cd.extend_from_slice(&[0; 8]);
+            cd.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            cd.extend_from_slice(&[0; 12]); // extra, comment, disk, attributes
+            cd.extend_from_slice(&at.to_le_bytes());
+            cd.extend_from_slice(name.as_bytes());
+        }
+        let cd_at = out.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_at.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    #[test]
+    fn zipped_games_hash_the_game_inside_but_arcade_hashes_the_name() {
+        let dir = std::env::temp_dir().join(format!("ra_fetch_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let game: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let want = md5_of(&[&game]);
+        for deflate in [false, true] {
+            let zip = dir.join(format!("Tetris{}.zip", deflate as u8));
+            std::fs::write(&zip, make_zip(&[("readme.txt", b"hi", false), ("Tetris.gb", &game, deflate)])).unwrap();
+            assert_eq!(hash_rom(Method::Whole, &zip).unwrap().unwrap(), want, "deflate {deflate}");
+            // the same zip in an arcade folder is a romset: its name
+            assert_eq!(
+                hash_rom(Method::Arcade, &zip).unwrap().unwrap(),
+                md5_of(&[format!("Tetris{}", deflate as u8).as_bytes()])
+            );
+        }
+        // a .md inside is a Mega Drive game, not something to skip
+        let zip = dir.join("Sonic.zip");
+        std::fs::write(&zip, make_zip(&[("Sonic.md", &game, true)])).unwrap();
+        assert_eq!(hash_rom(Method::Whole, &zip).unwrap().unwrap(), want);
+        // nothing but a readme: no hash rather than a wrong one
+        let zip = dir.join("Empty.zip");
+        std::fs::write(&zip, make_zip(&[("readme.txt", b"hi", false)])).unwrap();
+        assert_eq!(hash_rom(Method::Whole, &zip).unwrap(), None);
+        // the temporary folders are gone again
+        let left = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("ra_fetch_{}_", std::process::id())))
+            .count();
+        assert_eq!(left, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_paths_and_migration() {
+        let mut s = Settings { roms: "/pc/roms".into(), out: "/pc/out".into(), ..Default::default() };
+        s.migrate();
+        assert_eq!(s.roms_dir(), PathBuf::from("/pc/roms"));
+        assert_eq!(s.out_dir(), Path::new("/pc/out").join("Profile").join("retroachievements"));
+
+        // saved by the build that only asked for the card root
+        let mut old = Settings { sd_root: "/media/card".into(), ..Default::default() };
+        old.migrate();
+        assert_eq!(old.roms_dir(), Path::new("/media/card").join("Roms"));
+        assert_eq!(old.out_dir(), Path::new("/media/card").join("Profile").join("retroachievements"));
+        assert!(old.sd_root.is_empty());
+    }
 
     /// Builds the cdzs framing libchdr produces - the ecc bitmap, the
     /// big-endian compressed length, a zstd sector stream and a raw-deflate
