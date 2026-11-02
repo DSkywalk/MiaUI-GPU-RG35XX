@@ -86,6 +86,30 @@ void PROF_frame(void);   // once per presented frame, just counts
 void PROF_tick(void);    // at the top of the main loop, reports when a window is full
 void PROF_log(const char* fmt, ...);  // free-form line into the same log
 
+// Floating point against the core. A core's asm that writes d8-d15 (callee
+// saved) or FPSCR without restoring them corrupts whatever double the frontend
+// keeps in a register across retro_run. PROF_vfpCall records d8-d15 and FPSCR
+// either side of the call and restores nothing, so minarch sees exactly what
+// it would without the probe; PROF_vfpCheck compares, from a separate function
+// so its own register saves can't mask anything. PROF_fp counts NaN/Inf by
+// their bits (isnan() is folded away under -Ofast).
+enum {
+    PROF_FP_REFRESH,   // GFX_getRefreshRate(), Hz
+    PROF_FP_SKEW,      // SND_updateClock: panel / core rate
+    PROF_FP_RATIO,     // SND_updateClock: resampling ratio
+    PROF_FP_FPS,       // trackFPS: fps_double
+    PROF_FP_COUNT,
+};
+void PROF_vfpCall(void (*fn)(void));
+void PROF_vfpCheck(void);
+void PROF_fp(int site, double value);
+
+#if defined(__arm__)
+#define PROF_CORE_CALL(fn) do { PROF_vfpCall(fn); PROF_vfpCheck(); } while (0)
+#else
+#define PROF_CORE_CALL(fn) (fn)()
+#endif
+#define PROF_FP(s,v)      PROF_fp((s),(v))
 #define PROF_BEGIN(z)     PROF_begin(z)
 #define PROF_END(z)       PROF_end(z)
 #define PROF_COUNT(c,n)   PROF_count((c),(n))
@@ -97,6 +121,8 @@ void PROF_log(const char* fmt, ...);  // free-form line into the same log
 
 #else
 
+#define PROF_CORE_CALL(fn) (fn)()
+#define PROF_FP(s,v)      ((void)0)
 #define PROF_BEGIN(z)     ((void)0)
 #define PROF_END(z)       ((void)0)
 #define PROF_COUNT(c,n)   ((void)0)

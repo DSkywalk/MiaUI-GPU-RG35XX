@@ -158,6 +158,99 @@ void PROF_log(const char* fmt, ...) {
     if (logfile) fflush(logfile);
 }
 
+// The layout prof_vfpCall's asm writes: before at 0, after at 64, fpscr at 128/132.
+typedef struct {
+    uint64_t before[8], after[8];
+    uint32_t fpscr_before, fpscr_after;
+} ProfVfp;
+static ProfVfp prof_vfp;
+
+static uint32_t vfp_calls, vfp_changed, vfp_mask, fpscr_changed, fpscr_seen_in, fpscr_seen_out;
+// limitFF's 1000000.0, which GCC keeps in a callee-saved register across
+// core.run: frames it went in to the core, and frames it came back altered
+#define PROF_FF_CONST 0x412E848000000000ull
+static uint32_t ff_seen, ff_bad, ff_reg;
+static uint32_t fp_bad[PROF_FP_COUNT], fp_n[PROF_FP_COUNT];
+static uint64_t fp_bad_bits[PROF_FP_COUNT];
+static const char* fp_names[PROF_FP_COUNT] = { "refresh", "skew", "ratio", "fps" };
+
+// r0 = the call, r1 = the ProfVfp to fill. The address comes in as an argument
+// because LTO can't see a symbol referenced from inside asm, and drops it.
+void prof_vfpCall(void (*fn)(void), ProfVfp* out);
+#if defined(__arm__)
+__asm__(
+    ".text\n"
+    ".align 2\n"
+    ".arm\n"
+    ".fpu neon\n"
+    ".global prof_vfpCall\n"
+    ".type prof_vfpCall, %function\n"
+    "prof_vfpCall:\n"
+    "    push    {r4, lr}\n"           // 8 bytes: the stack stays 8-aligned
+    "    mov     r4, r1\n"
+    "    vstmia  r4, {d8-d15}\n"
+    "    vmrs    r1, fpscr\n"
+    "    str     r1, [r4, #128]\n"
+    "    blx     r0\n"                 // r4 is callee saved, so still the ProfVfp
+    "    add     r1, r4, #64\n"
+    "    vstmia  r1, {d8-d15}\n"
+    "    vmrs    r1, fpscr\n"
+    "    str     r1, [r4, #132]\n"
+    "    pop     {r4, pc}\n"
+    ".size prof_vfpCall, .-prof_vfpCall\n"
+);
+#else
+void prof_vfpCall(void (*fn)(void), ProfVfp* out) { (void)out; fn(); }
+#endif
+
+// No frame of its own around the call, so nothing of ours saves and restores
+// d8-d15 over the core: a tail call straight into the asm.
+void PROF_vfpCall(void (*fn)(void)) {
+    prof_vfpCall(fn, &prof_vfp);
+}
+
+void PROF_vfpCheck(void) {
+    vfp_calls++;
+    uint32_t mask = 0;
+    for (int i=0; i<8; i++) if (prof_vfp.before[i] != prof_vfp.after[i]) mask |= 1u << i;
+    if (mask) { vfp_changed++; vfp_mask |= mask; }
+    for (int i=0; i<8; i++) {
+        if (prof_vfp.before[i] != PROF_FF_CONST) continue;
+        ff_seen++; ff_reg = 8 + i;
+        if (prof_vfp.after[i] != PROF_FF_CONST) ff_bad++;
+    }
+    if (prof_vfp.fpscr_before != prof_vfp.fpscr_after) fpscr_changed++;
+    fpscr_seen_in  = prof_vfp.fpscr_before;
+    fpscr_seen_out = prof_vfp.fpscr_after;
+}
+
+void PROF_fp(int site, double value) {
+    if (site<0 || site>=PROF_FP_COUNT) return;
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    fp_n[site]++;
+    if (((bits >> 52) & 0x7ff) == 0x7ff) { fp_bad[site]++; fp_bad_bits[site] = bits; } // NaN or Inf
+}
+
+static void vfp_report(void) {
+    char line[512];
+    int len = snprintf(line, sizeof(line),
+             "vfp: core_run %u calls, d8-d15 changed in %u (regs d8+ mask 0x%02x), fpscr changed %u (in 0x%08x out 0x%08x)  nonfinite:",
+             vfp_calls, vfp_changed, vfp_mask, fpscr_changed, fpscr_seen_in, fpscr_seen_out);
+    for (int i=0; i<PROF_FP_COUNT && len < (int)sizeof(line) - 48; i++) {
+        len += snprintf(line + len, sizeof(line) - len, " %s %u/%u", fp_names[i], fp_bad[i], fp_n[i]);
+        if (fp_bad[i]) len += snprintf(line + len, sizeof(line) - len, " (0x%016llx)", (unsigned long long)fp_bad_bits[i]);
+    }
+    if (ff_seen) len += snprintf(line + len, sizeof(line) - len, "  ff 1e6 in d%u: corrupted %u/%u", ff_reg, ff_bad, ff_seen);
+    else         len += snprintf(line + len, sizeof(line) - len, "  ff 1e6: not in d8-d15");
+    snprintf(line + len, sizeof(line) - len, "\n");
+    prof_emit(line);
+    ff_seen = ff_bad = 0;
+    vfp_calls = vfp_changed = vfp_mask = fpscr_changed = 0;
+    memset(fp_bad, 0, sizeof(fp_bad));
+    memset(fp_n, 0, sizeof(fp_n));
+}
+
 static void prof_report(void) {
     char line[256];
     uint64_t elapsed = prof_now() - window_start;
@@ -235,6 +328,7 @@ static void prof_report(void) {
         }
     }
     pres_report();
+    vfp_report();
 
     if (logfile) fflush(logfile);
     fflush(stdout);

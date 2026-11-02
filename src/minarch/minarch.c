@@ -130,6 +130,36 @@ static struct Core {
     // retro_audio_buffer_status_callback_t audio_buffer_status;
 } core;
 
+// The core's frame, with d8-d15 saved around it. AAPCS makes them callee saved,
+// but PCSX ReARMed's NEON GTE (gteRTPT_sf1lm0_neon) writes q4-q6 and its
+// dynarec entry saves only r4-r11: every 3D frame of Tekken 3 came back with
+// d9-d15 changed, on the 2021 build and r26 alike. GCC keeps loop constants
+// there across the call (main held limitFF's 1000000.0 in d9), so they're
+// restored here, for any core, rather than trusting each one.
+void Core_callSavingVFP(void (*fn)(void));
+#if defined(__arm__)
+__asm__(
+    ".text\n"
+    ".align 2\n"
+    ".arm\n"
+    ".fpu neon\n"
+    ".global Core_callSavingVFP\n"
+    ".type Core_callSavingVFP, %function\n"
+    "Core_callSavingVFP:\n"
+    "    push    {r4, lr}\n"   // with the 64 below, 72 bytes: still 8-aligned
+    "    vpush   {d8-d15}\n"
+    "    blx     r0\n"
+    "    vpop    {d8-d15}\n"
+    "    pop     {r4, pc}\n"
+    ".size Core_callSavingVFP, .-Core_callSavingVFP\n"
+);
+#else
+void Core_callSavingVFP(void (*fn)(void)) { fn(); }
+#endif
+static void Core_run(void) {
+    Core_callSavingVFP(core.run);
+}
+
 ///////////////////////////////////////
 // based on picoarch/unzip.c
 
@@ -5278,6 +5308,7 @@ static void trackFPS(void) {
         double last_time = (double)(now - sec_start) / 1000;
         fps_double = fps_ticks / last_time;
         cpu_double = cpu_ticks / last_time;
+        PROF_FP(PROF_FP_FPS, fps_double);
         if (show_debug) { // a /proc read and parse; only the debug HUD shows it
             use_ticks = getUsage();
             if (use_ticks && last_use_ticks) {
@@ -5457,7 +5488,7 @@ int main(int argc , char* argv[]) {
         GFX_startFrame();
         
         PROF_BEGIN(PROF_CORE_RUN);
-        core.run();
+        PROF_CORE_CALL(Core_run);
         PROF_END(PROF_CORE_RUN);
 
         PROF_BEGIN(PROF_RA);
