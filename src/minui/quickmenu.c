@@ -4,6 +4,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -19,13 +20,16 @@
 #include "nekobit.h"
 #include "quickmenu.h"
 
-// What the old ADB tool (Tools/System/ADB.pak) ran. There is no way back:
-// stopping or switching the USB gadget once it's up hangs the console.
-#define QM_ADB_START "/etc/init.d/D50adbd start"
-#define QM_NET_START "sleep 2; /usr/sbin/usbeth.sh"
-#define QM_ADB_LOG "/tmp/adb_cmd_log.txt"
+// The one way the USB port is set up: usbnet.sh <adb|adbnet|net|off>. It
+// tears the old mode down safely, so modes switch live, takes a few seconds,
+// logs to /tmp/usbnet.log and writes USB_MODE_PATH. Its exit code says how
+// it went.
+#define QM_USBNET "/usr/sbin/usbnet.sh"
+#define QM_USB_TIMEOUT 60 // s: a switch takes under 15; past this the port isn't answering
 #define QM_USB_IF "rndis0"
+#define QM_USB_LEASES "/tmp/udhcpd.leases" // usbnet.sh's DHCP server: the PC's address
 #define QM_24HOUR_PATH USERDATA_PATH "/show_24hour" // shared with the Clock tool
+#define QM_DATE_PATH USERDATA_PATH "/clock_date" // "1" day and month, "2" full date; none: time only
 
 #define QM_ICON_SCALE 2 // the atlas' 10px icons, doubled in the round buttons
 #define QM_ICON_GAP 14
@@ -44,22 +48,41 @@ static const struct {
     [ITEM_ABOUT]        = {ASSET_GAMEPAD, STR_QM_ABOUT,        1},
 };
 
-enum { SCR_ROW, SCR_SETTINGS, SCR_ACHIEVEMENTS, SCR_NETWORK, SCR_CLOCK, SCR_ABOUT, SCR_CONFIRM, SCR_MESSAGE, SCR_COUNT };
+enum { SCR_ROW, SCR_SETTINGS, SCR_ACHIEVEMENTS, SCR_NETWORK, SCR_CLOCK, SCR_ABOUT, SCR_CONFIRM, SCR_MESSAGE, SCR_USB_BUSY, SCR_COUNT };
 
 // the rows of the option pages
-enum { SET_LANGUAGE, SET_AUTO_SLEEP, SET_SLEEP_OFF, SET_KIDS, SET_RESET_NB, SET_COUNT };
+enum { SET_LANGUAGE, SET_AUTO_SLEEP, SET_SLEEP_OFF, SET_CLOCK_DATE, SET_KIDS, SET_RESET_NB, SET_COUNT };
 enum { RA_ENABLED, RA_SOUND, RA_NOTIFY, RA_COUNT };
-enum { NET_ADB, NET_ADB_NET, NET_COUNT };
+enum { NET_ADB, NET_ADB_NET, NET_ONLY, NET_OFF, NET_COUNT };
+static const struct {
+    int label;
+    int desc;
+    int mode; // USB_getMode()'s
+    const char* arg; // usbnet.sh's
+} net_rows[NET_COUNT] = {
+    [NET_ADB]     = {STR_QM_ADB,      STR_QM_DESC_ADB,      USB_MODE_ADB,      "adb"},
+    [NET_ADB_NET] = {STR_QM_ADB_NET,  STR_QM_DESC_ADB_NET,  USB_MODE_NET,      "adbnet"},
+    [NET_ONLY]    = {STR_QM_NET_ONLY, STR_QM_DESC_NET_ONLY, USB_MODE_NET_ONLY, "net"},
+    [NET_OFF]     = {STR_QM_USB_OFF,  STR_QM_DESC_USB_OFF,  USB_MODE_NONE,     "off"},
+};
 
-enum { CONFIRM_KIDS, CONFIRM_NB, CONFIRM_NB2, CONFIRM_ADB, CONFIRM_ADB_NET };
+enum { CONFIRM_KIDS, CONFIRM_NB, CONFIRM_NB2, CONFIRM_USB };
 
 static const int auto_sleep_minutes[] = {0, 1, 2, 5, 10}; // GetAutoSleep()
 #define AUTO_SLEEP_COUNT 5
 #define SLEEP_OFF_COUNT 3 // 5, 10, 15 minutes: GetSleepPowerOff()
 static const int notify_labels[] = {STR_QM_NOTIFY_ALL, STR_QM_NOTIFY_UNLOCKS, STR_QM_NOTIFY_GENERAL, STR_QM_OFF};
 #define NOTIFY_COUNT 4
+// the date next to the time: a flat battery puts the clock back to 1970, and
+// seeing the year is what tells
+enum { DATE_NONE, DATE_SHORT, DATE_FULL, DATE_COUNT };
+static const int date_labels[DATE_COUNT] = {STR_QM_DATE_NONE, STR_QM_DATE_SHORT, STR_QM_DATE_FULL};
 
-enum { CURSOR_YEAR, CURSOR_MONTH, CURSOR_DAY, CURSOR_HOUR, CURSOR_MINUTE, CURSOR_SECOND, CURSOR_AMPM };
+enum { CURSOR_YEAR, CURSOR_MONTH, CURSOR_DAY, CURSOR_HOUR, CURSOR_MINUTE, CURSOR_SECOND, CURSOR_AMPM, CURSOR_COUNT };
+// the Clock screen's fields left to right, which is also the cursor's path:
+// the date as the language writes it, then the time, AM/PM last (12 hour only)
+static const int clock_order_dmy[CURSOR_COUNT] = {CURSOR_DAY, CURSOR_MONTH, CURSOR_YEAR, CURSOR_HOUR, CURSOR_MINUTE, CURSOR_SECOND, CURSOR_AMPM};
+static const int clock_order_mdy[CURSOR_COUNT] = {CURSOR_MONTH, CURSOR_DAY, CURSOR_YEAR, CURSOR_HOUR, CURSOR_MINUTE, CURSOR_SECOND, CURSOR_AMPM};
 
 static struct {
     int open;
@@ -75,15 +98,30 @@ static struct {
     int settings_dirty; // msettings.bin to write when the menu closes
     int language_dirty; // language.conf, likewise
     int show_24hour;
+    int clock_date; // DATE_*
     int minute; // last one drawn
-    char ip[INET_ADDRSTRLEN];
+    char ip[INET_ADDRSTRLEN]; // the console's, on the USB network
+    char pc[INET_ADDRSTRLEN]; // the PC's, once it has its lease
     uint32_t ip_at;
-    pid_t adb_pid; // switching USB on, in the background
-    int adb_target;
-    struct { int year, month, day, hour, minute, second, cursor; } clock;
+    struct {
+        pid_t pid; // usbnet.sh, switching the port in the background
+        int row; // to which net_rows[] mode
+        uint32_t started;
+        int seconds; // shown on the wait screen
+        int stuck; // past QM_USB_TIMEOUT: said so, still reaped when it ends
+        int rc; // its exit code, for the message when it fails
+    } usb;
+    char dialog[256]; // a confirmation put together on the spot
+    struct { int year, month, day, hour, minute, second, cursor; } clock; // cursor: a place in qm_clockOrder()
 } qm;
 
 static int qm_min(int a, int b) { return a < b ? a : b; }
+
+// dates in the menu's language: month first in English (12/20/26), day first
+// in Spanish (20/12/26)
+static int qm_monthFirst(void) {
+    return !strcmp(I18N_code(I18N_index()), "en");
+}
 static int qm_max(int a, int b) { return a > b ? a : b; }
 
 ///////////////////////////////////////
@@ -111,6 +149,26 @@ static int qm_usbUp(void) {
     return exists("/sys/class/net/" QM_USB_IF);
 }
 
+// The PC's address, from the DHCP server's lease file (busybox udhcpd: an
+// 8-byte time, then 36-byte leases of expiry, address, MAC and name)
+static void qm_readPC(void) {
+    qm.pc[0] = '\0';
+    FILE* f = fopen(QM_USB_LEASES, "rb");
+    if (!f) return;
+    unsigned char lease[36];
+    if (fseek(f, 8, SEEK_SET) == 0) {
+        while (fread(lease, sizeof(lease), 1, f) == 1) {
+            uint32_t expires, nip;
+            memcpy(&expires, lease, 4);
+            memcpy(&nip, lease + 4, 4); // network order already
+            if (!expires || !nip) continue;
+            inet_ntop(AF_INET, &nip, qm.pc, sizeof(qm.pc));
+            break;
+        }
+    }
+    fclose(f);
+}
+
 static void qm_readIP(void) {
     qm.ip[0] = '\0';
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -121,28 +179,41 @@ static void qm_readIP(void) {
     if (ioctl(fd, SIOCGIFADDR, &ifr) == 0)
         inet_ntop(AF_INET, &((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr, qm.ip, sizeof(qm.ip));
     close(fd);
+    qm_readPC();
 }
 
-static void qm_startUSB(int mode) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "(%s%s%s) > " QM_ADB_LOG " 2>&1",
-             QM_ADB_START, mode == USB_MODE_NET ? "; " : "", mode == USB_MODE_NET ? QM_NET_START : "");
-    LOG_info("Quick Menu: %s\n", cmd);
+static void qm_dialog(int screen, int what);
+
+// usbnet.sh in the background: the wait screen shows until it's done
+static void qm_startUSB(int row) {
+    LOG_info("Quick Menu: %s %s\n", QM_USBNET, net_rows[row].arg);
     pid_t pid = fork();
     if (pid == 0) {
-        // adbd lives on after us: none of minui's files (the GPU's) go with it
+        // the daemons it starts live on after us: none of minui's files (the
+        // GPU's) go with them, and it logs on its own
+        setsid();
         for (int fd = 3; fd < 1024; fd++) close(fd);
-        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        int null = open("/dev/null", O_RDWR);
+        if (null >= 0) {
+            dup2(null, 0);
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        execl("/bin/sh", "sh", QM_USBNET, net_rows[row].arg, (char*)NULL);
         _exit(127);
     }
     if (pid < 0) {
-        qm.message = STR_QM_ADB_FAILED;
-        qm.back = qm.screen;
-        qm.screen = SCR_MESSAGE;
+        qm.usb.rc = -1;
+        qm_dialog(SCR_MESSAGE, STR_QM_USB_FAILED);
         return;
     }
-    qm.adb_pid = pid;
-    qm.adb_target = mode;
+    qm.usb.pid = pid;
+    qm.usb.row = row;
+    qm.usb.started = SDL_GetTicks();
+    qm.usb.seconds = 0;
+    qm.usb.stuck = 0;
+    qm.back = SCR_NETWORK;
+    qm.screen = SCR_USB_BUSY;
 }
 
 ///////////////////////////////////////
@@ -162,9 +233,11 @@ void QM_init(void) {
     qm.kids = exists(SIMPLE_MODE_PATH);
     qm.minute = -1;
     qm_refreshItems();
-    // once a boot: after that the file says (it's in tmpfs)
+    // usbnet.sh writes the file; this is for a port set up some other way
+    // (once a boot: after that the file says, it's in tmpfs)
     if (!exists(USB_MODE_PATH)) {
-        int mode = qm_usbUp() ? USB_MODE_NET : qm_adbdRunning() ? USB_MODE_ADB : USB_MODE_NONE;
+        int adbd = qm_adbdRunning();
+        int mode = qm_usbUp() ? (adbd ? USB_MODE_NET : USB_MODE_NET_ONLY) : adbd ? USB_MODE_ADB : USB_MODE_NONE;
         if (mode != USB_MODE_NONE) USB_setMode(mode);
     }
 }
@@ -181,9 +254,10 @@ void QM_open(void) {
     qm.open = 1;
     qm.screen = SCR_ROW;
     qm.show_24hour = exists(QM_24HOUR_PATH);
+    qm.clock_date = exists(QM_DATE_PATH) ? qm_min(qm_max(getInt(QM_DATE_PATH), DATE_NONE), DATE_COUNT - 1) : DATE_NONE;
     qm.minute = -1;
     qm.ip_at = 0;
-    if (USB_getMode() == USB_MODE_NET) qm_readIP();
+    if (USB_hasNetwork(USB_getMode())) qm_readIP();
 }
 
 static void qm_close(void) {
@@ -224,7 +298,7 @@ static int qm_rows(int screen, int* rows) {
 static int qm_rowLabel(int screen, int row) {
     switch (screen) {
     case SCR_SETTINGS: {
-        static const int ids[SET_COUNT] = {STR_QM_LANGUAGE, STR_QM_AUTO_SLEEP, STR_QM_SLEEP_OFF, STR_QM_KIDS_MODE, STR_NB_MENU_RESET};
+        static const int ids[SET_COUNT] = {STR_QM_LANGUAGE, STR_QM_AUTO_SLEEP, STR_QM_SLEEP_OFF, STR_QM_CLOCK_DATE, STR_QM_KIDS_MODE, STR_NB_MENU_RESET};
         return ids[row];
     }
     case SCR_ACHIEVEMENTS: {
@@ -232,17 +306,13 @@ static int qm_rowLabel(int screen, int row) {
         return ids[row];
     }
     }
-    return row == NET_ADB ? STR_QM_ADB : STR_QM_ADB_NET;
-}
-
-static int qm_netMode(int row) {
-    return row == NET_ADB ? USB_MODE_ADB : USB_MODE_NET;
+    return net_rows[row].label;
 }
 
 static int qm_rowDesc(int screen, int row) {
     switch (screen) {
     case SCR_SETTINGS: {
-        static const int ids[SET_COUNT] = {STR_QM_DESC_LANGUAGE, STR_QM_DESC_AUTO_SLEEP, STR_QM_DESC_SLEEP_OFF, STR_QM_DESC_KIDS_MODE, STR_QM_DESC_RESET_NB};
+        static const int ids[SET_COUNT] = {STR_QM_DESC_LANGUAGE, STR_QM_DESC_AUTO_SLEEP, STR_QM_DESC_SLEEP_OFF, STR_QM_DESC_CLOCK_DATE, STR_QM_DESC_KIDS_MODE, STR_QM_DESC_RESET_NB};
         return ids[row];
     }
     case SCR_ACHIEVEMENTS: {
@@ -250,9 +320,7 @@ static int qm_rowDesc(int screen, int row) {
         return ids[row];
     }
     }
-    int mode = USB_getMode();
-    if (mode != USB_MODE_NONE && mode != qm_netMode(row)) return STR_QM_DESC_LOCKED;
-    return row == NET_ADB ? STR_QM_DESC_ADB : STR_QM_DESC_ADB_NET;
+    return net_rows[row].desc;
 }
 
 // A row's values, for the list to be as wide as the widest of them (as
@@ -264,11 +332,12 @@ static int qm_valueCount(int screen, int row) {
         case SET_LANGUAGE: return I18N_count();
         case SET_AUTO_SLEEP: return AUTO_SLEEP_COUNT;
         case SET_SLEEP_OFF: return SLEEP_OFF_COUNT;
+        case SET_CLOCK_DATE: return DATE_COUNT;
         case SET_KIDS: return 2;
         }
         return 0; // Reset NekoBit only does something
     case SCR_ACHIEVEMENTS: return row == RA_NOTIFY ? NOTIFY_COUNT : 2;
-    case SCR_NETWORK: return 4; // see qm_valueText
+    case SCR_NETWORK: return 3; // see qm_valueText
     }
     return 0;
 }
@@ -280,6 +349,7 @@ static int qm_valueIndex(int screen, int row) {
         case SET_LANGUAGE: return I18N_index();
         case SET_AUTO_SLEEP: return qm_min(qm_max(GetAutoSleep(), 0), AUTO_SLEEP_COUNT - 1);
         case SET_SLEEP_OFF: return qm_min(qm_max(GetSleepPowerOff(), 0), SLEEP_OFF_COUNT - 1);
+        case SET_CLOCK_DATE: return qm.clock_date;
         case SET_KIDS: return qm.kids;
         }
         return 0;
@@ -289,13 +359,9 @@ static int qm_valueIndex(int screen, int row) {
         case RA_SOUND: return GetRASound() ? 1 : 0;
         }
         return qm_min(qm_max(GetRANotify(), 0), NOTIFY_COUNT - 1);
-    case SCR_NETWORK: { // 0 enable, 1 active, 2 locked, 3 being enabled
-        int mode = USB_getMode();
-        int want = qm_netMode(row);
-        if (qm.adb_pid) return qm.adb_target == want ? 3 : 2;
-        if (mode == want) return 1;
-        return mode != USB_MODE_NONE ? 2 : 0;
-    }
+    case SCR_NETWORK: // 0 enable, 1 active, 2 being enabled
+        if (qm.usb.pid) return qm.usb.row == row ? 2 : 0;
+        return USB_getMode() == net_rows[row].mode ? 1 : 0;
     }
     return 0;
 }
@@ -311,6 +377,7 @@ static void qm_valueText(int screen, int row, int i, char* out, size_t size) {
             else snprintf(out, size, T(STR_QM_MINUTES), auto_sleep_minutes[i]);
             break;
         case SET_SLEEP_OFF: snprintf(out, size, T(STR_QM_MINUTES), (i + 1) * 5); break;
+        case SET_CLOCK_DATE: snprintf(out, size, "%s", T(date_labels[i])); break;
         case SET_KIDS: snprintf(out, size, "%s", T(i ? STR_QM_ON : STR_QM_OFF)); break;
         }
         break;
@@ -319,7 +386,7 @@ static void qm_valueText(int screen, int row, int i, char* out, size_t size) {
         else snprintf(out, size, "%s", T(i ? STR_QM_ON : STR_QM_OFF));
         break;
     case SCR_NETWORK: {
-        static const int ids[4] = {STR_QM_ENABLE, STR_QM_ACTIVE, STR_QM_LOCKED, STR_QM_ACTIVATING};
+        static const int ids[3] = {STR_QM_ENABLE, STR_QM_ACTIVE, STR_QM_ACTIVATING};
         snprintf(out, size, "%s", T(ids[i]));
         break;
     }
@@ -346,6 +413,11 @@ static void qm_change(int screen, int row, int dir) {
         case SET_SLEEP_OFF:
             SetSleepPowerOff(qm_wrap(GetSleepPowerOff() + dir, SLEEP_OFF_COUNT));
             qm.settings_dirty = 1;
+            break;
+        case SET_CLOCK_DATE:
+            qm.clock_date = qm_wrap(qm.clock_date + dir, DATE_COUNT);
+            if (qm.clock_date == DATE_NONE) unlink(QM_DATE_PATH);
+            else putInt(QM_DATE_PATH, qm.clock_date);
             break;
         case SET_KIDS:
             // on, with a word on how to get out; off only with the combo (A)
@@ -389,10 +461,24 @@ static void qm_activate(int screen, int row) {
     case SCR_ACHIEVEMENTS:
         qm_change(screen, row, 1);
         break;
-    case SCR_NETWORK:
-        if (USB_getMode() == USB_MODE_NONE && !qm.adb_pid)
-            qm_dialog(SCR_CONFIRM, row == NET_ADB ? CONFIRM_ADB : CONFIRM_ADB_NET);
+    case SCR_NETWORK: {
+        // live: from whatever it is now, once the last switch is over
+        int from = USB_getMode(), to = net_rows[row].mode;
+        if (qm.usb.pid || from == to) break;
+        // what goes, said up front: ADB, the network, or both
+        int drops_adb = from == USB_MODE_ADB || from == USB_MODE_NET;
+        drops_adb = drops_adb && !(to == USB_MODE_ADB || to == USB_MODE_NET);
+        int drops_net = USB_hasNetwork(from) && !USB_hasNetwork(to);
+        int n;
+        if (to == USB_MODE_NONE) n = snprintf(qm.dialog, sizeof(qm.dialog), "%s", T(STR_QM_CONFIRM_OFF));
+        else n = snprintf(qm.dialog, sizeof(qm.dialog), T(STR_QM_CONFIRM_USB), T(net_rows[row].label));
+        int drops = drops_adb && drops_net ? STR_QM_DROPS_BOTH : drops_adb ? STR_QM_DROPS_ADB : drops_net ? STR_QM_DROPS_NET : -1;
+        if (drops >= 0 && n > 0 && n < (int)sizeof(qm.dialog))
+            snprintf(qm.dialog + n, sizeof(qm.dialog) - n, "%s", T(drops));
+        qm.usb.row = row;
+        qm_dialog(SCR_CONFIRM, CONFIRM_USB);
         break;
+    }
     }
 }
 
@@ -409,11 +495,8 @@ static void qm_confirmed(void) {
     case CONFIRM_NB2:
         NB_reset(); // its banner says so
         break;
-    case CONFIRM_ADB:
-        qm_startUSB(USB_MODE_ADB);
-        break;
-    case CONFIRM_ADB_NET:
-        qm_startUSB(USB_MODE_NET);
+    case CONFIRM_USB:
+        qm_startUSB(qm.usb.row);
         break;
     }
 }
@@ -455,12 +538,17 @@ static void qm_clockValidate(void) {
     else if (qm.clock.second < 0) qm.clock.second += 60;
 }
 
+static const int* qm_clockOrder(void) {
+    return qm_monthFirst() ? clock_order_mdy : clock_order_dmy;
+}
+
+// how many places the cursor has: AM/PM, the last, only in 12 hour mode
 static int qm_clockFields(void) {
-    return (qm.show_24hour ? CURSOR_SECOND : CURSOR_AMPM) + 1;
+    return qm.show_24hour ? CURSOR_COUNT - 1 : CURSOR_COUNT;
 }
 
 static void qm_clockStep(int dir) {
-    switch (qm.clock.cursor) {
+    switch (qm_clockOrder()[qm.clock.cursor]) {
     case CURSOR_YEAR: qm.clock.year += dir; break;
     case CURSOR_MONTH: qm.clock.month += dir; break;
     case CURSOR_DAY: qm.clock.day += dir; break;
@@ -507,6 +595,9 @@ static int qm_clockInput(void) {
 int QM_input(int* action) {
     *action = QM_NONE;
     if (!qm.open) return 0;
+
+    // a switch half done can't be stopped, nor the menu left: wait it out
+    if (qm.screen == SCR_USB_BUSY) return 0;
 
     if (qm.screen == SCR_CONFIRM || qm.screen == SCR_MESSAGE) {
         if (PAD_justPressed(BTN_A)) {
@@ -577,27 +668,45 @@ int QM_input(int* action) {
 
 int QM_update(void) {
     int dirty = 0;
-    if (qm.adb_pid) {
+    uint32_t now = SDL_GetTicks();
+    if (qm.usb.pid) {
         int status;
-        if (waitpid(qm.adb_pid, &status, WNOHANG) == qm.adb_pid) {
-            qm.adb_pid = 0;
-            if (qm_adbdRunning()) {
-                USB_setMode(qm.adb_target);
-                qm.ip_at = 0;
-            }
-            else if (qm.open) qm_dialog(SCR_MESSAGE, STR_QM_ADB_FAILED);
+        if (waitpid(qm.usb.pid, &status, WNOHANG) == qm.usb.pid) {
+            qm.usb.pid = 0;
+            qm.usb.rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            LOG_info("Quick Menu: usbnet.sh %s -> %i\n", net_rows[qm.usb.row].arg, qm.usb.rc);
+            USB_reloadMode(); // usbnet.sh wrote it
+            qm.ip[0] = qm.pc[0] = '\0';
+            qm.ip_at = 0;
+            if (qm.screen == SCR_USB_BUSY) qm.screen = SCR_NETWORK;
+            if (qm.usb.rc != 0 && !qm.usb.stuck && qm.open) qm_dialog(SCR_MESSAGE, STR_QM_USB_FAILED);
             dirty = 1;
+        }
+        else if (qm.screen == SCR_USB_BUSY) {
+            int seconds = (now - qm.usb.started) / 1000;
+            if (seconds != qm.usb.seconds) {
+                qm.usb.seconds = seconds;
+                dirty = 1;
+            }
+            // not waited for any longer (stuck in the kernel, it may never
+            // end), but still reaped above if it does
+            if (seconds >= QM_USB_TIMEOUT) {
+                qm.usb.stuck = 1;
+                qm.screen = SCR_NETWORK;
+                qm_dialog(SCR_MESSAGE, STR_QM_USB_STUCK);
+            }
         }
     }
     if (!qm.open) return dirty;
 
-    uint32_t now = SDL_GetTicks();
-    if (USB_getMode() == USB_MODE_NET && (!qm.ip_at || now - qm.ip_at >= 2000)) {
-        char was[sizeof(qm.ip)];
-        strcpy(was, qm.ip);
+    if (USB_hasNetwork(USB_getMode()) && (!qm.ip_at || now - qm.ip_at >= 2000)) {
+        char was[sizeof(qm.ip) + sizeof(qm.pc)];
+        snprintf(was, sizeof(was), "%s %s", qm.ip, qm.pc);
         qm_readIP();
         qm.ip_at = now;
-        if (strcmp(was, qm.ip)) dirty = 1;
+        char is[sizeof(was)];
+        snprintf(is, sizeof(is), "%s %s", qm.ip, qm.pc);
+        if (strcmp(was, is)) dirty = 1;
     }
 
     time_t t = time(NULL);
@@ -612,21 +721,32 @@ int QM_update(void) {
 ///////////////////////////////////////
 // drawing
 
+// "20:40", or with the date before it: "20/12 20:40", "20/12/26 20:40" (day
+// first; month first in English, "12/20/26 8:40 PM")
 static void qm_timeText(char* out, size_t size) {
     time_t t = time(NULL);
     struct tm tm = *localtime(&t);
-    if (qm.show_24hour) snprintf(out, size, "%02i:%02i", tm.tm_hour, tm.tm_min);
+    int n = 0;
+    if (qm.clock_date != DATE_NONE) {
+        int month_first = qm_monthFirst();
+        int a = month_first ? tm.tm_mon + 1 : tm.tm_mday;
+        int b = month_first ? tm.tm_mday : tm.tm_mon + 1;
+        if (qm.clock_date == DATE_FULL) n = snprintf(out, size, "%02i/%02i/%02i ", a, b, tm.tm_year % 100);
+        else n = snprintf(out, size, "%02i/%02i ", a, b);
+        if (n < 0 || n >= (int)size) n = 0;
+    }
+    if (qm.show_24hour) snprintf(out + n, size - n, "%02i:%02i", tm.tm_hour, tm.tm_min);
     else {
         int hour = tm.tm_hour % 12;
-        snprintf(out, size, "%i:%02i %s", hour ? hour : 12, tm.tm_min, tm.tm_hour < 12 ? "AM" : "PM");
+        snprintf(out + n, size - n, "%i:%02i %s", hour ? hour : 12, tm.tm_min, tm.tm_hour < 12 ? "AM" : "PM");
     }
 }
 
 // the time, centred on the battery pill's row
 static void qm_drawTime(SDL_Surface* dst) {
-    char now[16];
+    char now[32];
     qm_timeText(now, sizeof(now));
-    GFX_Text text = GFX_renderText(font.large, now, COLOR_WHITE);
+    GFX_Text text = GFX_renderText(font.small, now, COLOR_WHITE); // smaller than the menu's: the date fits
     int w = text.w + SCALE1(BUTTON_PADDING * 2);
     int x = (dst->w - w) / 2;
     GFX_blitPill(ASSET_DARK_GRAY_PILL, dst, &(SDL_Rect){x, SCALE1(PADDING), w, SCALE1(PILL_SIZE)});
@@ -649,8 +769,9 @@ static void qm_drawUSBInfo(SDL_Surface* dst, int y) {
     if (mode == USB_MODE_NONE) return;
     char line[128];
     if (mode == USB_MODE_ADB) snprintf(line, sizeof(line), "%s", T(STR_QM_INFO_ADB));
-    else if (qm.ip[0]) snprintf(line, sizeof(line), T(STR_QM_INFO_NET), qm.ip);
-    else snprintf(line, sizeof(line), "%s", T(STR_QM_INFO_NO_IP));
+    else if (!qm.ip[0]) snprintf(line, sizeof(line), "%s", T(STR_QM_INFO_NO_IP));
+    else if (qm.pc[0]) snprintf(line, sizeof(line), T(STR_QM_INFO_NET), qm.ip, qm.pc);
+    else snprintf(line, sizeof(line), T(STR_QM_INFO_NET_NO_PC), qm.ip);
     GFX_Text text = GFX_renderText(font.small, line, COLOR_LIGHT_TEXT);
     GFX_blitRenderedText(&text, NULL, dst, (dst->w - text.w) / 2, y);
 }
@@ -725,9 +846,14 @@ static void qm_drawPage(SDL_Surface* dst, int show_setting) {
         GFX_Text text = GFX_renderText(font.small, label, color);
         GFX_blitRenderedText(&text, NULL, dst, ox + SCALE1(QM_OPTION_PADDING), y + SCALE1(1));
         if (qm_valueCount(qm.screen, rows[j])) {
-            qm_valueText(qm.screen, rows[j], qm_valueIndex(qm.screen, rows[j]), value, sizeof(value));
-            text = GFX_renderText(font.tiny, value, COLOR_WHITE);
-            GFX_blitRenderedText(&text, NULL, dst, ox + mw - text.w - SCALE1(QM_OPTION_PADDING), y + SCALE1(3));
+            int index = qm_valueIndex(qm.screen, rows[j]);
+            qm_valueText(qm.screen, rows[j], index, value, sizeof(value));
+            // the USB mode in use: its value on a white badge, on any row
+            int badge = qm.screen == SCR_NETWORK && index == 1;
+            text = GFX_renderText(font.tiny, value, badge ? COLOR_BLACK : COLOR_WHITE);
+            int vx = ox + mw - text.w - SCALE1(QM_OPTION_PADDING);
+            if (badge) GFX_blitPill(ASSET_BUTTON, dst, &(SDL_Rect){vx - SCALE1(QM_OPTION_PADDING), y, text.w + SCALE1(QM_OPTION_PADDING * 2), SCALE1(BUTTON_SIZE)});
+            GFX_blitRenderedText(&text, NULL, dst, vx, y + SCALE1(3));
         }
     }
 
@@ -744,15 +870,25 @@ static void qm_drawPage(SDL_Surface* dst, int show_setting) {
 static void qm_drawDialog(SDL_Surface* dst, int show_setting) {
     static const int confirms[] = {
         [CONFIRM_KIDS] = STR_QM_KIDS_ON, [CONFIRM_NB] = STR_NB_CONFIRM_RESET, [CONFIRM_NB2] = STR_NB_CONFIRM_RESET2,
-        [CONFIRM_ADB] = STR_QM_CONFIRM_ADB, [CONFIRM_ADB_NET] = STR_QM_CONFIRM_ADB_NET,
     };
-    int id = qm.screen == SCR_CONFIRM ? confirms[qm.confirm] : qm.message;
-    GFX_blitMessage(font.medium, (char*)T(id), dst, &(SDL_Rect){0, SCALE1(PADDING), dst->w, dst->h - SCALE1(PILL_SIZE + PADDING)});
+    char text[256];
+    if (qm.screen == SCR_CONFIRM && qm.confirm == CONFIRM_USB) snprintf(text, sizeof(text), "%s", qm.dialog);
+    else if (qm.screen == SCR_MESSAGE && qm.message == STR_QM_USB_FAILED) snprintf(text, sizeof(text), T(STR_QM_USB_FAILED), qm.usb.rc);
+    else snprintf(text, sizeof(text), "%s", T(qm.screen == SCR_CONFIRM ? confirms[qm.confirm] : qm.message));
+    GFX_blitMessage(font.medium, text, dst, &(SDL_Rect){0, SCALE1(PADDING), dst->w, dst->h - SCALE1(PILL_SIZE + PADDING)});
 
     if (qm.screen == SCR_CONFIRM)
         qm_hints(dst, show_setting, (char*[]){"B", (char*)T(STR_MA_CANCEL), "A", (char*)T(STR_MA_CONFIRM), NULL});
     else
         qm_hints(dst, show_setting, (char*[]){"A", (char*)T(STR_MA_OKAY), NULL, NULL});
+}
+
+// while usbnet.sh works: what it's doing and for how long, no buttons
+static void qm_drawUSBBusy(SDL_Surface* dst) {
+    qm_drawTitle(dst, ITEM_NETWORK);
+    char text[256];
+    snprintf(text, sizeof(text), T(STR_QM_USB_BUSY), T(net_rows[qm.usb.row].label), qm.usb.seconds);
+    GFX_blitMessage(font.medium, text, dst, &(SDL_Rect){0, SCALE1(PADDING), dst->w, dst->h - SCALE1(PILL_SIZE + PADDING)});
 }
 
 static void qm_drawAbout(SDL_Surface* dst, int show_setting) {
@@ -818,36 +954,43 @@ static void qm_drawClock(SDL_Surface* dst, int show_setting) {
     int ox = (dst->w - (qm.show_24hour ? SCALE1(188) : SCALE1(223))) / 2;
     int x = ox;
     int y = SCALE1(((FIXED_HEIGHT / FIXED_SCALE) - PILL_SIZE - DIGIT_HEIGHT) / 2);
-    x = qm_clockNumber(dst, qm.clock.year, 4, x, y);
-    x = qm_clockGlyph(dst, "/", x, y);
-    x = qm_clockNumber(dst, qm.clock.month, 2, x, y);
-    x = qm_clockGlyph(dst, "/", x, y);
-    x = qm_clockNumber(dst, qm.clock.day, 2, x, y);
+    int field_x[CURSOR_COUNT] = {0}, field_w[CURSOR_COUNT] = {0}; // where each field went, for the underline
+
+    // the date, in the language's order (the same width either way)
+    const int* order = qm_clockOrder();
+    for (int i = 0; i < 3; i++) {
+        int field = order[i];
+        if (i) x = qm_clockGlyph(dst, "/", x, y);
+        field_x[field] = x;
+        if (field == CURSOR_YEAR) x = qm_clockNumber(dst, qm.clock.year, 4, x, y);
+        else x = qm_clockNumber(dst, field == CURSOR_MONTH ? qm.clock.month : qm.clock.day, 2, x, y);
+        field_w[field] = x - field_x[field];
+    }
     x += SCALE1(10);
     int hour = qm.clock.hour;
     if (!qm.show_24hour) {
         hour %= 12;
         if (!hour) hour = 12;
     }
-    x = qm_clockNumber(dst, hour, 2, x, y);
-    x = qm_clockGlyph(dst, ":", x, y);
-    x = qm_clockNumber(dst, qm.clock.minute, 2, x, y);
-    x = qm_clockGlyph(dst, ":", x, y);
-    x = qm_clockNumber(dst, qm.clock.second, 2, x, y);
-    int ampm_w = 0;
+    const int time_fields[3] = {CURSOR_HOUR, CURSOR_MINUTE, CURSOR_SECOND};
+    const int time_values[3] = {hour, qm.clock.minute, qm.clock.second};
+    for (int i = 0; i < 3; i++) {
+        if (i) x = qm_clockGlyph(dst, ":", x, y);
+        field_x[time_fields[i]] = x;
+        x = qm_clockNumber(dst, time_values[i], 2, x, y);
+        field_w[time_fields[i]] = x - field_x[time_fields[i]];
+    }
     if (!qm.show_24hour) {
         x += SCALE1(10);
         GFX_Text text = GFX_renderText(font.large, qm.clock.hour < 12 ? "AM" : "PM", COLOR_WHITE);
-        ampm_w = text.w + SCALE1(2);
+        field_x[CURSOR_AMPM] = x;
+        field_w[CURSOR_AMPM] = text.w + SCALE1(2);
         GFX_blitRenderedText(&text, NULL, dst, x, y - SCALE1(3));
     }
 
     // the field being changed
-    x = ox;
-    y += SCALE1(19);
-    if (qm.clock.cursor != CURSOR_YEAR) x += SCALE1(50) + (qm.clock.cursor - 1) * SCALE1(30);
-    int w = qm.clock.cursor == CURSOR_YEAR ? SCALE1(40) : qm.clock.cursor == CURSOR_AMPM ? ampm_w : SCALE1(20);
-    GFX_blitPill(ASSET_UNDERLINE, dst, &(SDL_Rect){x, y, w});
+    int field = order[qm_min(qm.clock.cursor, qm_clockFields() - 1)];
+    GFX_blitPill(ASSET_UNDERLINE, dst, &(SDL_Rect){field_x[field], y + SCALE1(19), field_w[field]});
 
     if (show_setting && !GetHDMI()) GFX_blitHardwareHints(dst, show_setting);
     else GFX_blitButtonGroup((char*[]){"SELECT", (char*)T(qm.show_24hour ? STR_QM_12_HOUR : STR_QM_24_HOUR), NULL}, 0, dst, 0);
@@ -862,6 +1005,7 @@ void QM_draw(SDL_Surface* dst, int show_setting) {
     case SCR_ABOUT: qm_drawAbout(dst, show_setting); break;
     case SCR_CONFIRM:
     case SCR_MESSAGE: qm_drawDialog(dst, show_setting); break;
+    case SCR_USB_BUSY: qm_drawUSBBusy(dst); break;
     default: qm_drawPage(dst, show_setting); break;
     }
 }
