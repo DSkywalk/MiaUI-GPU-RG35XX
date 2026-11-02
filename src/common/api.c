@@ -266,6 +266,7 @@ void GFX_flip(SDL_Surface* screen) {
     last_present_us = after;
     last_present_vsynced = should_vsync;
     PROF_GAUGE(PROF_G_REFRESH_MHZ, (int64_t)(1e9 / refresh_us));
+    PROF_FP(PROF_FP_REFRESH, GFX_getRefreshRate());
 }
 
 /**
@@ -806,7 +807,7 @@ int GFX_blitHardwareGroup(SDL_Surface* dst, int show_setting) {
         int icons[2];
         int n = 0;
         if (usb!=USB_MODE_NONE) icons[n++] = ASSET_USB;
-        if (usb==USB_MODE_NET) icons[n++] = ASSET_WIFI_SMALL;
+        if (USB_hasNetwork(usb)) icons[n++] = ASSET_WIFI_SMALL;
 
         int lead = SCALE1(9); // pill edge to the first icon
         int gap = SCALE1(6);  // after each icon
@@ -1322,6 +1323,8 @@ static void SND_updateClock(void) {
         double f = (double)fill / snd.frame_count; // 0 empty .. 1 full
         ratio *= skew * (1.0 + SND_RATE_DELTA * 2.0 * (f - snd.target));
     }
+    PROF_FP(PROF_FP_SKEW, skew);
+    PROF_FP(PROF_FP_RATIO, ratio);
     snd.step = (uint32_t)(ratio * 65536.0 + 0.5);
     snd.resample = (!snd.video_clocked && snd.sample_rate_in==snd.sample_rate_out)
                  ? SND_resampleNone : SND_resampleLinear;
@@ -2196,15 +2199,23 @@ int PWR_preventAutosleep(void) {
 static int usb_mode = -1;
 int USB_getMode(void) {
     if (usb_mode<0) {
-        char mode[8] = {0};
+        char mode[16] = {0};
         if (exists(USB_MODE_PATH)) getFile(USB_MODE_PATH, mode, sizeof(mode));
-        usb_mode = !strncmp(mode, "net", 3) ? USB_MODE_NET : !strncmp(mode, "adb", 3) ? USB_MODE_ADB : USB_MODE_NONE;
+        usb_mode = !strncmp(mode, "net-only", 8) ? USB_MODE_NET_ONLY
+                 : !strncmp(mode, "net", 3) ? USB_MODE_NET
+                 : !strncmp(mode, "adb", 3) ? USB_MODE_ADB : USB_MODE_NONE;
     }
     return usb_mode;
 }
 void USB_setMode(int mode) {
     usb_mode = mode;
-    putFile(USB_MODE_PATH, mode==USB_MODE_NET ? "net" : mode==USB_MODE_ADB ? "adb" : "");
+    putFile(USB_MODE_PATH, mode==USB_MODE_NET_ONLY ? "net-only" : mode==USB_MODE_NET ? "net" : mode==USB_MODE_ADB ? "adb" : "");
+}
+void USB_reloadMode(void) {
+    usb_mode = -1;
+}
+int USB_hasNetwork(int mode) {
+    return mode==USB_MODE_NET || mode==USB_MODE_NET_ONLY;
 }
 
 // updated by PWR_updateBatteryStatus()

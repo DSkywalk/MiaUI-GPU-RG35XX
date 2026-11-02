@@ -293,10 +293,14 @@ int PWR_preventAutosleep(void);
 // The USB gadget mode minui's Quick Menu switched on. It can't be switched off
 // or changed (the console hangs), so it holds until a reboot; the file is in
 // tmpfs for the same reason. Read once per process, it's drawn by the battery.
-enum { USB_MODE_NONE, USB_MODE_ADB, USB_MODE_NET };
+// what usbnet.sh has set the port up as (it writes the file): ADB, ADB + a
+// network, or the network alone
+enum { USB_MODE_NONE, USB_MODE_ADB, USB_MODE_NET, USB_MODE_NET_ONLY };
 #define USB_MODE_PATH "/tmp/usb_mode"
 int USB_getMode(void);
 void USB_setMode(int mode);
+void USB_reloadMode(void); // the file changed: read it again
+int USB_hasNetwork(int mode);
 
 int PWR_isCharging(void);
 int PWR_getBattery(void);

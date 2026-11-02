@@ -4,6 +4,14 @@
 #
 
 echo "starting adb..."
+
+# The USB port is usbnet.sh's to set up: one way for ADB and the USB network
+# alike. This stays as the old entry point, and does it the old way only if
+# usbnet.sh isn't there.
+USBNET=/usr/sbin/usbnet.sh
+if [ "$1" != host ] && [ -f "$USBNET" ]; then
+	exec sh "$USBNET" adb
+fi
  
 echo "------usbdbg $1"
 

@@ -11,36 +11,31 @@ usb_gandroid0_iProduct="/sys/class/android_usb/android0/iProduct"
 
 echo "------usbmond shell: $1"
 
+# MiaUI is a gaming handheld first: plugged in, the port only charges. No
+# gadget and no adbd until usbnet.sh is asked for a mode, and a
+# mode it has set up (/tmp/usb_mode) is left alone when the cable comes and goes.
+usbnet_mode=$(cat /tmp/usb_mode 2>/dev/null)
+
 if [ $1 = USB_B_IN ];then
 	echo "------USB_B_IN: device mode" > /dev/console
 	
 	echo "USB_B_IN" > /sys/monitor/usb_port/config/usb_con_msg
 
-	echo "Anbernic" > $usb_gandroid0_iManufacturer
-	echo "RG35XX" > $usb_gandroid0_iProduct
-	echo '0' > $usb_gandroid0_enable
-	echo "10d6" > $usb_gandroid0_idVendor
-	
-#	if [ $2 = MTP ];then
-#		echo "4e42" > $usb_gandroid0_idProduct
-#		echo "mtp,adb" > $usb_gandroid0_functions
-#	else
-		echo "0c02" > $usb_gandroid0_idProduct
-		echo "mass_storage,adb" > $usb_gandroid0_functions
-#	fi
-	
-	echo '1' > $usb_gandroid0_enable
-
-	# Don't start adbd by default
-	echo "------adb start in B_IN" > /dev/console
-	adbd &
+	if [ -n "$usbnet_mode" ];then
+		echo "------USB_B_IN: keeping usbnet.sh mode $usbnet_mode" > /dev/console
+	else
+		echo '0' > $usb_gandroid0_enable
+		echo "------USB_B_IN: charge only (ADB.pak sets up ADB or a network)" > /dev/console
+	fi
 fi
 
 if [ $1 = USB_B_OUT ];then
-	# in case that adbd has been started
-	echo "------adb stop in B_OUT" > /dev/console
-	killall adbd
-	sleep 1
+	# in case that adbd has been started, unless usbnet.sh's mode wants it
+	if [ -z "$usbnet_mode" ];then
+		echo "------adb stop in B_OUT" > /dev/console
+		killall adbd
+		sleep 1
+	fi
 
 	echo "USB_B_OUT" > /sys/monitor/usb_port/config/usb_con_msg
 	echo "------USB_B_OUT: device mode" > /dev/console
@@ -80,25 +75,4 @@ if [ $1 = REMOVE_LUN ];then
 	fi
 fi
 
-if [ $1 = RNDIS ]; then
-	killall -9 adbd
-        echo "Anbernic" > $usb_gandroid0_iManufacturer
-        echo "RG35XX" > $usb_gandroid0_iProduct
-        echo '0' > $usb_gandroid0_enable
-        echo "10d6" > $usb_gandroid0_idVendor
-	echo "0c02" > $usb_gandroid0_idProduct
-	echo "rndis" > $usb_gandroid0_functions
-	echo 1 > /sys/class/android_usb/android0/f_rndis/wceis
-	
-	# Create dir for dnsmasq
-	mkdir -p /var/lib/misc
-	dnsmasq
-	dropbear -R
-	echo '1' > $usb_gandroid0_enable
-	(
-		sleep 2
-		ip addr add 172.16.0.1/24 dev rndis0
-		ip link set rndis0 up
-	) &
-fi
 
