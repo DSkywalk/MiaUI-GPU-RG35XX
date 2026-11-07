@@ -597,6 +597,26 @@ void GFX_blitPillColor(SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
     }
     GFX_blitAssetTint(ASSET_WHITE_PILL, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y}, color, 255);
 }
+// A pill of any height h: the caps are the smallest white disc at least that
+// tall (ASSET_BUTTON or ASSET_WHITE_PILL), scaled to h when it isn't exact
+static void GFX_blitCapsule(SDL_Surface* dst, int x, int y, int w, int h, SDL_Color color) {
+    SDL_Rect* disc = &asset_rects[h <= asset_rects[ASSET_BUTTON].h ? ASSET_BUTTON : ASSET_WHITE_PILL];
+    int half = disc->w / 2;
+    int r = h / 2, r2 = h - r;
+    if (w < h) w = h;
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &(SDL_Rect){disc->x, disc->y, half, disc->h},
+                &(SDL_Rect){x, y, r, h}, color, 255);
+    if (w > h) PLAT_uiFill(dst, &(SDL_Rect){x + r, y, w - h, h}, color, 255);
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &(SDL_Rect){disc->x + half, disc->y, disc->w - half, disc->h},
+                &(SDL_Rect){x + w - r2, y, r2, h}, color, 255);
+}
+// An outlined pill, like a key drawn as a frame: the ring is the line colour
+// showing around a pill of fill colour `border` pixels smaller on every side
+void GFX_blitPillOutline(SDL_Surface* dst, SDL_Rect* dst_rect, int border, SDL_Color line, SDL_Color fill) {
+    SDL_Rect* r = dst_rect;
+    GFX_blitCapsule(dst, r->x, r->y, r->w, r->h, line);
+    GFX_blitCapsule(dst, r->x + border, r->y + border, r->w - border * 2, r->h - border * 2, fill);
+}
 void GFX_blitRect(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     int x = dst_rect->x;
     int y = dst_rect->y;

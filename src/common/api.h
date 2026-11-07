@@ -202,6 +202,7 @@ void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* ds
 void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect);
 void GFX_blitPillAlpha(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity); // 0..255
 void GFX_blitPillColor(SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color); // any colour, eg. COLOR_DARK_PILL
+void GFX_blitPillOutline(SDL_Surface* dst, SDL_Rect* dst_rect, int border, SDL_Color line, SDL_Color fill); // any height: a `border` ring of line around fill
 void GFX_blitAssetColor(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color); // white parts take color
 void GFX_blitAssetScaled(int asset, SDL_Surface* dst, SDL_Rect* box, int scale, SDL_Color color); // `scale` times its size (nearest), centred in box
 void GFX_blitAssetSized(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color); // stretched to dst_rect's w x h (nearest)

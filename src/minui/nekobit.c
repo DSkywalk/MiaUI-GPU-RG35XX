@@ -241,6 +241,10 @@ const char* NB_sleepyFace(void) {
     return "(-.-)";
 }
 
+const char* NB_introFace(void) {
+    return NB_face(NB_MOOD_HAPPY); // the face the overlay opens with too
+}
+
 int NB_moodString(int mood) {
     static const int ids[NB_MOOD_COUNT] = {
         STR_NB_MOOD_HAPPY, STR_NB_MOOD_EXCITED, STR_NB_MOOD_NEUTRAL,
@@ -906,6 +910,7 @@ static void nb_newBoot(void) {
 
 static int arrived = 0;
 static int via_mission = 0;
+static int onboarding = 0; // this boot's first minui only (NB_Save.met is what lasts)
 
 int NB_cameFromMission(void) {
     return via_mission;
@@ -935,7 +940,16 @@ int NB_isPresent(void) {
 int NB_arrived(void) {
     return arrived;
 }
+int NB_onboarding(void) {
+    return onboarding;
+}
 void NB_interact(void) {
+    onboarding = 0; // it has been called: the SELECT hint has done its job
+    if (!S.met) { // for good: a real change, so it reaches the card at power-off
+        S.met = S.present = S.engaged = 1;
+        nb_store();
+        return;
+    }
     if (S.present && S.engaged) return;
     S.present = S.engaged = 1;
     nb_storeAs(0);
@@ -946,6 +960,7 @@ void NB_init(void) {
     event_head = event_count = 0;
     leveled = 0;
     via_mission = 0;
+    onboarding = 0;
 
     static NB_Save loaded;
     int was_present = 0;
@@ -956,6 +971,12 @@ void NB_init(void) {
         nb_newBoot();
         S.present = nb_range(0, 99) < 60; // sometimes waiting, sometimes hiding
         S.engaged = 0;
+        // never opened: it comes out to introduce itself (the pill shows its
+        // happy face whatever the mood; a new NekoBit is happy anyway)
+        if (!S.met) {
+            S.present = 1;
+            onboarding = 1;
+        }
     }
     else { // the menu reloads (back from a game): an ignored NekoBit may wander
         was_present = S.present;

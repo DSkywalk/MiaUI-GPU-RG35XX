@@ -117,7 +117,8 @@ typedef struct NB_Save {
     uint32_t history_count;
     uint8_t present; // NekoBit is out on the root menu (rolled each boot)
     uint8_t engaged; // ...and the player has talked to it this boot, so it stays
-    uint8_t pad8[2];
+    uint8_t met;     // the overlay has been opened, ever: until then every boot introduces it
+    uint8_t pad8[1];
     uint32_t shown_level; // the XP the player last saw: the overlay animates
     uint32_t shown_xp;    // from here to level/xp
     NB_Mission missions[NB_MAX_MISSIONS];
@@ -180,6 +181,14 @@ const NB_Save* NB_state(void);
 int NB_isPresent(void);
 int NB_arrived(void);  // it came out since the last menu: play the peek-in
 void NB_interact(void); // the player summoned it
+// Until the player has opened NekoBit once (NB_Save.met), every boot it's out
+// for sure, and happy, to introduce itself, and its pill shows SELECT next to
+// the face. Within a boot that ends when the overlay opens or a game launches
+// (minui starting again); the next boot asks again until it has been opened.
+// A save being written (power-off, the Updater's restart) doesn't count:
+// only opening it does.
+int NB_onboarding(void);
+const char* NB_introFace(void); // the face it introduces itself with: its happy one
 const char* NB_face(int mood);
 const char* NB_sleepyFace(void); // woken up by SELECT while hiding
 int NB_moodString(int mood); // STR_NB_MOOD_*

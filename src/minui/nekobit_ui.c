@@ -827,19 +827,63 @@ void NBUI_draw(SDL_Surface* dst, int show_setting) {
 ///////////////////////////////////////
 // on the main menu
 
+// The first boot's pill: the face, then the key that calls NekoBit drawn as
+// an outlined SELECT button, as tall as the hints' buttons, in the same pill
+// Snug enough for the Spanish bar ("REPOSO" / "ABRIR" leave 209 px at 2x)
+#define INTRO_LEAD SCALE1(10)    // before the face (a plain pill has BUTTON_PADDING)
+#define INTRO_GAP SCALE1(4)      // between the face and the key
+#define INTRO_KEY_PAD SCALE1(4)  // the key's label to its frame, each side
+#define INTRO_BORDER SCALE1(1)   // the key's white frame
+static int nbui_keyWidth(const GFX_Text* key) {
+    return key->w + INTRO_KEY_PAD * 2;
+}
+static int nbui_introWidth(const GFX_Text* face, const GFX_Text* key) {
+    return INTRO_LEAD + face->w + INTRO_GAP + nbui_keyWidth(key) + SCALE1(BUTTON_MARGIN);
+}
+static void nbui_blitIntro(SDL_Surface* dst, GFX_Text* face, GFX_Text* key, int x, int y) {
+    int w = nbui_introWidth(face, key);
+    GFX_blitPillColor(dst, &(SDL_Rect){x, y, w, SCALE1(PILL_SIZE)}, NBUI_BADGE_MAIN);
+    GFX_blitRenderedText(face, NULL, dst, x + INTRO_LEAD, y + (SCALE1(PILL_SIZE - 3) - face->h) / 2);
+    SDL_Rect k = {x + INTRO_LEAD + face->w + INTRO_GAP, y + SCALE1(BUTTON_MARGIN), nbui_keyWidth(key), SCALE1(BUTTON_SIZE)};
+    GFX_blitPillOutline(dst, &k, INTRO_BORDER, COLOR_WHITE, NBUI_BADGE_MAIN);
+    GFX_blitRenderedText(key, NULL, dst, k.x + (k.w - key->w) / 2, k.y + (k.h - key->h) / 2);
+}
+
 // Just the kaomoji in a button bar pill, as tall as "A OPEN": centred on the
-// screen, or in the gap between the hints when a long translation is in the way
+// screen, or in the gap between the hints when a long translation is in the way.
+// On the first boot (NB_onboarding) the pill widens to the right for the SELECT
+// key, the face staying where it always sits; it's plain again once the
+// overlay has opened.
 void NBUI_drawFace(SDL_Surface* dst, int left, int right) {
     if (!NB_isPresent() && anim.kind == ANIM_NONE) return; // hiding
-    const char* face = anim.woken ? NB_sleepyFace() : NB_face(NB_state()->mood);
+    int intro = NB_onboarding() && !anim.woken;
+    const char* face = anim.woken ? NB_sleepyFace() : intro ? NB_introFace() : NB_face(NB_state()->mood);
     GFX_Text text = GFX_renderText(font.large, face, COLOR_WHITE);
     int w = text.w + SCALE1(BUTTON_PADDING * 2);
     int x = (dst->w - w) / 2;
+    int y = dst->h - SCALE1(PADDING + PILL_SIZE) + nbui_offset(SDL_GetTicks());
+    if (intro) {
+        GFX_Text key = GFX_renderText(font.tiny, "SELECT", COLOR_WHITE);
+        int iw = nbui_introWidth(&text, &key);
+        // the gap between the hints; if that's too tight, half the space
+        // either side of them too, before giving up on the key
+        for (int slack = 0; slack <= SCALE1(BUTTON_MARGIN) / 2; slack += SCALE1(BUTTON_MARGIN) / 2) {
+            int l = left - slack, r = right + slack;
+            int ix = x;
+            if (ix + iw > r) ix = r - iw;              // in the way of "A OPEN": back off to the left
+            if (ix < l) ix = l + (r - l - iw) / 2;     // ...and if that's too far, centre in the gap
+            if (ix >= l && ix + iw <= r) {
+                nbui_blitIntro(dst, &text, &key, ix, y);
+                return;
+            }
+        }
+        // no room for the key next to it (a long translation): just the face
+    }
     if (x < left || x + w > right) {
         if (right - left >= w) x = left + (right - left - w) / 2;
-        else if (!anim.summon) return; // no room at all: only a summon (SELECT) still shows it
+        else if (!anim.summon && !intro) return; // no room at all: only a summon (SELECT) or its first boot still shows it
     }
-    nbui_blitFace(dst, face, x, dst->h - SCALE1(PADDING + PILL_SIZE) + nbui_offset(SDL_GetTicks()), NBUI_BADGE_MAIN);
+    nbui_blitFace(dst, face, x, y, NBUI_BADGE_MAIN);
 }
 
 // SELECT always brings it, whatever the dice said. Out already, it hops and
