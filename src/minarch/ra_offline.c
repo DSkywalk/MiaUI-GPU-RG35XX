@@ -784,10 +784,21 @@ void RA_setMemoryMap(const struct retro_memory_map* mmap) {
     ra.mem_tries = 0;
 }
 
-static uint32_t ra_consoleIdForTag(const char* tag) {
+static int ra_isDiscImage(const char* path) {
+    static const char* const exts[] = { ".cue", ".chd", ".ccd", ".m3u", NULL };
+    size_t len = path ? strlen(path) : 0;
+    for (int i = 0; exts[i]; i++) {
+        size_t n = strlen(exts[i]);
+        if (len > n && !strcasecmp(path + len - n, exts[i])) return 1;
+    }
+    return 0;
+}
+
+static uint32_t ra_consoleIdForTag(const char* tag, const char* rom_path) {
     // Tags are the part in parentheses of the Roms/ folder name, which is what
     // getEmuName() extracts -- ie. the *emulator* name, not the RA console name.
-    // tools/ra_fetch.py carries the same table and must stay in sync with it.
+    // tools/ra_fetch.py carries the same table and must stay in sync with it, and
+    // so does the web manager's /api/hash (external/rust/miaui-web-manager).
     static const struct { const char* tag; uint32_t console_id; } map[] = {
         { "BMSX",      RC_CONSOLE_MSX },
         { "CPC",       RC_CONSOLE_AMSTRAD_PC },
@@ -823,7 +834,13 @@ static uint32_t ra_consoleIdForTag(const char* tag) {
     if (isArcadeTag(tag)) return RC_CONSOLE_ARCADE;
 
     for (size_t i=0; i<sizeof(map)/sizeof(map[0]); i++) {
-        if (!strcasecmp(map[i].tag, tag)) return map[i].console_id;
+        if (strcasecmp(map[i].tag, tag)) continue;
+        // PC Engine CD games share the PCE folder with the cartridges. Hashed as a
+        // cartridge, a disc image is buffered whole (up to 64 MB) and md5'd as raw
+        // bytes, a hash no game has: a disc image is a PC Engine CD game.
+        if (map[i].console_id==RC_CONSOLE_PC_ENGINE && ra_isDiscImage(rom_path))
+            return RC_CONSOLE_PC_ENGINE_CD;
+        return map[i].console_id;
     }
     return RC_CONSOLE_UNKNOWN;
 }
@@ -833,7 +850,9 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
 
     if (!ra.root[0]) return 0;
 
-    uint32_t console_id = ra_consoleIdForTag(emu_tag);
+    uint32_t console_id = ra_consoleIdForTag(emu_tag, rom_path);
+    // a disc is hashed from its file, sector by sector; never from a loaded buffer
+    if (console_id==RC_CONSOLE_PC_ENGINE_CD) { rom_data = NULL; rom_size = 0; }
     if (console_id==RC_CONSOLE_UNKNOWN) {
         LOG_info("RA: no console mapping for tag '%s'\n", emu_tag ? emu_tag : "");
         return 0;

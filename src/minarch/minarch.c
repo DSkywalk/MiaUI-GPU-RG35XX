@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <zlib.h>
 
+#include <ctype.h>
 #include "libretro.h"
 #include "defines.h"
 #include "api.h"
@@ -250,6 +251,10 @@ static struct Game {
     size_t size;
     int is_open;
 } game;
+// RETRO_ENVIRONMENT_GET_GAME_INFO_EXT (filled by GameInfoExt_fill in Core_load)
+static struct retro_game_info_ext game_info_ext;
+static int game_info_ext_ready;
+static char game_info_ext_dir[MAX_PATH], game_info_ext_name[MAX_PATH], game_info_ext_ext[16], game_info_ext_file[MAX_PATH];
 static void Game_open(char* path) {
     LOG_info("Game_open\n");
     memset(&game, 0, sizeof(game));
@@ -417,6 +422,7 @@ static void Game_open(char* path) {
     game.is_open = 1;
 }
 static void Game_close(void) {
+    game_info_ext_ready = 0;
     if (game.data) free(game.data);
     if (game.tmp_path[0]) remove(game.tmp_path);
     game.is_open = 0;
@@ -2263,7 +2269,12 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
         // if (info) LOG_info("has overrides");
         break;
     }
-    // RETRO_ENVIRONMENT_GET_GAME_INFO_EXT 66
+    case RETRO_ENVIRONMENT_GET_GAME_INFO_EXT: { /* 66 */
+        // only once Core_load has filled it: libretro allows the call inside retro_load_game() only
+        if (!game_info_ext_ready || !data) return false;
+        *(const struct retro_game_info_ext**)data = &game_info_ext;
+        return true;
+    }
     // TODO: RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK 69
     // used by fceumm
     // TODO: used by gambatte for L/R palette switching (seems like it needs to return true even if data is NULL to indicate support)
@@ -2953,6 +2964,52 @@ static void HW_quit(void) {
     hwr.fbo = 0;
 }
 
+// RETRO_ENVIRONMENT_GET_GAME_INFO_EXT: what RetroArch reports for the loaded content, filled by Core_load right
+// before retro_load_game() and valid until the game is unloaded. Cores use it to find files named after or next to
+// the content: Genesis Plus GX's Paprium mapper streams its music from <dir>/paprium/, for example.
+// For a zip minarch extracted itself, full_path is the extracted copy, dir the zip's folder and name the zip's
+// basename (RetroArch's convention); archive_path/archive_file name the zip and the file in it.
+
+static void GameInfoExt_fill(const char* load_path) {
+    const char* content = game.path;                      // the file the user picked (the zip, if it is one)
+    int in_archive = game.tmp_path[0] != '\0';
+    const char* slash = strrchr(content, '/');
+    const char* base = slash ? slash + 1 : content;
+    const char* dot;
+    int i;
+
+    memset(&game_info_ext, 0, sizeof(game_info_ext));
+
+    if (slash) snprintf(game_info_ext_dir, sizeof(game_info_ext_dir), "%.*s", (int)(slash - content), content);
+    else strcpy(game_info_ext_dir, ".");
+    if (!game_info_ext_dir[0]) strcpy(game_info_ext_dir, "/"); // content at the root
+
+    dot = strrchr(base, '.');
+    snprintf(game_info_ext_name, sizeof(game_info_ext_name), "%.*s", dot ? (int)(dot - base) : (int)strlen(base), base);
+
+    // the extension of the content file itself (inside the archive, if any), in lower case
+    const char* file = in_archive ? strrchr(game.tmp_path, '/') + 1 : base;
+    dot = strrchr(file, '.');
+    snprintf(game_info_ext_ext, sizeof(game_info_ext_ext), "%s", dot ? dot + 1 : "");
+    for (i = 0; game_info_ext_ext[i]; i++) game_info_ext_ext[i] = tolower((unsigned char)game_info_ext_ext[i]);
+
+    game_info_ext.full_path = load_path;
+    game_info_ext.dir = game_info_ext_dir;
+    game_info_ext.name = game_info_ext_name;
+    game_info_ext.ext = game_info_ext_ext;
+    game_info_ext.data = game.data;
+    game_info_ext.size = game.size;
+    game_info_ext.persistent_data = false; // game.data is freed by Game_close, after the core is unloaded, but cores
+                                           // that keep pointers past retro_load_game must not rely on it here
+    if (in_archive) {
+        snprintf(game_info_ext_file, sizeof(game_info_ext_file), "%s", file);
+        game_info_ext.archive_path = game.path;
+        game_info_ext.archive_file = game_info_ext_file;
+        game_info_ext.file_in_archive = true;
+    }
+    game_info_ext_ready = 1;
+}
+
 // Returns 0 if the core refused the content. Everything downstream (the av
 // info, the save ram, the state buffer) reads state that only exists once the
 // game is loaded, so this has to be checked -- ignoring it turns a core that
@@ -2963,6 +3020,7 @@ int Core_load(void) {
     game_info.path = game.tmp_path[0]?game.tmp_path:game.path;
     game_info.data = game.data;
     game_info.size = game.size;
+    GameInfoExt_fill(game_info.path);
     
     if (!core.load_game(&game_info)) {
         LOG_error("Core_load: %s refused to load the content. Look further up the\n"
