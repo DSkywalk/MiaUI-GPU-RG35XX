@@ -20,6 +20,7 @@ This is a heavily optimized, highly opinionated OS designed to maximize performa
 - [🧠 Smart Memory Management (On-Demand SWAP)](#-smart-memory-management-on-demand-swap)
 - [🧰 Built-in Helper Apps](#-built-in-helper-apps)
 - [🤝 Contributing & Feedback](#contributing--feedback)
+- [❓ Frequently Asked Questions](#-frequently-asked-questions-faq)
  
 
 ## 🛡️ SD Card Preservation
@@ -144,6 +145,19 @@ This project is a personal hobby and a labor of love for a handheld I truly enjo
 I've spent over two years refining it so that it works exactly the way I want it to. So user support is not provided and the Issues tab is disabled. Clean Pull Requests are welcome, but for new features or major design changes, please fork the repository and build your own vision.
 
 If you just want to say hi, show off your customized setup, or tell me you're enjoying MiaUI, I'd 🥰 to hear from you over on: [@dskywalk.eurosky.social](https://bsky.app/profile/dskywalk.bsky.social) or [@dskywalk@masto.es](https://masto.es/@dskywalk).
+
+## ❓ Frequently Asked Questions (FAQ)
+
+_To push this tiny handheld to do such amazing things, we had to make some strict design decisions. We know this might require a little extra effort on your end to adapt your setup, but the performance we could get is worth it! ;)_
+
+**Q: Can I use SD2 for ROMs? Can the OS merge ROMs from SD1 and SD2? Can I do X on SDx?**  
+**A:** No. MiaUI expects all your ROMs to be on SD1. The second slot (SD2) is exclusively reserved for the On-Demand SWAP feature. Scanning and merging directories across two different SD cards adds overhead and slows down boot times. This OS is built to be fast, simple, and direct, so multi-SD ROM reading is not supported.
+
+**Q: I have a large SD card in slot 2. Can I make a 2GB partition for SWAP and use the rest of the space for ROMs?**  
+**A:** No. Because the system does not scan SD2 for games, any extra space there will remain unused by MiaUI. The SWAP size is fixed at 2GB (allocating more is actually counterproductive for performance). We highly recommend using an old, cheap, low-capacity SD card (like a 2GB or 4GB card) in slot 2, and saving your large, high-quality cards for slot 1.
+
+**Q: Is HDMI out working?**  
+**A:** No, but is not intentionally removed, is not something we use or it could be tested for me. However, HDMI introduces external displays with varying resolutions and known stability issues inherited from the base OS. A core goal of MiaUI is to avoid unnecessary CPU/GPU scaling calculations to maintain top performance. To achieve this, the entire UI and emulation architecture is strictly optimized to run at the handheld's native 640x480 screen.
 
 ### Testers
 * Thx to ^Morgoth^, Ricco, Eric Magnus, Wolfenprey, dfernandezd, SamyJankins, ShinMetalSonic.
