@@ -8,6 +8,7 @@ fi
 
 cp /usr/share/evmapy/drastic.keys /var/run/evmapy/event1.json
 evmapy &
+sleep 2
 
 overclock.elf 1104000
 
