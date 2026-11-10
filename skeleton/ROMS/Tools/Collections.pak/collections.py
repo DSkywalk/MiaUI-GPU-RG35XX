@@ -531,7 +531,12 @@ def main():
     try:
         ui.main()
     finally:
+        # as the Updater: leave the screen blank for minui
+        for _ in range(10):
+            ui.screen.fill(BG)
+            pygame.display.flip()
         pygame.quit()
+        os.system("cat /dev/zero > /dev/fb0 2>/dev/null")
     return 0
 
 
