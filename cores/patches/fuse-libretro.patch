@@ -1,0 +1,170 @@
+diff --git a/Makefile.libretro b/Makefile.libretro
+index f5afa42..bf23ca9 100644
+--- a/Makefile.libretro
++++ b/Makefile.libretro
+@@ -197,6 +197,30 @@ else ifeq ($(platform), classic_armv8_a35)
+ 	LDFLAGS += -marm -mcpu=cortex-a35 -mfpu=neon-fp-armv8 -mfloat-abi=hard -Ofast -flto -fuse-linker-plugin
+ #######################################
+ 
++# RG35XX
++else ifeq ($(platform), rg35xx)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	CXX = $(CROSS_COMPILE)g++
++	AR = $(CROSS_COMPILE)ar
++	SHARED := -shared -Wl,--version-script=build/link.T -Wl,--no-undefined
++
++	CFLAGS += -Ofast \
++	-marm -mcpu=cortex-a9 -mfpu=neon-fp16 -mfloat-abi=hard \
++	-flto=4 -fwhole-program -fuse-linker-plugin \
++	-fdata-sections -ffunction-sections -Wl,--gc-sections \
++	-fno-stack-protector -fno-ident -fomit-frame-pointer \
++	-fno-unwind-tables -fno-asynchronous-unwind-tables \
++	-fmerge-all-constants -fno-math-errno
++
++	CXXFLAGS += $(CFLAGS)
++	CPPFLAGS += $(CFLAGS)
++	ASFLAGS += $(CFLAGS)
++	HAVE_NEON = 1
++	ARCH = arm
++	LDFLAGS += -lrt
++	LDFLAGS += -marm -mcpu=cortex-a9 -mfpu=neon-fp16 -mfloat-abi=hard -Ofast -flto=4 -fuse-linker-plugin -fPIC
++
+ # OS X
+ else ifeq ($(platform), osx)
+ 	TARGET := $(TARGET_NAME)_libretro.dylib
+diff --git a/src/libretro.c b/src/libretro.c
+index bc28113..f876123 100644
+--- a/src/libretro.c
++++ b/src/libretro.c
+@@ -256,6 +256,11 @@ static int show_joystick_type_at_startup;
+ static int show_emulation_speed_at_startup;
+ static int display_joystick_type;
+ static int display_emulation_speed;
++/* Joystick wired to port 1 when the frontend does not choose a controller
++   port device type itself (minarch never does: it passes RETRO_DEVICE_JOYPAD,
++   which is also this core's RETRO_DEVICE_AUTO_CFG marker). Driven by the
++   fuse_joypad_type option; Kempston is the de-facto standard for ZX games. */
++static unsigned opt_joyport0_device = RETRO_DEVICE_KEMPSTON_JOYSTICK;
+ static int periph_needs_update = 0;
+ /* Set alongside periph_needs_update when the peripheral that changed is one
+    the machine cannot gain or lose while running - see retro_run(). */
+@@ -849,6 +854,26 @@ static struct retro_core_option_v2_definition core_option_definitions[] = {
+       { CORE_OPTION_VALUE_LIST_ENABLED_DISABLED },
+       "disabled"
+    },
++   {
++      "fuse_joypad_type",
++      "Joystick Type (Port 1)",
++      NULL,
++      NULL,
++      NULL,
++      "input",
++      {
++         { "none", NULL },
++         { "cursor", NULL },
++         { "kempston", NULL },
++         { "sinclair 1", NULL },
++         { "sinclair 2", NULL },
++         { "timex 1", NULL },
++         { "timex 2", NULL },
++         { "fuller", NULL },
++         { NULL, NULL }
++      },
++      "kempston"
++   },
+    {
+       "fuse_display_joystick_type",
+       "Display joystick type at startup",
+@@ -1062,6 +1087,7 @@ static const struct retro_variable core_vars[] =
+    { "fuse_display_emulation_speed", "Display emulation speed at startup; disabled|enabled" },
+    { "fuse_auto_size_savestate", "Use Auto Size for Savestates. For Netplay 'Off' is recommended; enabled|disabled" },
+    { "fuse_mouse_swap_buttons", "Kempston Mouse Swap Buttons; disabled|enabled" },
++   { "fuse_joypad_type", "Joystick Type (Port 1); none|cursor|kempston|sinclair 1|sinclair 2|timex 1|timex 2|fuller" },
+    { "fuse_joypad_left",    "Joypad Left mapping; " SPECTRUMKEYS },
+    { "fuse_joypad_right",   "Joypad Right mapping; " SPECTRUMKEYS },
+    { "fuse_joypad_up",      "Joypad Up mapping; " SPECTRUMKEYS },
+@@ -1143,6 +1169,28 @@ static void apply_border_size(int option)
+                  (hard_width - soft_width) / 2;
+ }
+ 
++/* Index into the fuse_joypad_type value list -> libretro controller port
++   device. Keep the order in sync with core_vars[] and
++   core_option_definitions[]: none, cursor, kempston, sinclair 1, sinclair 2,
++   timex 1, timex 2, fuller. */
++static unsigned joystick_device_from_option(int option)
++{
++   switch (option)
++   {
++      case 0:  return RETRO_DEVICE_NONE;
++      case 1:  return RETRO_DEVICE_CURSOR_JOYSTICK;
++      case 2:  return RETRO_DEVICE_KEMPSTON_JOYSTICK;
++      case 3:  return RETRO_DEVICE_SINCLAIR1_JOYSTICK;
++      case 4:  return RETRO_DEVICE_SINCLAIR2_JOYSTICK;
++      case 5:  return RETRO_DEVICE_TIMEX1_JOYSTICK;
++      case 6:  return RETRO_DEVICE_TIMEX2_JOYSTICK;
++      case 7:  return RETRO_DEVICE_FULLER_JOYSTICK;
++   }
++
++   /* Unreadable or invalid option: keep the Kempston default. */
++   return RETRO_DEVICE_KEMPSTON_JOYSTICK;
++}
++
+ int update_variables(int force)
+ {
+    int flags = 0;
+@@ -1314,6 +1362,22 @@ int update_variables(int force)
+    opt_uspeech = coreopt(env_cb, core_vars, "fuse_uspeech", NULL) == 1;
+    opt_issue2  = coreopt(env_cb, core_vars, "fuse_issue2", NULL) == 1;
+ 
++   /* Joystick on port 1. Frontends such as minarch never expose controller
++      port device types, so without this option no port is ever configured as
++      a joystick and compat/ui.c ignores the pad entirely. Applied here (and
++      not only in retro_set_controller_port_device) so that a running game
++      picks up a change made in the Options menu. */
++   {
++      int option = coreopt(env_cb, core_vars, "fuse_joypad_type", NULL);
++      unsigned device = joystick_device_from_option(option);
++
++      if (device != opt_joyport0_device || input_devices[0] != device)
++      {
++         opt_joyport0_device = device;
++         retro_set_controller_port_device(0, device);
++      }
++   }
++
+    sync_periph_from_ports_and_options();
+ 
+    keyb_transparent = coreopt(env_cb, core_vars, "fuse_key_ovrlay_transp", NULL) != 1;
+@@ -2954,11 +3018,30 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
+    {
+       if (port == 0 && show_joystick_type_at_startup == TRUE)
+          display_joystick_type = TRUE;
+-      return;
++
++      /* RETRO_DEVICE_AUTO_CFG just means "the frontend does not pick a
++         controller port device". Frontends that never expose port types
++         (minarch, and anything else calling this with RETRO_DEVICE_JOYPAD)
++         land here, so returning without wiring a joystick left every port at
++         RETRO_DEVICE_NONE and compat/ui.c ignored the pad completely. Resolve
++         port 0 from the fuse_joypad_type option instead and carry on.
++         Not over a joystick a loaded snapshot has already chosen (.z80/.szx
++         record the one the game was set up for, see joystick_from_snapshot()):
++         minarch makes this call after retro_load_game(), so wiring the option
++         here would replace, say, a Cursor snapshot's joystick with Kempston and
++         the game would stop responding. Changing the option itself still
++         applies, through update_variables(). */
++      if (port != 0 || settings_current.joystick_1_output != 0)
++         return;
++
++      device = opt_joyport0_device;
+    }
+ 
+    switch (device)
+    {
++      /* RETRO_DEVICE_NONE detaches the joystick: get_joystick() maps it to
++         0 (LIBSPECTRUM_JOYSTICK_NONE), so let it share the path below. */
++      case RETRO_DEVICE_NONE:
+       case RETRO_DEVICE_CURSOR_JOYSTICK:
+       case RETRO_DEVICE_KEMPSTON_JOYSTICK:
+       case RETRO_DEVICE_SINCLAIR1_JOYSTICK:
