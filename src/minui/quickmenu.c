@@ -101,7 +101,7 @@ static struct {
     int clock_date; // DATE_*
     int minute; // last one drawn
     char ip[INET_ADDRSTRLEN]; // the console's, on the USB network
-    char pc[INET_ADDRSTRLEN]; // the PC's, once it has its lease
+    char pc[INET_ADDRSTRLEN]; // the PC's: its DHCP lease, or the ARP table for a fixed IP
     uint32_t ip_at;
     struct {
         pid_t pid; // usbnet.sh, switching the port in the background
@@ -149,12 +149,39 @@ static int qm_usbUp(void) {
     return exists("/sys/class/net/" QM_USB_IF);
 }
 
+// A PC with a fixed address (Windows ICS, NetworkManager "shared", a static
+// IP) never asks our DHCP server for a lease. It still answers ARP, and
+// usbnet.sh pings it once when the network comes up, so it's in the ARP table:
+// the first complete entry (flags 0x2) on the USB interface.
+static void qm_readPCFromARP(void) {
+    FILE* f = fopen("/proc/net/arp", "r");
+    if (!f) return;
+    char line[160];
+    if (fgets(line, sizeof(line), f)) { // the header
+        char ip[INET_ADDRSTRLEN], dev[IFNAMSIZ];
+        unsigned type, flags;
+        while (fgets(line, sizeof(line), f)) {
+            // IP address  HW type  Flags  HW address  Mask  Device
+            if (sscanf(line, "%15s %x %x %*s %*s %15s", ip, &type, &flags, dev) == 4 &&
+                (flags & 0x2) && !strcmp(dev, QM_USB_IF)) {
+                snprintf(qm.pc, sizeof(qm.pc), "%s", ip);
+                break;
+            }
+        }
+    }
+    fclose(f);
+}
+
 // The PC's address, from the DHCP server's lease file (busybox udhcpd: an
-// 8-byte time, then 36-byte leases of expiry, address, MAC and name)
+// 8-byte time, then 36-byte leases of expiry, address, MAC and name), else
+// from the ARP table
 static void qm_readPC(void) {
     qm.pc[0] = '\0';
     FILE* f = fopen(QM_USB_LEASES, "rb");
-    if (!f) return;
+    if (!f) {
+        qm_readPCFromARP();
+        return;
+    }
     unsigned char lease[36];
     if (fseek(f, 8, SEEK_SET) == 0) {
         while (fread(lease, sizeof(lease), 1, f) == 1) {
@@ -167,6 +194,7 @@ static void qm_readPC(void) {
         }
     }
     fclose(f);
+    if (!qm.pc[0]) qm_readPCFromARP();
 }
 
 static void qm_readIP(void) {
