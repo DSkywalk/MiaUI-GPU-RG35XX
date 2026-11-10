@@ -2019,6 +2019,51 @@ static bool HW_setRender(unsigned cmd, struct retro_hw_render_callback* cb) {
     return true;
 }
 
+// A core that changes its picture after load (PS1 mode switches, DOSBox video
+// modes, overscan options) reports it with SET_GEOMETRY / SET_SYSTEM_AV_INFO.
+// Only the aspect needs handling: a new frame size is already caught by the
+// size check in video_refresh_callback. Costs nothing per frame: this runs only
+// when the core calls, and the rescale reuses that callback's dst_p==0 test.
+static void Core_applyGeometry(const struct retro_game_geometry* geom) {
+    double a = geom->aspect_ratio;
+    if (a<=0 && geom->base_width && geom->base_height) a = (double)geom->base_width / geom->base_height;
+    if (a>0 && a!=core.aspect_ratio) {
+        LOG_info("geometry: %ux%u aspect %f -> %f\n", geom->base_width, geom->base_height, core.aspect_ratio, a);
+        core.aspect_ratio = a;
+        renderer.dst_p = 0; // selectScaler again on the next frame
+    }
+}
+
+// Set once SND_init has opened the audio for the loaded game (see main).
+static int snd_open = 0;
+
+// New timing from SET_SYSTEM_AV_INFO. The audio device is reopened ONLY when
+// the sample rate really changes; a new frame rate alone is applied in place
+// (it only feeds the clock decision, re-made on every batch), and identical
+// timing does nothing at all - no restart, no pop.
+static void Core_applyTiming(double fps, double sample_rate) {
+    int fps_changed  = fps>0 && fps!=core.fps;
+    int rate_changed = sample_rate>0 && sample_rate!=core.sample_rate;
+    if (!fps_changed && !rate_changed) return;
+
+    LOG_info("timing: %f fps %f Hz -> %f fps %f Hz\n", core.fps, core.sample_rate,
+             fps_changed ? fps : core.fps, rate_changed ? sample_rate : core.sample_rate);
+    if (fps_changed) core.fps = fps;
+    if (rate_changed) core.sample_rate = sample_rate;
+
+    // before SND_init (eg. during retro_load_game) the stored values are enough
+    if (!snd_open) return;
+
+    if (rate_changed) {
+        SND_quit();
+        SND_init(core.sample_rate, core.fps);
+        SetVolume(GetVolume()); // as after the first SND_init
+    }
+    else {
+        SND_setFrameRate(core.fps);
+    }
+}
+
 static bool environment_callback(unsigned cmd, void *data) { // copied from picoarch initially
     // LOG_info("environment_callback: %i\n", cmd);
     
@@ -2273,6 +2318,21 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
         // only once Core_load has filled it: libretro allows the call inside retro_load_game() only
         if (!game_info_ext_ready || !data) return false;
         *(const struct retro_game_info_ext**)data = &game_info_ext;
+        return true;
+    }
+    case RETRO_ENVIRONMENT_SET_GEOMETRY: { /* 37 */
+        const struct retro_game_geometry* geom = data;
+        if (!geom) return false;
+        Core_applyGeometry(geom);
+        return true;
+    }
+    case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: { /* 32 */
+        // Geometry plus timing: PCSX on a PAL/NTSC switch, dosbox-pure on a
+        // video mode with another refresh rate. Runs only when the core calls.
+        const struct retro_system_av_info* av = data;
+        if (!av) return false;
+        Core_applyGeometry(&av->geometry);
+        Core_applyTiming(av->timing.fps, av->timing.sample_rate);
         return true;
     }
     // TODO: RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK 69
@@ -3059,6 +3119,7 @@ void Core_reset(void) {
     core.reset();
 }
 void Core_unload(void) {
+    snd_open = 0;
     SND_quit();
 }
 void Core_quit(void) {
@@ -5532,6 +5593,7 @@ int main(int argc , char* argv[]) {
     Config_free();
         
     SND_init(core.sample_rate, core.fps);
+    snd_open = 1;
     SetVolume(GetVolume()); // again, now that the audio is open
     Menu_init();
     State_resume();

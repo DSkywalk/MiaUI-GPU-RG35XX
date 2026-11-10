@@ -1316,6 +1316,17 @@ void SND_setVideoSync(int enabled) {
     snd_video_sync = enabled ? 1 : 0;
 }
 
+// A core changed its frame rate mid-game (SET_SYSTEM_AV_INFO) but not its
+// sample rate: nothing to reopen. SND_updateClock re-decides the clock and the
+// resample step from snd.frame_rate on the next batch, so no restart and no pop.
+// The ring keeps its size (5s at the old rate), which is just as good.
+void SND_setFrameRate(double frame_rate) {
+    if (frame_rate <= 0) return;
+    SDL_LockAudio();
+    snd.frame_rate = frame_rate;
+    SDL_UnlockAudio();
+}
+
 int SND_isVideoClocked(void) {
     return snd.initialized && snd.video_clocked;
 }
