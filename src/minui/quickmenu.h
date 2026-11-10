@@ -2,7 +2,7 @@
 #define __QUICKMENU_H__
 
 // The Quick Menu MENU opens on the main menu: a row of round icons (Settings,
-// Achievements, Network, Clock, SD Tool, About) with the time above them, and
+// Achievements, Network, Clock, Collections, SD Tool, About) with the time above them, and
 // the pages behind them. GFX_* only, like nekobit_ui.
 
 #include "api.h"
@@ -10,7 +10,7 @@
 enum {
     QM_NONE,
     QM_CLOSED, // the menu closed
-    QM_SDTOOL, // ...and minui should hand over to the SD tool
+    QM_COLLECTIONS, // ...and minui should open the Collections manager (CM_openManager)
 };
 
 // After GFX_init. Works out the USB mode if this boot hasn't yet (adbd started

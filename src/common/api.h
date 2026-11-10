@@ -65,6 +65,9 @@ enum {
 	ASSET_CLOCK,
 	ASSET_GAMEPAD,
 	ASSET_SDCARD,
+	ASSET_STAR, // Collections, in the Quick Menu
+	ASSET_CHECKED, // the Collections screen: the game is in this list
+	ASSET_UNCHECKED,
 };
 
 typedef struct GFX_Fonts {

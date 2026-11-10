@@ -17,6 +17,7 @@
 #include "nekobit.h"
 #include "nekobit_ui.h"
 #include "quickmenu.h"
+#include "collections.h"
 
 
 static SDL_Surface *screen = NULL; // Must be assigned externally
@@ -819,7 +820,7 @@ static int deleteCurrentEntry(Directory *dir, int index)
 
     // Prepare the UI message based on the result
     char msg[256];
-    snprintf(msg, sizeof(msg), "Deleted: %s", entry->name);
+    snprintf(msg, sizeof(msg), T(STR_DELETED), entry->name);
 
     // 2. Free the memory allocated for this specific entry
     Entry_free(entry);
@@ -834,7 +835,8 @@ static int deleteCurrentEntry(Directory *dir, int index)
     dir->alphas->count = 0;
     Directory_index(dir);
 
-    // Render the message over what is on screen
+    // The message on its own (the frame before it was the question)
+    GFX_clear(screen);
     GFX_Text notif_txt = GFX_renderText(font.large, msg, COLOR_LIGHT_RED);
 
     // Use MinUI's exact scaling constants so the pill edges render without clipping
@@ -2101,17 +2103,118 @@ static void reloadMenu(void)
     Menu_init();
 }
 
-static void openSDTool(void)
+///////////////////////////////////////
+// Collections, and deleting a game
+
+// the game behind an entry, as recents and collections hold it: a rom or a
+// pak as it is, a multi-disc folder by the .cue or .m3u openRom() plays
+static int gamePath(Entry *entry, char *out)
 {
-    if (!exists(SDTOOL_PAK_PATH))
-        return;
-    saveCurrent(); // not the pak: back to the list as it was
-    putFile(QM_REOPEN_PATH, "");
+    if (entry->type == ENTRY_ROM || entry->type == ENTRY_PAK)
+    {
+        strcpy(out, entry->path);
+        return 1;
+    }
     char path[MAX_PATH];
-    strcpy(path, SDTOOL_PAK_PATH);
-    char cmd[MAX_PATH + 32];
-    sprintf(cmd, "sh '%s/launch.sh'", escapeSingleQuotes(path));
-    queueNext(cmd);
+    if (hasCue(entry->path, path))
+    {
+        strcpy(out, path);
+        return 1;
+    }
+    strcpy(strrchr(path, '.') + 1, "m3u");
+    if (!exists(path))
+        return 0;
+    strcpy(out, path);
+    return 1;
+}
+
+// SELECT + Y: the selected game's collections
+static void openCollections(void)
+{
+    if (top->entries->count == 0)
+        return;
+    Entry *entry = top->entries->items[top->selected];
+    char path[MAX_PATH];
+    if (!gamePath(entry, path))
+        return;
+    char *name = entry->name;
+    trimSortingMeta(&name);
+    CM_open(path, name);
+}
+
+// what the left pill offers while buttons are held on a game in a folder:
+// SELECT, Y for its collections; SELECT + START, X to delete it (not in Kids
+// Mode). On the root SELECT is NekoBit's.
+enum { HOLD_NONE, HOLD_FAV, HOLD_DELETE };
+static int heldAction(int show_setting)
+{
+    if (stack->count < 2 || top->entries->count == 0 || show_setting || !PAD_isPressed(BTN_SELECT))
+        return HOLD_NONE;
+    Entry *entry = top->entries->items[top->selected];
+    if (PAD_isPressed(BTN_START))
+        return !simple_mode && entry->type == ENTRY_ROM ? HOLD_DELETE : HOLD_NONE;
+    char path[MAX_PATH];
+    return gamePath(entry, path) ? HOLD_FAV : HOLD_NONE;
+}
+
+// a list whose entries changed: entry i selected (or the last), and the rows
+// shown kept where they were as far as they still fit
+static void Directory_fit(Directory *self, int i)
+{
+    int count = self->entries->count;
+    if (count == 0)
+    {
+        self->selected = self->start = self->end = 0;
+        return;
+    }
+    if (i >= count)
+        i = count - 1;
+    int rows = count < MAIN_ROW_COUNT ? count : MAIN_ROW_COUNT;
+    if (i < self->start)
+        self->start = i;
+    if (i >= self->start + rows)
+        self->start = i - rows + 1;
+    if (self->start + rows > count)
+        self->start = count - rows;
+    self->end = self->start + rows;
+    self->selected = i;
+}
+
+// After the Collections screen changed a list: the root (a first list brings
+// Collections), the Collections folder and an open list are read again, each
+// on the entry it was on, or where it was if that one left (reloadMenu()
+// would put the player in the game's own folder instead)
+static void refreshCollections(void)
+{
+    // a list deleted while it was open: back out of it
+    while (stack->count > 1 && prefixMatch(COLLECTIONS_PATH, top->path) && suffixMatch(".txt", top->path) && !exists(top->path))
+        closeDirectory();
+    for (int i = 0; i < stack->count; i++)
+    {
+        Directory *old = stack->items[i];
+        if (!exactMatch(old->path, SDCARD_PATH) && !prefixMatch(COLLECTIONS_PATH, old->path))
+            continue;
+        if (i == 0)
+        { // getRoot() reads recents again, into this array: as Menu_init()
+            RecentArray_free(recents);
+            recents = Array_new();
+        }
+        Directory *dir = Directory_new(old->path, old->selected);
+        dir->start = old->start;
+        int at = old->selected;
+        if (old->entries->count > 0)
+        {
+            Entry *was = old->entries->items[old->selected];
+            for (int j = 0; j < dir->entries->count; j++)
+                if (exactMatch(((Entry *)dir->entries->items[j])->path, was->path))
+                    at = j;
+        }
+        Directory_fit(dir, at);
+        stack->items[i] = dir;
+        if (top == old)
+            top = dir;
+        Directory_free(old);
+    }
 }
 
 ///////////////////////////////////////
@@ -2160,6 +2263,9 @@ int main(int argc, char *argv[])
     int dirty = 1;
 
     int show_setting = 0; // 1=brightness,2=volume
+    int delete_confirm = 0; // asking before the selected game is deleted
+    int resume_blocked = 0; // X went down for DELETE: its release doesn't resume
+    int cm_from_qm = 0; // the Collections manager came from the Quick Menu: B goes back to it
     int was_online = PLAT_isOnline();
 
     // game art for the selected entry: what it should show, and what has
@@ -2191,6 +2297,14 @@ int main(int argc, char *argv[])
 
         PWR_update(&dirty, &show_setting, NULL, NULL);
 
+        int overlay = NBUI_isOpen() || QM_isOpen() || CM_isOpen() || delete_confirm;
+        int held = overlay ? HOLD_NONE : heldAction(show_setting);
+        if (stack->count > 1 && !overlay &&
+            (PAD_justPressed(BTN_SELECT) || PAD_justReleased(BTN_SELECT) || PAD_justPressed(BTN_START) || PAD_justReleased(BTN_START)))
+            dirty = 1; // the left pill follows the buttons
+        if (PAD_justReleased(BTN_RESUME) && delete_confirm)
+            resume_blocked = 0; // DELETE's X let go under the question (later, the list takes it below)
+
         int is_online = PLAT_isOnline();
         if (was_online != is_online)
             dirty = 1;
@@ -2199,7 +2313,7 @@ int main(int argc, char *argv[])
         if (QM_update())
             dirty = 1;
 
-        int nb = NBUI_update(now, stack->count == 1 && !QM_isOpen() && !NBUI_isOpen());
+        int nb = NBUI_update(now, stack->count == 1 && !QM_isOpen() && !NBUI_isOpen() && !CM_isOpen());
         if (nb & NBUI_REDRAW)
             dirty = 1;
         if (nb & NBUI_SUMMONED) // NekoBit is fully out: now the overlay
@@ -2225,6 +2339,43 @@ int main(int argc, char *argv[])
                     readyResume(top->entries->items[top->selected]);
             }
         }
+        else if (CM_isOpen())
+        {
+            if (CM_input())
+                dirty = 1;
+            if (!CM_isOpen())
+            {
+                if (CM_changed())
+                    refreshCollections();
+                if (cm_from_qm)
+                    QM_open(); // as its other pages: B is back to the icons
+                cm_from_qm = 0;
+                total = top->entries->count;
+                update_timer = now;
+                dirty = 1;
+                if (total > 0)
+                    readyResume(top->entries->items[top->selected]);
+            }
+        }
+        else if (delete_confirm)
+        {
+            if (PAD_justPressed(BTN_A))
+            {
+                delete_confirm = 0;
+                if (deleteCurrentEntry(top, top->selected))
+                    Directory_fit(top, top->selected);
+                total = top->entries->count;
+                if (total > 0)
+                    readyResume(top->entries->items[top->selected]);
+                update_timer = SDL_GetTicks(); // the message held the loop: no skipped frames
+                dirty = 1;
+            }
+            else if (PAD_justPressed(BTN_B))
+            {
+                delete_confirm = 0;
+                dirty = 1;
+            }
+        }
         else if (QM_isOpen())
         {
             int action;
@@ -2241,8 +2392,11 @@ int main(int argc, char *argv[])
                 }
                 if (!HAS_POWER_BUTTON && !simple_mode)
                     PWR_disableSleep();
-                if (action == QM_SDTOOL)
-                    openSDTool();
+                else if (action == QM_COLLECTIONS)
+                {
+                    CM_openManager();
+                    cm_from_qm = 1;
+                }
             }
         }
         else
@@ -2261,48 +2415,19 @@ int main(int argc, char *argv[])
                 if (!HAS_POWER_BUTTON && !simple_mode)
                     PWR_enableSleep();
             }
+            else if (held == HOLD_FAV && PAD_justPressed(BTN_Y))
+            {
+                openCollections();
+                dirty = 1;
+            }
+            else if (held == HOLD_DELETE && PAD_justPressed(BTN_X))
+            {
+                delete_confirm = 1;
+                resume_blocked = 1;
+                dirty = 1;
+            }
             else if (total > 0)
             {
-                // MENU+SELECT+START deletes the selected file, inside a system
-                // folder only: on the root SELECT is NekoBit's alone
-                if (stack->count > 1 && show_setting && PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_START))
-                {
-                    Entry *target_entry = top->entries->items[selected];
-                    
-                    // Backup the name before deletion to display it on screen
-                    char deleted_name[256];
-                    strncpy(deleted_name, target_entry->name, sizeof(deleted_name) - 1);
-                    deleted_name[sizeof(deleted_name) - 1] = '\0';
-
-                    int success = deleteCurrentEntry(top, selected);
-                    if (!success)
-                        continue;
-
-                    // Update cursor and pagination bounds after deletion
-                    total = top->entries->count;
-                    if (total == 0) 
-                    {
-                        selected = 0;
-                        top->start = 0;
-                        top->end = 0;
-                    } 
-                    else 
-                    {
-                        if (selected >= total) selected = total - 1;
-                        
-                        if (top->end > total) 
-                        {
-                            top->end = total;
-                            top->start = (top->end > MAIN_ROW_COUNT) ? top->end - MAIN_ROW_COUNT : 0;
-                        }
-                    }
-                    
-                    // Reset the input timer to prevent skipped frames from jumping the cursor
-                    update_timer = SDL_GetTicks(); 
-                    dirty = 1; // Force a full UI redraw for the next iteration
-                    continue;  // Skip the rest of the inputs for this frame
-                }
-
                 if (PAD_justRepeated(BTN_UP))
                 {
                     if (selected == 0 && !PAD_justPressed(BTN_UP))
@@ -2433,7 +2558,9 @@ int main(int argc, char *argv[])
             if (dirty && total > 0)
                 readyResume(top->entries->items[top->selected]);
 
-            if (total > 0 && can_resume && PAD_justReleased(BTN_RESUME))
+            if (resume_blocked && PAD_justReleased(BTN_RESUME))
+                resume_blocked = 0;
+            else if (total > 0 && can_resume && held == HOLD_NONE && PAD_justReleased(BTN_RESUME))
             {
                 should_resume = 1;
                 Entry_open(top->entries->items[top->selected]);
@@ -2608,7 +2735,7 @@ int main(int argc, char *argv[])
 
             // the folder background goes under everything, the battery and
             // brightness pill included (it used to be drawn over them)
-            if (!QM_isOpen() && !NBUI_isOpen())
+            if (!QM_isOpen() && !NBUI_isOpen() && !CM_isOpen() && !delete_confirm)
                 Art_draw(shown_bg, 0, 0);
 
             int ow = GFX_blitHardwareGroup(screen, show_setting);
@@ -2620,6 +2747,23 @@ int main(int argc, char *argv[])
             else if (QM_isOpen())
             {
                 QM_draw(screen, show_setting);
+            }
+            else if (CM_isOpen())
+            {
+                CM_draw(screen, show_setting, ow);
+            }
+            else if (delete_confirm)
+            {
+                // as the Quick Menu's dialogs: the question on its own, the answers under it
+                Entry *entry = top->entries->items[top->selected];
+                char *name = entry->name;
+                trimSortingMeta(&name);
+                char text[MAX_PATH];
+                snprintf(text, sizeof(text), T(STR_DELETE_GAME), name);
+                GFX_blitMessage(font.medium, text, screen, &(SDL_Rect){0, SCALE1(PADDING), screen->w, screen->h - SCALE1(PILL_SIZE + PADDING)});
+                if (show_setting && !GetHDMI())
+                    GFX_blitHardwareHints(screen, show_setting);
+                GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_MA_CANCEL), "A", (char *)T(STR_DELETE), NULL}, 1, screen, 1);
             }
             else
             {
@@ -2706,6 +2850,10 @@ int main(int argc, char *argv[])
                 int lw = screen->w; // the left group's width: NekoBit's pill keeps clear of it
                 if (show_setting && !GetHDMI())
                     GFX_blitHardwareHints(screen, show_setting);
+                else if (held == HOLD_FAV)
+                    lw = GFX_blitButtonGroup((char *[]){"Y", (char *)T(STR_FAV), NULL}, 0, screen, 0);
+                else if (held == HOLD_DELETE)
+                    lw = GFX_blitButtonGroup((char *[]){"X", (char *)T(STR_DELETE), NULL}, 0, screen, 0);
                 else if (can_resume)
                     lw = GFX_blitButtonGroup((char *[]){"X", (char *)T(STR_RESUME), NULL}, 0, screen, 0);
                 else

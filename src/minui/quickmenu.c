@@ -32,9 +32,9 @@
 #define QM_DATE_PATH USERDATA_PATH "/clock_date" // "1" day and month, "2" full date; none: time only
 
 #define QM_ICON_SCALE 2 // the atlas' 10px icons, doubled in the round buttons
-#define QM_ICON_GAP 14
+#define QM_ICON_GAP 10
 
-enum { ITEM_SETTINGS, ITEM_ACHIEVEMENTS, ITEM_NETWORK, ITEM_CLOCK, ITEM_SDTOOL, ITEM_ABOUT, ITEM_COUNT };
+enum { ITEM_SETTINGS, ITEM_ACHIEVEMENTS, ITEM_NETWORK, ITEM_CLOCK, ITEM_COLLECTIONS, ITEM_ABOUT, ITEM_COUNT };
 static const struct {
     int icon;
     int label;
@@ -44,7 +44,7 @@ static const struct {
     [ITEM_ACHIEVEMENTS] = {ASSET_TROPHY,  STR_QM_ACHIEVEMENTS, 1},
     [ITEM_NETWORK]      = {ASSET_WIFI_SMALL, STR_QM_NETWORK,   0},
     [ITEM_CLOCK]        = {ASSET_CLOCK,   STR_QM_CLOCK,        1},
-    [ITEM_SDTOOL]       = {ASSET_SDCARD,  STR_QM_SDTOOL,       0},
+    [ITEM_COLLECTIONS]  = {ASSET_STAR,    STR_QM_COLLECTIONS,  1},
     [ITEM_ABOUT]        = {ASSET_GAMEPAD, STR_QM_ABOUT,        1},
 };
 
@@ -662,9 +662,9 @@ int QM_input(int* action) {
             case ITEM_NETWORK: qm.screen = SCR_NETWORK; break;
             case ITEM_CLOCK: qm_clockLoad(); qm.screen = SCR_CLOCK; break;
             case ITEM_ABOUT: qm.screen = SCR_ABOUT; break;
-            case ITEM_SDTOOL:
+            case ITEM_COLLECTIONS:
                 qm_close();
-                *action = QM_SDTOOL;
+                *action = QM_COLLECTIONS;
                 break;
             }
         }
@@ -781,13 +781,13 @@ static void qm_drawTime(SDL_Surface* dst) {
     GFX_blitRenderedText(&text, NULL, dst, x + SCALE1(BUTTON_PADDING), SCALE1(PADDING) + (SCALE1(PILL_SIZE) - text.h) / 2);
 }
 
-// a page's name, top left: its icon and label in a pill
+// a page's name, top left: its icon and label in a pill, darker, as NekoBit's
 static void qm_drawTitle(SDL_Surface* dst, int item) {
-    GFX_Text text = GFX_renderText(font.large, T(items[item].label), COLOR_WHITE);
+    GFX_Text text = GFX_renderText(font.large, T(items[item].label), COLOR_DARK_TEXT);
     int icon_w = SCALE1(PILL_SIZE - BUTTON_PADDING);
     int w = SCALE1(BUTTON_PADDING / 2) + icon_w + text.w + SCALE1(BUTTON_PADDING);
     GFX_blitPill(ASSET_DARK_GRAY_PILL, dst, &(SDL_Rect){SCALE1(PADDING), SCALE1(PADDING), w, SCALE1(PILL_SIZE)});
-    GFX_blitAssetScaled(items[item].icon, dst, &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING / 2), SCALE1(PADDING), icon_w, SCALE1(PILL_SIZE)}, 1, COLOR_WHITE);
+    GFX_blitAssetScaled(items[item].icon, dst, &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING / 2), SCALE1(PADDING), icon_w, SCALE1(PILL_SIZE)}, 1, COLOR_DARK_TEXT);
     GFX_blitRenderedText(&text, NULL, dst, SCALE1(PADDING + BUTTON_PADDING / 2) + icon_w, SCALE1(PADDING) + (SCALE1(PILL_SIZE) - text.h) / 2);
 }
 

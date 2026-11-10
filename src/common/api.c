@@ -105,6 +105,9 @@ static SDL_Rect asset_rects[] = {
     [ASSET_CLOCK]            = (SDL_Rect){SCALE4(44,64,10,10)},
     [ASSET_GAMEPAD]          = (SDL_Rect){SCALE4(57,65,10, 8)},
     [ASSET_SDCARD]           = (SDL_Rect){SCALE4(95,51, 8,10)}, // ASSET_SWAP's card, without its neighbour's edge
+    [ASSET_STAR]             = (SDL_Rect){SCALE4(69,64,10,10)},
+    [ASSET_CHECKED]          = (SDL_Rect){SCALE4(82,64,10,10)},
+    [ASSET_UNCHECKED]        = (SDL_Rect){SCALE4(95,64,10,10)},
 };
 // the flat colour of each asset that is stretched with a fill
 static const SDL_Color asset_colors[ASSET_COLORS] = {
