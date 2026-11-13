@@ -53,6 +53,7 @@ LOG=$TMP/usbnet.log
 G=$SYS/class/android_usb/android0
 MON=$SYS/monitor/usb_port/config
 BB=$HERE/busybox-udhcpd
+WEBMAN=$HERE/miaui-web-manager # the web file manager, on port 80 in network modes
 MODE_FILE=$TMP/usb_mode # minui reads it: "adb", or "net..." for a network
 
 CONSOLE_IP=192.168.137.100
@@ -284,6 +285,7 @@ stop_net() {
     stop busybox-udhcpd
     rm -f "$TMP/udhcpd.pid"
     stop dropbear
+    stop miaui-web-manager
     # down, so nothing is sent through the gadget while it goes (its routes go too)
     if [ -e "$SYS/class/net/rndis0" ]; then run ifconfig rndis0 down; fi
 }
@@ -379,6 +381,16 @@ EOF
         fi
     fi
 
+    # the web manager (port 80): its own process, no output kept
+    if [ -x "$WEBMAN" ]; then
+        log "\$ $WEBMAN > /dev/null 2>&1 < /dev/null &"
+        if [ "$DRY" = 1 ]; then
+            log "  (dry run: not run)"
+        else
+            (trap - HUP PIPE; exec "$WEBMAN" > /dev/null 2>&1 < /dev/null) &
+        fi
+    fi
+
     # SSH/SFTP on the console (root / linux). Its own host keys, not -R: that
     # offers every key type and makes the missing one (RSA) when a client
     # picks it, 7-20 s at this clock and again on every login, as /etc
@@ -389,6 +401,23 @@ EOF
         run dropbear -r ${K}_ed25519_host_key -r ${K}_ecdsa_host_key -p 22
     else
         run dropbear -R -p 22
+    fi
+
+    # A PC with a fixed .1 (Windows ICS, NetworkManager "shared") never asks
+    # for a lease, so the Quick Menu finds it in the ARP table instead; one
+    # ping puts it there. In the background: up to 30 tries while the PC sets
+    # its side up, and it stops at the first reply.
+    log "\$ ping -c 1 -W 1 $PC_IP, in the background until it answers (30 tries)"
+    if [ "$DRY" = 1 ]; then
+        log "  (dry run: not run)"
+    else
+        (trap - HUP PIPE
+         i=0
+         while [ $i -lt 30 ]; do
+             ping -c 1 -W 1 "$PC_IP" && break
+             sleep 1
+             i=$((i + 1))
+         done) > /dev/null 2>&1 < /dev/null &
     fi
 }
 
